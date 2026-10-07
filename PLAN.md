@@ -11,7 +11,7 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P0.4 Determinism lint: a test that fails if core or state-machine packages import `time`, `net`, `os`, `sync` or `math/rand` → §P0
 
 ### Phase 1 — Rung 1: split brain and a lost Acknowledged write (§P1)
-- [ ] P1.1 Simulation skeleton: seeded scheduler, tick clock, in-memory network (drop, Partition), crash and restart → §P1
+- [x] P1.1 Simulation skeleton: seeded scheduler, tick clock, in-memory network (drop, Partition), crash and restart → §P1
 - [ ] P1.2 State machine v1: get, put, delete, compare-and-set with versions → §P1
 - [ ] P1.3 Verdicts: History recorder, Porcupine model, End-state comparison, client signals (A§8.2) → §P1
 - [ ] P1.4 Naive primary-backup core (acknowledges early, fails over on timeout) → §P1

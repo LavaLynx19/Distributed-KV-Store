@@ -83,8 +83,8 @@ const (
 )
 
 // Result is the fate of one proposal. With Reason OK, Index is where its
-// Entry sits in the Log; the Entry itself arrives in Output.Committed in the
-// same step or an earlier one.
+// Entry sits in the Log, and the Entry itself is in the same Output's
+// Committed, so the shell can pair the Result with what applying it returned.
 type Result struct {
 	Ref    uint64
 	Reason Reason
