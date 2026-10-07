@@ -37,6 +37,7 @@ type Node struct {
 	inbox     chan core.Message
 	proposals chan proposal
 	statusReq chan chan core.Status
+	inspect   chan func(Machine)
 }
 
 // NewNode wires a core to its state machine and its way of sending Messages.
@@ -47,6 +48,7 @@ func NewNode(c core.Node, m Machine, send func(core.Message), tick time.Duration
 		inbox:     make(chan core.Message, 4096),
 		proposals: make(chan proposal),
 		statusReq: make(chan chan core.Status),
+		inspect:   make(chan func(Machine)),
 	}
 }
 
@@ -101,6 +103,8 @@ func (n *Node) Run(ctx context.Context) {
 			step(core.Propose{Ref: nextRef, Payload: p.payload})
 		case reply := <-n.statusReq:
 			reply <- n.core.Status()
+		case fn := <-n.inspect:
+			fn(n.machine)
 		}
 	}
 }
@@ -130,5 +134,18 @@ func (n *Node) Status(ctx context.Context) (core.Status, bool) {
 		return <-reply, true
 	case <-ctx.Done():
 		return core.Status{}, false
+	}
+}
+
+// Inspect runs fn on the state machine between two steps, so fn sees a
+// consistent state. It reports false if ctx ended first.
+func (n *Node) Inspect(ctx context.Context, fn func(Machine)) bool {
+	done := make(chan struct{})
+	select {
+	case n.inspect <- func(m Machine) { fn(m); close(done) }:
+		<-done
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }

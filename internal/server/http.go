@@ -58,6 +58,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("PUT /v1/kv/{key}", a.put)
 	mux.HandleFunc("DELETE /v1/kv/{key}", a.delete)
 	mux.HandleFunc("GET /v1/status", a.status)
+	mux.HandleFunc("GET /v1/debug/items", a.debugItems)
 	return mux
 }
 
@@ -145,6 +146,32 @@ func (a *API) status(w http.ResponseWriter, r *http.Request) {
 	}
 	role := map[core.Role]string{core.Follower: "follower", core.Candidate: "candidate", core.LeaderRole: "leader"}[st.Role]
 	writeJSON(w, http.StatusOK, statusResponse{ID: st.ID, Role: role, Term: st.Term, Leader: st.Leader, Commit: st.Commit})
+}
+
+// ItemJSON is one key in the debug dump (A§7.4).
+type ItemJSON struct {
+	Key     string `json:"key"`
+	Value   string `json:"value"`
+	Version uint64 `json:"version"`
+}
+
+// debugItems dumps this Member's own applied data for the harness.
+func (a *API) debugItems(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), a.Timeout)
+	defer cancel()
+	items := []ItemJSON{}
+	ok := a.Node.Inspect(ctx, func(m Machine) {
+		if lister, ok := m.(interface{ Items() []fsm.Item }); ok {
+			for _, it := range lister.Items() {
+				items = append(items, ItemJSON{Key: it.Key, Value: string(it.Value), Version: it.Version})
+			}
+		}
+	})
+	if !ok {
+		writeError(w, http.StatusGatewayTimeout, errorResponse{Reason: "timeout"})
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
 }
 
 func writeJSON(w http.ResponseWriter, code int, body any) {

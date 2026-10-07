@@ -34,18 +34,20 @@ func main() {
 	id := flag.Uint64("id", 0, "this Node's id (must appear in -peers and -clients)")
 	peersFlag := flag.String("peers", "", "every Member's address for other Members: id=host:port,…")
 	clientsFlag := flag.String("clients", "", "every Member's client API address: id=host:port,…")
+	listenPeer := flag.String("listen-peer", "", "address to accept Members on (default: this Node's -peers entry)")
+	listenClient := flag.String("listen-client", "", "address to serve clients on (default: this Node's -clients entry)")
 	tick := flag.Duration("tick", 10*time.Millisecond, "length of one core tick")
 	electionTicks := flag.Int("election-ticks", 10, "ticks of silence before an election (randomized up to 2×)")
 	heartbeatTicks := flag.Int("heartbeat-ticks", 1, "ticks between a Leader's heartbeats")
 	timeout := flag.Duration("request-timeout", 5*time.Second, "how long a client request waits to commit")
 	flag.Parse()
 
-	if err := run(core.NodeID(*id), *peersFlag, *clientsFlag, *tick, *electionTicks, *heartbeatTicks, *timeout); err != nil {
+	if err := run(core.NodeID(*id), *peersFlag, *clientsFlag, *listenPeer, *listenClient, *tick, *electionTicks, *heartbeatTicks, *timeout); err != nil {
 		log.Fatalf("kvnode: %v", err)
 	}
 }
 
-func run(id core.NodeID, peersFlag, clientsFlag string, tick time.Duration, electionTicks, heartbeatTicks int, timeout time.Duration) error {
+func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string, tick time.Duration, electionTicks, heartbeatTicks int, timeout time.Duration) error {
 	peers, err := parseAddrs(peersFlag)
 	if err != nil {
 		return fmt.Errorf("-peers: %w", err)
@@ -57,6 +59,12 @@ func run(id core.NodeID, peersFlag, clientsFlag string, tick time.Duration, elec
 	if peers[id] == "" || clients[id] == "" {
 		return fmt.Errorf("-id %d must appear in both -peers and -clients", id)
 	}
+	if listenPeer == "" {
+		listenPeer = peers[id]
+	}
+	if listenClient == "" {
+		listenClient = clients[id]
+	}
 	members := make([]core.NodeID, 0, len(peers))
 	for m := range peers {
 		members = append(members, m)
@@ -64,7 +72,7 @@ func run(id core.NodeID, peersFlag, clientsFlag string, tick time.Duration, elec
 	slices.Sort(members)
 
 	transport.Register(raft.MessageBodies()...)
-	ln, err := net.Listen("tcp", peers[id])
+	ln, err := net.Listen("tcp", listenPeer)
 	if err != nil {
 		return fmt.Errorf("listen for Members: %w", err)
 	}
@@ -89,7 +97,7 @@ func run(id core.NodeID, peersFlag, clientsFlag string, tick time.Duration, elec
 		hints[m] = "http://" + addr
 	}
 	api := &server.API{Node: node, Clients: hints, Timeout: timeout}
-	srv := &http.Server{Addr: clients[id], Handler: api.Handler(), ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: listenClient, Handler: api.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -97,7 +105,7 @@ func run(id core.NodeID, peersFlag, clientsFlag string, tick time.Duration, elec
 		_ = srv.Shutdown(shutdown) // exiting anyway
 	}()
 
-	log.Printf("kvnode %d: Members on %s, clients on %s, %d Members, tick %s", id, peers[id], clients[id], len(members), tick)
+	log.Printf("kvnode %d: Members on %s, clients on %s, %d Members, tick %s", id, listenPeer, listenClient, len(members), tick)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("client API: %w", err)
 	}

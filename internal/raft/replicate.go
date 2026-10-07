@@ -91,6 +91,11 @@ func (n *Node) handleAppendReply(out *core.Output, from core.NodeID, m AppendRep
 	if n.next[from] <= n.match[from] {
 		n.next[from] = n.match[from] + 1
 	}
+	// A follower that is catching up gets its next batch at once, not at the
+	// next heartbeat.
+	if n.next[from] <= n.lastIndex() {
+		n.sendAppend(out, from)
+	}
 	n.advanceCommit()
 }
 

@@ -240,6 +240,11 @@ New reasons are added here first.
 
 Unsafe recovery is a command-line action on a stopped Member, not an API call.
 
+### 7.4 Debug (harness only)
+| Method and path | Purpose |
+|---|---|
+| `GET /v1/debug/items` | This Member's own data, as applied so far: every key with its value and version. Not Linearizable, and not for clients. The harness uses it for the End-state comparison (§8.2). |
+
 ## 8. Verification
 
 ### 8.1 Simulation

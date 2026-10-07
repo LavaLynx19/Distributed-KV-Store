@@ -297,3 +297,31 @@ func TestRefusedVoteDoesNotResetElectionTimer(t *testing.T) {
 		t.Fatal("a granted vote should reset the election timer")
 	}
 }
+
+// A follower far behind is sent batch after batch as fast as it confirms
+// them, without waiting for heartbeats.
+func TestCatchUpDoesNotWaitForHeartbeats(t *testing.T) {
+	n := newNode(1, 3)
+	elect(t, n, 2)
+	for i := range 3 * maxBatch {
+		n.Step(core.Propose{Ref: uint64(i), Payload: []byte("x")})
+	}
+	last := n.lastIndex()
+
+	a := reply[Append](t, recv(n, 3, AppendReply{Term: 1, Match: 0})) // "I have nothing"
+	sent := core.Index(len(a.Entries))
+	for rounds := 0; sent < last; rounds++ {
+		if rounds > 10 {
+			t.Fatalf("stuck after sending %d of %d", sent, last)
+		}
+		a = reply[Append](t, recv(n, 3, AppendReply{Term: 1, Success: true, Match: sent}))
+		if a.PrevIndex != sent || len(a.Entries) == 0 {
+			t.Fatalf("after confirming %d the Leader sent %d Entries from %d", sent, len(a.Entries), a.PrevIndex)
+		}
+		sent += core.Index(len(a.Entries))
+	}
+	// Fully caught up: nothing more to send.
+	if out := recv(n, 3, AppendReply{Term: 1, Success: true, Match: last}); len(out.Messages) != 0 {
+		t.Fatalf("a caught-up follower was sent %d more messages", len(out.Messages))
+	}
+}

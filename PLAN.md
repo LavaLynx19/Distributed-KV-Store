@@ -21,7 +21,7 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P1.8 Client path in the core: proposals, `not_leader`, `no_majority` → §P1
 - [x] P1.9 Rung 1 Simulation suite: crashes and clean Partitions on 3 and 5 Members, many seeds → §P1
 - [x] P1.10 Real shell: TCP transport, HTTP API (A§7), ticker, local process runner → §P1
-- [ ] P1.11 Docker Compose with toxiproxy, and the real-run client with History recording → §P1
+- [x] P1.11 Docker Compose with toxiproxy, and the real-run client with History recording → §P1
 - [ ] P1.12 Baseline numbers: single Node vs 3 vs 5 Members, local and Docker → §P1
 - [ ] P1.13 `retros/rung-1.md`; set relative targets for later Rungs in README → §P1
 
