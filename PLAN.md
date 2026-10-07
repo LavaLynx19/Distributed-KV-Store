@@ -12,7 +12,7 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 
 ### Phase 1 — Rung 1: split brain and a lost Acknowledged write (§P1)
 - [x] P1.1 Simulation skeleton: seeded scheduler, tick clock, in-memory network (drop, Partition), crash and restart → §P1
-- [ ] P1.2 State machine v1: get, put, delete, compare-and-set with versions → §P1
+- [x] P1.2 State machine v1: get, put, delete, compare-and-set with versions, all as Log commands → §P1
 - [ ] P1.3 Verdicts: History recorder, Porcupine model, End-state comparison, client signals (A§8.2) → §P1
 - [ ] P1.4 Naive primary-backup core (acknowledges early, fails over on timeout) → §P1
 - [ ] P1.5 Expose: seeds that show two primaries and a lost Acknowledged write, recorded for the retro → §P1
@@ -27,8 +27,8 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 
 ### Phase 2 — Rung 2: Stale read and double apply (§P2)
 - [ ] P2.1 Simulation network Faults: delay, reorder, duplicate, one-way Partition → §P2
-- [ ] P2.2 Expose: Stale read from a cut-off Leader; a retried compare-and-set applied twice → §P2
-- [ ] P2.3 Reads through the Log → §P2
+- [ ] P2.2 Naive shortcuts: the Leader answers reads from memory; clients retry unanswered requests → §P2
+- [ ] P2.3 Expose: Stale read from a cut-off Leader; a retried compare-and-set applied twice → §P2
 - [ ] P2.4 Sessions: open, deduplicate on apply, saved responses (A§6.3) → §P2
 - [ ] P2.5 Read index, with the own-Term commit rule (A§6.2) → §P2
 - [ ] P2.6 Rung 2 suite under the new Faults; measure Log reads vs read index → §P2
@@ -115,6 +115,7 @@ The contract types come first because both shells and both cores (naive and Raft
 **Verify:** `go build ./...` and `go vet ./...` pass; the determinism lint fails when a forbidden import is added to a pure package, and passes otherwise.
 
 ## §P1 — Rung 1
+- **Reads and retries:** a get is a Log command, and clients never retry. An unanswered request is recorded as outcome unknown (A§6.2, A§6.3).
 - **Crashes before Rung 3:** in Rungs 1–2 a crashed Member restarts with its state intact, as if its storage were perfect. Rung 3 takes that away.
 - **Naive first (Decision Log):** P1.4–P1.5 land and are recorded before any Raft code.
 - **Real shell** arrives here so the baseline can be measured. It stays thin: everything it does is also done by the Simulation.
@@ -124,7 +125,7 @@ The contract types come first because both shells and both cores (naive and Raft
 - P1.12: numbers recorded on local processes and Docker. Ask the user before running.
 
 ## §P2 — Rung 2
-**Verify:** P2.2's seeds fail before P2.3–P2.5 and pass after. The suite passes under delay, reordering, duplication and one-way Partitions. Read index is measured against Log reads.
+**Verify:** P2.3's seeds fail with the P2.2 shortcuts and pass after P2.4–P2.5. The suite passes under delay, reordering, duplication and one-way Partitions. Read index is measured against Log reads.
 
 ## §P3 — Rung 3
 The v1 state is replaced by the tree here, because Snapshots need it.
