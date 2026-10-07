@@ -75,8 +75,8 @@ const (
 	// NotLeader: this Member isn't the Leader, so it did not take the
 	// proposal. The Result's Leader field is a hint, or zero if unknown.
 	NotLeader
-	// NoMajority: the Leader can't currently reach a Majority, so it did not
-	// take the proposal.
+	// NoMajority: this Member knows of no Leader backed by a Majority (it is
+	// cut off, or an election is under way), so it did not take the proposal.
 	NoMajority
 	// Unknown: the Member accepted the proposal and then lost the ability to
 	// say whether it committed (for example, it stopped being Leader).

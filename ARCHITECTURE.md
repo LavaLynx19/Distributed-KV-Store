@@ -224,7 +224,7 @@ Writes carry `Session-Id` and `Request-Seq` headers.
 | 409 | `version_mismatch` | Compare-and-set or a transaction condition failed | Treat as a definite answer |
 | 404 | `not_found` | Key doesn't exist (or has expired) | Definite answer |
 | 421 | `not_leader` | This Member isn't the Leader; includes a hint | Retry on the hint, same request number |
-| 503 | `no_majority` | The Leader can't reach a Majority | Retry later, same request number |
+| 503 | `no_majority` | This Member knows of no Leader backed by a Majority: it is cut off, or an election is under way | Retry later, same request number |
 | 504 | `timeout` | Outcome unknown | Retry, same request number |
 | 410 | `session_expired` | The Session was cleaned up | Open a new Session; the outcome of the last request is unknown |
 | 400 | `invalid` | Malformed request | Fix the request |

@@ -16,9 +16,9 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P1.3 Verdicts: History recorder, Porcupine model, End-state comparison, client signals (A§8.2) → §P1
 - [x] P1.4 Naive primary-backup core (acknowledges early, fails over on timeout) → §P1
 - [x] P1.5 Expose: seeds that show two primaries and a lost Acknowledged write, recorded for the retro → §P1
-- [ ] P1.6 Raft election: Terms, votes, heartbeats, randomized timeouts → §P1
-- [ ] P1.7 Raft replication: append, consistency check, commit by Majority, apply → §P1
-- [ ] P1.8 Client path in the core: proposals, `not_leader`, `no_majority` → §P1
+- [x] P1.6 Raft election: Terms, votes, heartbeats, randomized timeouts → §P1
+- [x] P1.7 Raft replication: append, consistency check, commit by Majority, apply → §P1
+- [x] P1.8 Client path in the core: proposals, `not_leader`, `no_majority` → §P1
 - [ ] P1.9 Rung 1 Simulation suite: crashes and clean Partitions on 3 and 5 Members, many seeds → §P1
 - [ ] P1.10 Real shell: TCP transport, HTTP API (A§7), ticker, local process runner → §P1
 - [ ] P1.11 Docker Compose with toxiproxy, and the real-run client with History recording → §P1
