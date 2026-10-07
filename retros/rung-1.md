@@ -1,6 +1,6 @@
 # Rung 1 retro: split brain and a lost Acknowledged write
 
-Status: **in progress**. The naive store's failures and the Raft core's Simulation results are recorded below. Real-process runs and the baseline numbers (P1.10–P1.12) are still to come.
+Status: **in progress**. The naive store's failures, the Raft core's Simulation results and the real-run baseline are recorded below. Relative targets for later Rungs (P1.13) are still to be agreed.
 
 Environment: everything in this section ran in the Simulation (A§8.1): one process, virtual time, a seed per run. Each Member ticks every 10 time units and a message takes 1–8. Four clients work three keys, each client sitting beside one Member and sharing its view of the network.
 
@@ -92,3 +92,61 @@ A stale Member can still force a new Term each time it times out, which interrup
 go test ./internal/raft/                          # unit tests, including Figure 8
 go test -run TestRaft ./internal/rungtest/        # 200 seeds per scenario; -short for 20
 ```
+
+## Real runs and the baseline (P1.10–P1.12)
+
+Environment: MacBook M4 Pro. `kvbench` with 8 clients, each sending its next request as soon as the last is answered, for 10 seconds over 50 keys: 35% gets, 30% puts, 25% compare-and-sets, 10% deletes. A tick is 10 ms, so an election timeout is 100–200 ms. Nothing is written to disk in Rung 1, so these numbers measure consensus over the network and nothing else. Each configuration ran once, with 30 s between runs.
+
+### Baseline, no Faults
+| Where | Members | Answered/s | vs 1 Member | p50 | p99 | Verdicts |
+|---|---|---|---|---|---|---|
+| Local processes | 1 | 86,810 | 1.00× | 90 µs | 190 µs | Linearizable; identical |
+| Local processes | 3 | 42,743 | 0.49× | 180 µs | 330 µs | Linearizable; identical |
+| Local processes | 5 | 29,458 | 0.34× | 260 µs | 460 µs | Linearizable; identical |
+| Docker, direct links | 1 | 18,058 | 1.00× | 430 µs | 780 µs | Linearizable; identical |
+| Docker, direct links | 3 | 13,456 | 0.75× | 580 µs | 930 µs | Linearizable; identical |
+| Docker, direct links | 5 | 11,557 | 0.64× | 670 µs | 1.18 ms | Linearizable; identical |
+
+- **The cost of consensus, locally:** 3 Members answer about half of what one does, and 5 about a third. Every request is a round trip to a Majority, and a bigger Group means more messages per request on the same machine.
+- **Docker hides that cost.** A single Member in Docker manages only 21% of the local figure (18k against 87k), because every client request crosses the Docker network. Against that slower base, consensus looks cheaper (0.75× and 0.64×). The local ratios are the honest ones.
+- These are ceilings for later Rungs to fall from. Rung 3 adds a disk write to every acknowledgement and will cost far more than anything here.
+
+### Under Faults, on real processes
+A Fault is injected 3 s into the run and repaired 3 s later.
+
+| Where | Members | Fault | Answered/s | Rejected / lost | Next write after the Fault | Verdicts |
+|---|---|---|---|---|---|---|
+| Local | 3 | Leader frozen | 33,393 | 8 / 11 | 1.93 s | Linearizable; identical |
+| Local | 5 | Leader frozen | 23,273 | 11 / 8 | 1.94 s | Linearizable; identical |
+| Docker + toxiproxy | 3 | Leader isolated | 11,095 | 304 / 11 | 185 ms | Linearizable; identical |
+| Docker + toxiproxy | 5 | Leader isolated | 9,442 | 240 / 12 | 136 ms | Linearizable; identical |
+| Docker + toxiproxy | 3 | Leader frozen | 8,781 | 12 / 10 | 2.00 s | Linearizable; identical |
+
+- **An isolated Leader costs clients about one election timeout** (136–185 ms). It still answers, so its clients are told `no_majority` and move on at once.
+- **A frozen Leader costs clients their own timeout** (about 2 s, which is `kvbench`'s request timeout). The Group elects a new Leader in a fraction of a second, but every client was mid-request to the frozen one and waits it out. The 1.9–2.0 s measures the client, not the store.
+- In every run the returning Member caught up and all Members ended identical.
+
+### What broke on the way: slow catch-up, found by the End-state comparison
+The first real Fault runs were Linearizable but failed the End-state comparison: one second after the load, the former Leader was still tens of thousands of Entries behind (92–100 of the keys compared differed).
+
+- **Cause:** after a follower confirmed a batch, the Leader waited for the next heartbeat to send the next one: 64 Entries per 10 ms, about 6,400 a second, against 20–40 thousand a second being written.
+- **Fix:** the Leader sends the next batch as soon as the previous one is confirmed (`handleAppendReply`). Regression test: `TestCatchUpDoesNotWaitForHeartbeats`.
+- **Also:** `kvbench` now waits for Members to converge, up to a limit, before judging the End state. A Member that is behind but catching up isn't divergence.
+- The Simulation never showed this, because its clients pause between requests and nobody falls far behind.
+
+### Observed, not fixed
+After the Docker Partition healed, the cut-off Member had raised the Term from 3 to 19 by standing for election over and over. On rejoining it forced one more election on a healthy Group. Raft's pre-vote extension prevents this. Rung 1's guarantees don't depend on it.
+
+### Reproduce
+```
+harness/run.sh local 3                       # baseline
+harness/run.sh local 3 pause-leader
+harness/run.sh docker 3 isolate-leader
+```
+
+## Lessons
+1. **A Fault the clients don't experience can hide the failure it causes.** Simulated clients that ignored the Partition never reached the second primary, and every History passed.
+2. **The End-state comparison and the History catch different things.** A lost Acknowledged write left the naive store's Members identical in one run; only the History showed it. Slow catch-up left Histories Linearizable; only the End-state comparison showed it.
+3. **Check that it works again, not only that it's safe.** Three of 1,600 runs kept every safety property while electing nobody for 550 time units.
+4. **Simulation and real runs find different bugs.** The slow election needed thousands of seeded Fault schedules. The slow catch-up needed real throughput.
+5. **Break it on purpose once.** Removing the up-to-date vote rule made the suite fail at once, which is the evidence that 16,000 passing runs mean something.
