@@ -72,10 +72,11 @@ type Reason uint8
 const (
 	// OK: the proposal's Entry is Committed.
 	OK Reason = iota
-	// NotLeader: this Member isn't the Leader. The Result's Leader field is a
-	// hint, or zero if unknown.
+	// NotLeader: this Member isn't the Leader, so it did not take the
+	// proposal. The Result's Leader field is a hint, or zero if unknown.
 	NotLeader
-	// NoMajority: the Leader can't currently reach a Majority.
+	// NoMajority: this Member knows of no Leader backed by a Majority (it is
+	// cut off, or an election is under way), so it did not take the proposal.
 	NoMajority
 	// Unknown: the Member accepted the proposal and then lost the ability to
 	// say whether it committed (for example, it stopped being Leader).
@@ -83,8 +84,8 @@ const (
 )
 
 // Result is the fate of one proposal. With Reason OK, Index is where its
-// Entry sits in the Log; the Entry itself arrives in Output.Committed in the
-// same step or an earlier one.
+// Entry sits in the Log, and the Entry itself is in the same Output's
+// Committed, so the shell can pair the Result with what applying it returned.
 type Result struct {
 	Ref    uint64
 	Reason Reason

@@ -1,0 +1,3 @@
+# Only the cross-compiled binary goes into the image.
+*
+!bin/linux/kvnode

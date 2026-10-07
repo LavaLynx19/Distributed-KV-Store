@@ -88,7 +88,7 @@ Every run is judged three ways:
 
 ## Rung Ladder
 
-Each **Rung** names a failure to watch happen first, then the capability that fixes it. Relative targets are set once Rung 1 gives a baseline.
+Each **Rung** names a failure to watch happen first, then the capability that fixes it. Performance targets are relative (see Targets, below the table).
 
 | Rung | Failure to expose | Capability | Must hold afterwards |
 |---|---|---|---|
@@ -104,13 +104,22 @@ Each **Rung** names a failure to watch happen first, then the capability that fi
 
 Rungs 1–6 are the consensus core. Rungs 7–9 build on it. Earlier Rungs must not rule out a later one.
 
+### Targets
+Rung 1 measured the baseline (`retros/rung-1.md`): with nothing on disk, a **Group** of 3 **Members** answers 42,743 requests/s as local processes, about half of what a single **Node** does, and a client of an isolated **Leader** gets its next write through in 136–185 ms.
+
+- **Throughput: each Rung against the one before.** With no **Faults**, on local processes with 3 Members and the same load, a Rung must answer at least 0.9× the requests/s of the Rung before it.
+- **A Rung that adds a known cost resets the baseline.** Rung 3 puts a disk write before every acknowledgement. Its retro states the cost, and Rung 4 is then measured against Rung 3.
+- **A Rung that adds a faster path must show it.** Rung 2's read index must answer reads faster than reads through the **Log**.
+- **Recovery:** when a Leader is cut off by a **Partition**, the next write must succeed within 2× the longest election timeout (400 ms at the Rung 1 settings). A frozen Leader is reported separately, because there the delay is the client's own request timeout.
+- Docker numbers are reported beside the local ones, not gated.
+
 ## Success Criteria
 
 ### Per Rung
 A **Rung** is done when all four checks pass:
 1. **Exposed:** the named failure was observed and recorded before the fix.
 2. **Faults:** the Rung's guarantees hold under its **Faults**, with a **Linearizable** **History**, identical **Members** and the client-side signals recorded.
-3. **Numbers:** the relative targets for the Rung are measured.
+3. **Numbers:** the Rung meets its Targets (Rung Ladder → Targets).
 4. **Retro:** a written retro covers what broke, why, and what changed.
 
 ### Project

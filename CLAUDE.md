@@ -34,4 +34,4 @@ Client-facing errors come from the A§7.2 table: HTTP status plus `reason`. New 
 - Ask before editing: `deploy/docker-compose.yml`, `.gitignore`.
 
 ## Key files
-`cmd/{kvnode,kvctl,kvbench}`, `internal/{core,naive,raft,fsm,tree,storage,transport,server,sim,check,purity}`, `harness/`, `deploy/`, `retros/`.
+`cmd/{kvnode,kvctl,kvbench}`, `internal/{core,naive,raft,fsm,tree,storage,transport,server,sim,check,rungtest,purity}`, `harness/`, `deploy/`, `retros/`.

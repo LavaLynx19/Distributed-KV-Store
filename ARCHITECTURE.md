@@ -50,7 +50,7 @@ Each decision lists the alternatives considered. The user chose every option mar
 ### 2.7 Linearizable reads
 | Option | For | Against |
 |---|---|---|
-| **Through the Log, then confirm with a Majority** — Chosen | Rung 2 starts with the obviously correct version, then adds Raft's read index and measures the gain. Neither depends on clocks. | Two read paths over the project's life. |
+| **Through the Log, then confirm with a Majority** — Chosen | Rung 1 uses the obviously correct version. Rung 2 adds Raft's read index and measures the gain. Neither depends on clocks. | Two read paths over the project's life. |
 | **Leader lease** — Chosen as a measured variant, off by default | Fastest: the Leader answers from memory. | A **Stale read** is possible under clock skew, which is in the failure model. See Decision Log. |
 
 ### 2.8 Real runs
@@ -158,7 +158,7 @@ Entry kinds: no-op, command, Membership change. Rungs 7–8 add more (§10).
 | Transaction | A list of conditions and writes over several keys, applied all or nothing (Rung 5) |
 | Open Session | Registers a **Session** |
 
-Range scans and gets are reads, not commands (§6.2), except in Rung 2's first step.
+A get is also a command in Rung 1. From Rung 2 on, gets and range scans are reads that bypass the Log (§6.2).
 
 ### 5.3 State machine
 - **Keys:** a copy-on-write ordered tree from key to value, version and Expiry stamp. A version increases on every write to the key.
@@ -178,13 +178,14 @@ The Log is a sequence of segment files of length-prefixed records, with a separa
 5. Each Member applies it in Log order. The Leader answers the client only then, which makes it an **Acknowledged write**.
 
 ### 6.2 Read
-Three paths, introduced in order:
-1. **Through the Log** (Rung 2, first): a read is an Entry like any other. Correct and slow.
-2. **Read index** (Rung 2, then the default): the Leader notes its commit index, confirms with a Majority that it still leads, waits until that index is applied, then answers from memory. A new Leader must first commit an Entry of its own Term.
-3. **Lease** (variant, off by default): the Leader answers from memory while its lease holds. Not Linearizable under clock skew.
+Read paths, in the order they appear:
+1. **Through the Log** (Rung 1): a read is an Entry like any other. Correct and slow.
+2. **From the Leader's memory** (Rung 2, naive): the tempting shortcut, shipped to show the Stale read it allows. It doesn't survive the Rung.
+3. **Read index** (Rung 2, then the default): the Leader notes its commit index, confirms with a Majority that it still leads, waits until that index is applied, then answers from memory. A new Leader must first commit an Entry of its own Term.
+4. **Lease** (variant, off by default): the Leader answers from memory while its lease holds. Not Linearizable under clock skew.
 
 ### 6.3 Retries
-Every command carries a Session id and a request number. Before applying, the state machine checks the Session: a request number already applied returns its saved response and changes nothing. Because this happens when an Entry is applied, it is identical on every Member and survives a change of Leader.
+In Rung 1 clients never retry: a request with no definite answer is recorded as outcome unknown, which the checker allows for. Rung 2 lets clients retry, shows a compare-and-set applying twice, and adds Sessions. From then on every command carries a Session id and a request number. Before applying, the state machine checks the Session: a request number already applied returns its saved response and changes nothing. Because this happens when an Entry is applied, it is identical on every Member and survives a change of Leader.
 
 ### 6.4 Snapshot and catch-up
 Taking a Snapshot keeps the tree's current root and writes it out in the shell while the core carries on. Entries up to that point are then dropped. A follower that needs dropped Entries receives the Snapshot, then the Log after it.
@@ -223,10 +224,11 @@ Writes carry `Session-Id` and `Request-Seq` headers.
 | 409 | `version_mismatch` | Compare-and-set or a transaction condition failed | Treat as a definite answer |
 | 404 | `not_found` | Key doesn't exist (or has expired) | Definite answer |
 | 421 | `not_leader` | This Member isn't the Leader; includes a hint | Retry on the hint, same request number |
-| 503 | `no_majority` | The Leader can't reach a Majority | Retry later, same request number |
+| 503 | `no_majority` | This Member knows of no Leader backed by a Majority: it is cut off, or an election is under way | Retry later, same request number |
 | 504 | `timeout` | Outcome unknown | Retry, same request number |
 | 410 | `session_expired` | The Session was cleaned up | Open a new Session; the outcome of the last request is unknown |
 | 400 | `invalid` | Malformed request | Fix the request |
+| 500 | `internal` | A bug in the store | Report it; the outcome is unknown |
 
 New reasons are added here first.
 
@@ -237,6 +239,11 @@ New reasons are added here first.
 | `DELETE /v1/admin/members/{id}` | Remove a Member |
 
 Unsafe recovery is a command-line action on a stopped Member, not an API call.
+
+### 7.4 Debug (harness only)
+| Method and path | Purpose |
+|---|---|
+| `GET /v1/debug/items` | This Member's own data, as applied so far: every key with its value and version. Not Linearizable, and not for clients. The harness uses it for the End-state comparison (§8.2). |
 
 ## 8. Verification
 
@@ -263,8 +270,8 @@ The same client and History recorder run against real processes: locally, and in
 ## 9. Rung mechanics
 | Rung | What ships first, to be seen failing | Fix | Section |
 |---|---|---|---|
-| 1 | Naive primary-backup: acknowledges before a Majority, fails over on a timeout | Raft election and replication | §4, §6.1 |
-| 2 | Leader answers reads from memory; no Sessions | Reads through the Log, then read index; Sessions | §6.2, §6.3 |
+| 1 | Naive primary-backup: acknowledges before a Majority, fails over on a timeout | Raft election and replication; reads through the Log; clients don't retry | §4, §6.1, §6.2 |
+| 2 | Leader answers reads from memory; clients retry with no Sessions | Read index; Sessions | §6.2, §6.3 |
 | 3 | Nothing durable; Log never trimmed | Durable Log and vote, Snapshots, catch-up | §5.4, §6.4 |
 | 4 | Records without checksums | Checksums; a damaged Member repairs from the others | §5.4 |
 | 5 | Expiry by each Member's own clock | Leader-stamped Log time; scans; transactions | §6.7, §5.2 |

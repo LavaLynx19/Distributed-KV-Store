@@ -1,0 +1,40 @@
+# A Group in containers, for real-network runs (A§2.8, A§8.3). Use it through
+# harness/docker.sh, which sets PEERS_<i> and CLIENTS for the chosen size and
+# starts only the Members needed.
+#
+# Member i serves clients on the host at 127.0.0.1:800i. In the default mode
+# every Member-to-Member link goes through toxiproxy, so harness/docker.sh can
+# cut any link in either direction.
+
+x-node: &node
+  image: distributed-kv-store:dev
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+
+services:
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    ports:
+      - "127.0.0.1:8474:8474"
+
+  node1:
+    <<: *node
+    command: ["-id", "1", "-peers", "${PEERS_1:-}", "-clients", "${CLIENTS:-}", "-listen-peer", "0.0.0.0:7000", "-listen-client", "0.0.0.0:8000"]
+    ports: ["127.0.0.1:8001:8000"]
+  node2:
+    <<: *node
+    command: ["-id", "2", "-peers", "${PEERS_2:-}", "-clients", "${CLIENTS:-}", "-listen-peer", "0.0.0.0:7000", "-listen-client", "0.0.0.0:8000"]
+    ports: ["127.0.0.1:8002:8000"]
+  node3:
+    <<: *node
+    command: ["-id", "3", "-peers", "${PEERS_3:-}", "-clients", "${CLIENTS:-}", "-listen-peer", "0.0.0.0:7000", "-listen-client", "0.0.0.0:8000"]
+    ports: ["127.0.0.1:8003:8000"]
+  node4:
+    <<: *node
+    command: ["-id", "4", "-peers", "${PEERS_4:-}", "-clients", "${CLIENTS:-}", "-listen-peer", "0.0.0.0:7000", "-listen-client", "0.0.0.0:8000"]
+    ports: ["127.0.0.1:8004:8000"]
+  node5:
+    <<: *node
+    command: ["-id", "5", "-peers", "${PEERS_5:-}", "-clients", "${CLIENTS:-}", "-listen-peer", "0.0.0.0:7000", "-listen-client", "0.0.0.0:8000"]
+    ports: ["127.0.0.1:8005:8000"]
