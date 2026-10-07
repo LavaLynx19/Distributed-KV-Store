@@ -1,6 +1,6 @@
 # Rung 1 retro: split brain and a lost Acknowledged write
 
-Status: **in progress**. The naive store's failures, the Raft core's Simulation results and the real-run baseline are recorded below. Relative targets for later Rungs (P1.13) are still to be agreed.
+Status: **done**. The naive store's failures were recorded first, Raft holds Rung 1's guarantees in the Simulation and on real processes, and the baseline is measured.
 
 Environment: everything in this section ran in the Simulation (A§8.1): one process, virtual time, a seed per run. Each Member ticks every 10 time units and a message takes 1–8. Four clients work three keys, each client sitting beside one Member and sharing its view of the network.
 
@@ -150,3 +150,11 @@ harness/run.sh docker 3 isolate-leader
 3. **Check that it works again, not only that it's safe.** Three of 1,600 runs kept every safety property while electing nobody for 550 time units.
 4. **Simulation and real runs find different bugs.** The slow election needed thousands of seeded Fault schedules. The slow catch-up needed real throughput.
 5. **Break it on purpose once.** Removing the up-to-date vote rule made the suite fail at once, which is the evidence that 16,000 passing runs mean something.
+
+## Verdict
+| Check (README → Success Criteria) | Result |
+|---|---|
+| Exposed: the named failure observed and recorded before the fix | **Pass**: split brain and a lost Acknowledged write, pinned by `TestNaiveIsExposed` |
+| Faults: guarantees hold under crashes and clean Partitions, on 3 and 5 Members | **Pass**: 16,000 simulated runs and 5 real Fault runs. Every History Linearizable, Members identical, never two Leaders in a Term |
+| Numbers | **Baseline set**: 42,743 requests/s at 3 Members locally (0.49× a single Node); 136–185 ms to recover from an isolated Leader. Targets for later Rungs are in README → Rung Ladder → Targets |
+| Retro | This document |

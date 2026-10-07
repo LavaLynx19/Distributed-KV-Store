@@ -23,7 +23,7 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P1.10 Real shell: TCP transport, HTTP API (A§7), ticker, local process runner → §P1
 - [x] P1.11 Docker Compose with toxiproxy, and the real-run client with History recording → §P1
 - [x] P1.12 Baseline numbers: single Node vs 3 vs 5 Members, local and Docker → §P1
-- [ ] P1.13 `retros/rung-1.md`; set relative targets for later Rungs in README → §P1
+- [x] P1.13 `retros/rung-1.md`; set relative targets for later Rungs in README → §P1
 
 ### Phase 2 — Rung 2: Stale read and double apply (§P2)
 - [ ] P2.1 Simulation network Faults: delay, reorder, duplicate, one-way Partition → §P2
