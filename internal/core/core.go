@@ -72,10 +72,11 @@ type Reason uint8
 const (
 	// OK: the proposal's Entry is Committed.
 	OK Reason = iota
-	// NotLeader: this Member isn't the Leader. The Result's Leader field is a
-	// hint, or zero if unknown.
+	// NotLeader: this Member isn't the Leader, so it did not take the
+	// proposal. The Result's Leader field is a hint, or zero if unknown.
 	NotLeader
-	// NoMajority: the Leader can't currently reach a Majority.
+	// NoMajority: the Leader can't currently reach a Majority, so it did not
+	// take the proposal.
 	NoMajority
 	// Unknown: the Member accepted the proposal and then lost the ability to
 	// say whether it committed (for example, it stopped being Leader).

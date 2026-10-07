@@ -30,8 +30,8 @@ func put(k, v string) Command {
 	}
 	return c
 }
-func get(k string) Command    { return Command{Op: OpGet, Key: k} }
-func del(k string) Command    { return Command{Op: OpDelete, Key: k} }
+func get(k string) Command { return Command{Op: OpGet, Key: k} }
+func del(k string) Command { return Command{Op: OpDelete, Key: k} }
 func cas(k, v string, ifVersion uint64) Command {
 	return Command{Op: OpPut, Key: k, Value: []byte(v), Conditional: true, IfVersion: ifVersion}
 }
