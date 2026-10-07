@@ -14,7 +14,7 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P1.1 Simulation skeleton: seeded scheduler, tick clock, in-memory network (drop, Partition), crash and restart → §P1
 - [x] P1.2 State machine v1: get, put, delete, compare-and-set with versions, all as Log commands → §P1
 - [x] P1.3 Verdicts: History recorder, Porcupine model, End-state comparison, client signals (A§8.2) → §P1
-- [ ] P1.4 Naive primary-backup core (acknowledges early, fails over on timeout) → §P1
+- [x] P1.4 Naive primary-backup core (acknowledges early, fails over on timeout) → §P1
 - [ ] P1.5 Expose: seeds that show two primaries and a lost Acknowledged write, recorded for the retro → §P1
 - [ ] P1.6 Raft election: Terms, votes, heartbeats, randomized timeouts → §P1
 - [ ] P1.7 Raft replication: append, consistency check, commit by Majority, apply → §P1
