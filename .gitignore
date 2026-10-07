@@ -1,0 +1,16 @@
+# Binaries
+/bin/
+*.test
+
+# Run output and node data
+/harness/out/
+/data/
+
+# Secrets
+.env*
+!.env.example
+
+# Editor and OS
+.DS_Store
+.idea/
+.vscode/
