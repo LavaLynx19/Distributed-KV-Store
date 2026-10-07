@@ -214,6 +214,10 @@ func (s *Sim) Partition(sets ...[]core.NodeID) {
 	s.mix('X', uint64(len(s.blocked)), 0)
 }
 
+// Reachable reports whether a message from a could reach b right now: no
+// Partition separates them in that direction.
+func (s *Sim) Reachable(a, b core.NodeID) bool { return !s.blocked[[2]core.NodeID{a, b}] }
+
 // SetLoss makes each message independently lost with probability p.
 func (s *Sim) SetLoss(p float64) {
 	s.loss = p

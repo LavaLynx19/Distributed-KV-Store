@@ -15,7 +15,7 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P1.2 State machine v1: get, put, delete, compare-and-set with versions, all as Log commands → §P1
 - [x] P1.3 Verdicts: History recorder, Porcupine model, End-state comparison, client signals (A§8.2) → §P1
 - [x] P1.4 Naive primary-backup core (acknowledges early, fails over on timeout) → §P1
-- [ ] P1.5 Expose: seeds that show two primaries and a lost Acknowledged write, recorded for the retro → §P1
+- [x] P1.5 Expose: seeds that show two primaries and a lost Acknowledged write, recorded for the retro → §P1
 - [ ] P1.6 Raft election: Terms, votes, heartbeats, randomized timeouts → §P1
 - [ ] P1.7 Raft replication: append, consistency check, commit by Majority, apply → §P1
 - [ ] P1.8 Client path in the core: proposals, `not_leader`, `no_majority` → §P1
@@ -101,6 +101,7 @@ internal/transport/ TCP between Nodes
 internal/server/   HTTP API
 internal/sim/      Simulation: scheduler, clock, network, disk
 internal/check/    History, Porcupine model, End-state comparison, signals
+internal/rungtest/ Fault scenarios per Rung, run against any core in the Simulation
 harness/           run scripts for real runs
 deploy/            Docker Compose
 retros/            one retro per Rung
