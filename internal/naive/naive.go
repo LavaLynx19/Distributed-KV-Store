@@ -18,8 +18,14 @@ import (
 	"distributed-kv-store/internal/core"
 )
 
-// Ping tells the other Members that the sender is alive.
-type Ping struct{}
+// Ping tells the other Members that the sender is alive. Tick is the
+// sender's tick count; nothing reads it, but the network encoding needs a
+// message to carry something.
+type Ping struct{ Tick int }
+
+// MessageBodies lists the types this core puts in a Message, for the
+// transport to register.
+func MessageBodies() []any { return []any{Ping{}, Replicate{}} }
 
 // Replicate carries one Entry from a primary to a backup.
 type Replicate struct{ Entry core.Entry }
@@ -78,7 +84,7 @@ func (n *Node) Step(ev core.Event) core.Output {
 	switch ev := ev.(type) {
 	case core.Tick:
 		n.ticks++
-		n.broadcast(&out, Ping{})
+		n.broadcast(&out, Ping{Tick: n.ticks})
 
 	case core.Receive:
 		n.lastHeard[ev.Msg.From] = n.ticks

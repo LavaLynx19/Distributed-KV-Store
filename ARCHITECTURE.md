@@ -228,6 +228,7 @@ Writes carry `Session-Id` and `Request-Seq` headers.
 | 504 | `timeout` | Outcome unknown | Retry, same request number |
 | 410 | `session_expired` | The Session was cleaned up | Open a new Session; the outcome of the last request is unknown |
 | 400 | `invalid` | Malformed request | Fix the request |
+| 500 | `internal` | A bug in the store | Report it; the outcome is unknown |
 
 New reasons are added here first.
 

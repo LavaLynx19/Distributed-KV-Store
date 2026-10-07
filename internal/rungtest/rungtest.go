@@ -13,6 +13,7 @@ import (
 	"distributed-kv-store/internal/core"
 	"distributed-kv-store/internal/fsm"
 	"distributed-kv-store/internal/sim"
+	"distributed-kv-store/internal/transport"
 )
 
 // NewNode builds one Member's core.
@@ -81,13 +82,16 @@ const (
 )
 
 // Run drives one Simulation: clients throughout, the scenario's Faults in the
-// middle, then repair and a quiet period before the verdicts.
+// middle, then repair and a quiet period before the verdicts. Messages pass
+// through the network encoding, so the core's message types must have been
+// given to transport.Register.
 func Run(newNode NewNode, sc Scenario, members int, seed uint64) Report {
 	s := sim.New(sim.Config{
 		Seed:       seed,
 		Nodes:      members,
 		NewNode:    newNode,
 		NewMachine: func() sim.Machine { return fsm.New() },
+		Copy:       transport.NewLoopback().Copy,
 	})
 	h := &check.History{}
 	rep := Report{Scenario: sc.Name, Seed: seed, Members: members, History: h}

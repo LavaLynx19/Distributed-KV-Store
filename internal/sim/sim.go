@@ -29,6 +29,10 @@ type Config struct {
 	// NewMachine builds a Member's state machine.
 	NewMachine func() Machine
 
+	// Copy, if set, stands in for the network's encoding: every message is
+	// passed through it on the way, so Members never share memory.
+	Copy func(core.Message) core.Message
+
 	// Virtual time is in arbitrary units. Each Member ticks every TickEvery
 	// units, and a message takes MinDelay..MaxDelay units. Zero values take
 	// the defaults 10, 1 and 8.
@@ -263,6 +267,9 @@ func (s *Sim) send(msg core.Message) {
 	if s.loss > 0 && s.rng.Float64() < s.loss {
 		s.mix('D', uint64(msg.From), uint64(msg.To))
 		return
+	}
+	if s.cfg.Copy != nil {
+		msg = s.cfg.Copy(msg)
 	}
 	delay := s.cfg.MinDelay + s.rng.Int64N(s.cfg.MaxDelay-s.cfg.MinDelay+1)
 	s.schedule(delay, func() { s.deliver(msg) })

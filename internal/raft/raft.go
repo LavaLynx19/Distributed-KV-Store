@@ -46,6 +46,12 @@ type AppendReply struct {
 	Match   core.Index
 }
 
+// MessageBodies lists the types this core puts in a Message, for the
+// transport to register.
+func MessageBodies() []any {
+	return []any{RequestVote{}, VoteReply{}, Append{}, AppendReply{}}
+}
+
 // Config sets up one Member.
 type Config struct {
 	ID      core.NodeID
