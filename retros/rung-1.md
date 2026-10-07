@@ -1,6 +1,6 @@
 # Rung 1 retro: split brain and a lost Acknowledged write
 
-Status: **in progress**. The naive store's failures are recorded below (P1.5). The fix and its results follow.
+Status: **in progress**. The naive store's failures and the Raft core's Simulation results are recorded below. Real-process runs and the baseline numbers (P1.10–P1.12) are still to come.
 
 Environment: everything in this section ran in the Simulation (A§8.1): one process, virtual time, a seed per run. Each Member ticks every 10 time units and a message takes 1–8. Four clients work three keys, each client sitting beside one Member and sharing its view of the network.
 
@@ -54,3 +54,41 @@ KV_EVIDENCE=harness/out/rung-1 go test -run TestNaiveIsExposed ./internal/rungte
 
 ### Harness lesson so far
 The first version of the simulated clients could reach every Member regardless of the Partition. With the primary cut off, all 30 runs still showed two primaries and diverged data, but every History was Linearizable: no client ever spoke to the second primary. Giving each client a home Member, so it sees the network as that Member does, made the lost writes visible (30 of 30). A Fault that clients don't experience can hide the failure it causes.
+
+## Fix: Raft (P1.6–P1.9)
+
+`internal/raft` replaces the naive core: Terms, one vote per Term, votes only for a candidate whose Log is at least as up to date, replication to a Majority before anything is acknowledged, and commit only through an Entry of the Leader's own Term. Reads go through the Log, and clients don't retry (A§6.2, A§6.3).
+
+### Same scenarios, same harness
+2,000 seeds per row, 16,000 runs in all. A run fails on any of: History not Linearizable, Members diverged, two Leaders in one Term.
+
+| Scenario | Members | Failed | Recovery after repair: median / p99 / max | Per run: answered / rejected / lost |
+|---|---|---|---|---|
+| No Faults | 3 | 0 | 9 / 47 / 81 | 529 / 25 / 0 |
+| No Faults | 5 | 0 | 9 / 56 / 75 | 516 / 24 / 0 |
+| Leader cut off, then healed | 3 | 0 | 9 / 51 / 69 | 407 / 148 / 3 |
+| Leader cut off, then healed | 5 | 0 | 9 / 52 / 80 | 424 / 115 / 2 |
+| Leader crashes, then returns | 3 | 0 | 9 / 47 / 70 | 492 / 60 / 1 |
+| Leader crashes, then returns | 5 | 0 | 9 / 50 / 80 | 487 / 55 / 1 |
+| Random crashes, restarts, Partitions | 3 | 0 | 68 / 264 / 338 | 271 / 304 / 5 |
+| Random crashes, restarts, Partitions | 5 | 0 | 49 / 255 / 371 | 303 / 247 / 5 |
+
+- Times are in Simulation units (a tick is 10; an election timeout is 100–200). "Recovery" is from the moment every Fault is repaired to the first write answered OK.
+- The four seeds pinned against the naive store all pass (`TestRaftPassesTheNaiveSeeds`).
+- "Rejected" is the store saying no: not the Leader, or no Leader with a Majority. "Lost" is a request with no definite answer, almost always one pending on a Leader that then stepped down. Safety costs availability: under random Faults about half of all requests are refused.
+
+### What broke on the way: a slow election, found by the liveness check
+The first full run kept every safety verdict in all 1,600 runs, but in 3 of them no write succeeded in the 500 units after the Faults were repaired. The harness only noticed because it also requires the Group to work again; a store that refuses everything is trivially "safe".
+
+- **Symptom (seed 56, 5 Members, random Faults):** after repair it took 5 Terms and about 550 units to elect a Leader.
+- **Cause:** a Member reset its election timer whenever it saw a higher Term, even when it then refused the vote. Three of the five Members had Logs too far behind to win. Each time one of them stood, it pushed back the timers of the two Members that could win.
+- **Fix:** a follower's timer is reset only by a granted vote or by word from the Leader (`becomeFollower`). Regression test: `TestRefusedVoteDoesNotResetElectionTimer`.
+- **After:** 16,000 runs, every one recovers, worst case 371 units.
+
+A stale Member can still force a new Term each time it times out, which interrupts a healthy Leader once the network heals. Raft's pre-vote extension removes that. It isn't needed for Rung 1's guarantees, so it's noted here and left out.
+
+### Reproduce
+```
+go test ./internal/raft/                          # unit tests, including Figure 8
+go test -run TestRaft ./internal/rungtest/        # 200 seeds per scenario; -short for 20
+```

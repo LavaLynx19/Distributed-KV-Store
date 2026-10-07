@@ -41,6 +41,9 @@ type Report struct {
 	Diverged []string
 	// Verdict 3: what clients saw.
 	Signals check.Signals
+	// Recovery is how long after the Faults were repaired the first write
+	// succeeded, or -1 if none did.
+	Recovery int64
 
 	// TwoLeaders is set when two running Members were Leader in the same
 	// Term at the same moment.
@@ -62,9 +65,9 @@ func (r Report) String() string {
 	if !r.Passed() {
 		state = "FAIL"
 	}
-	s := fmt.Sprintf("%s %s seed=%d members=%d linearizable=%v diverged=%d answered=%d rejected=%d lost=%d",
+	s := fmt.Sprintf("%s %s seed=%d members=%d linearizable=%v diverged=%d answered=%d rejected=%d lost=%d recovery=%d",
 		state, r.Scenario, r.Seed, r.Members, r.Linearizable, len(r.Diverged),
-		r.Signals.Answered, r.Signals.Rejected, r.Signals.Lost)
+		r.Signals.Answered, r.Signals.Rejected, r.Signals.Lost, r.Recovery)
 	if r.TwoLeaders != "" {
 		s += " two-leaders: " + r.TwoLeaders
 	}
@@ -109,6 +112,7 @@ func Run(newNode NewNode, sc Scenario, members int, seed uint64) Report {
 	}
 	rep.Diverged = check.Diverged(items)
 	rep.Signals = h.Signals
+	rep.Recovery = h.Signals.RecoveryAfter(faultsEnd)
 	return rep
 }
 
