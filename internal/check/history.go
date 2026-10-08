@@ -93,6 +93,23 @@ func (s Signals) RecoveryAfter(t int64) int64 {
 	return -1
 }
 
+// LongestPauseAfter is the longest stretch with no write answered OK, among
+// stretches that end after time t. With t set to just before a Fault, it is
+// how long the Fault stopped clients writing, however exactly the Fault's
+// start lines up with t. It returns -1 if no write succeeded after t.
+func (s Signals) LongestPauseAfter(t int64) int64 {
+	longest, prev := int64(-1), int64(-1)
+	for _, at := range s.okWrites {
+		if at >= t && prev >= 0 {
+			longest = max(longest, at-prev)
+		} else if at >= t {
+			longest = max(longest, at-t)
+		}
+		prev = at
+	}
+	return longest
+}
+
 // Operations turns the History into the checker's input.
 //   - A rejected request had no effect and is left out.
 //   - A request still open, or lost, stays open to the end of the History: it

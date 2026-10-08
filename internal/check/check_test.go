@@ -186,6 +186,17 @@ func TestSignals(t *testing.T) {
 	if got := s.RecoveryAfter(100); got != -1 {
 		t.Errorf("RecoveryAfter(100) = %d, want -1", got)
 	}
+	// OK writes at 10 and 95. A mark at 30 falls inside the pause between
+	// them, and the whole pause counts.
+	if got := s.LongestPauseAfter(30); got != 85 {
+		t.Errorf("LongestPauseAfter(30) = %d, want 85", got)
+	}
+	if got := s.LongestPauseAfter(5); got != 85 {
+		t.Errorf("LongestPauseAfter(5) = %d, want 85 (the longer of 5 and 85)", got)
+	}
+	if got := s.LongestPauseAfter(100); got != -1 {
+		t.Errorf("LongestPauseAfter(100) = %d, want -1", got)
+	}
 }
 
 func TestDiverged(t *testing.T) {

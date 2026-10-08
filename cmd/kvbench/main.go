@@ -56,7 +56,7 @@ func main() {
 	flag.IntVar(&cfg.keys, "keys", 50, "number of distinct keys")
 	flag.DurationVar(&cfg.duration, "duration", 10*time.Second, "how long clients run")
 	flag.DurationVar(&cfg.timeout, "timeout", 2*time.Second, "how long a client waits for one answer")
-	flag.DurationVar(&cfg.mark, "mark", 0, "report how long after this point the next write succeeded (set it to when a Fault is injected)")
+	flag.DurationVar(&cfg.mark, "mark", 0, "report the longest pause in successful writes after this point (set it to just before a Fault is injected)")
 	flag.DurationVar(&cfg.settle, "settle", 15*time.Second, "how long to wait after the load for Members to converge")
 	flag.DurationVar(&cfg.checkFor, "check", time.Minute, "time limit for the linearizability check (0 skips it)")
 	flag.Uint64Var(&cfg.seed, "seed", 1, "seed for the clients' choices")
@@ -153,8 +153,8 @@ func run(cfg config) bool {
 	report("  reads:", rec.reads)
 	report("  writes:", rec.writes)
 	if cfg.mark > 0 {
-		if after := sig.RecoveryAfter(int64(cfg.mark)); after >= 0 {
-			fmt.Printf("recovery:    next write succeeded %s after the mark at %s\n", round(time.Duration(after)), cfg.mark)
+		if pause := sig.LongestPauseAfter(int64(cfg.mark)); pause >= 0 {
+			fmt.Printf("recovery:    longest pause in successful writes after the mark at %s: %s\n", cfg.mark, round(time.Duration(pause)))
 		} else {
 			fmt.Printf("recovery:    no write succeeded after the mark at %s\n", cfg.mark)
 		}
