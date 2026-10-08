@@ -109,8 +109,8 @@ Rung 1 measured the baseline (`retros/rung-1.md`): with nothing on disk, a **Gro
 
 - **Throughput: each Rung against the one before.** With no **Faults**, on local processes with 3 Members and the same load, a Rung must answer at least 0.9× the requests/s of the Rung before it.
 - **A Rung that adds a known cost resets the baseline.** Rung 3 puts a disk write before every acknowledgement. Its retro states the cost, and Rung 4 is then measured against Rung 3.
-- **A Rung that adds a faster path must show it.** Rung 2's read index must answer reads faster than reads through the **Log**.
-- **Recovery:** when a Leader is cut off by a **Partition**, the next write must succeed within 2× the longest election timeout (400 ms at the Rung 1 settings). A frozen Leader is reported separately, because there the delay is the client's own request timeout.
+- **A Rung that adds a faster path must show it.** The read index must answer reads faster than reads through the **Log**. This is judged in Rung 3: while nothing is written to disk the two cost the same network round trip, and Rung 2 measured the read index about 10% slower (`retros/rung-2.md`).
+- **Recovery:** when a Leader is cut off by a **Partition**, the longest pause in successful writes must stay within 2× the longest election timeout (400 ms at the Rung 1 settings). A frozen Leader is reported separately, because there the delay is the client's own request timeout.
 - Docker numbers are reported beside the local ones, not gated.
 
 ## Success Criteria

@@ -14,6 +14,10 @@
 #
 # Environment:
 #   CLIENTS=8  DURATION=10s  FAULT_AT=3  FAULT_FOR=3   (seconds for the last two)
+#   RETRY=1    clients open a Session and retry unanswered requests (A§6.3)
+#   READ_PCT=35  percentage of requests that are gets
+#   TAG=name   added to the output file name, to keep variants apart
+#   READS=index|log   how gets are answered (default index, A§6.2)
 #
 # Output is also saved to harness/out/run-<backend>-<members>-<fault>.txt.
 set -euo pipefail
@@ -38,6 +42,10 @@ case "$FAULT" in
   *) echo "unknown fault $FAULT" >&2; exit 2 ;;
 esac
 
+if [[ -n "${READS:-}" ]]; then
+  export READS KVNODE_FLAGS="${KVNODE_FLAGS:-} -reads $READS"
+fi
+
 mkdir -p "$OUT" "$ROOT/bin"
 go build -o "$ROOT/bin/kvbench" "$ROOT/cmd/kvbench"
 nodes=()
@@ -52,20 +60,24 @@ leader() {
   done
 }
 
-log="$OUT/run-$BACKEND-$N-$FAULT.txt"
+log="$OUT/run-$BACKEND-$N-$FAULT${TAG:+-$TAG}.txt"
 {
-  echo "== $BACKEND, $N Members, fault $FAULT, $CLIENTS clients for $DURATION"
+  echo "== $BACKEND, $N Members, fault $FAULT, $CLIENTS clients for $DURATION, reads by ${READS:-index}, ${READ_PCT:-35}% gets${RETRY:+, retrying in Sessions}"
   "$ctl" "${start[@]}" | tail -1
   trap '"$ctl" "$stop" >/dev/null 2>&1 || true' EXIT
   for _ in $(seq 1 100); do [[ -n "$(leader)" ]] && break; sleep 0.1; done
   [[ -n "$(leader)" ]] || { echo "no Leader after 10s" >&2; exit 1; }
 
   bench=("$ROOT/bin/kvbench" -nodes "$(IFS=,; echo "${nodes[*]}")" -clients "$CLIENTS" -duration "$DURATION")
+  [[ -n "${RETRY:-}" ]] && bench+=(-retry)
+  [[ -n "${READ_PCT:-}" ]] && bench+=(-read-pct "$READ_PCT")
   if [[ $FAULT == none ]]; then
     "${bench[@]}"
     status=$?
   else
-    "${bench[@]}" -mark "${FAULT_AT}s" &
+    # The mark sits one second before the Fault, so the pause the Fault
+    # causes always ends after it.
+    "${bench[@]}" -mark "$((FAULT_AT - 1))s" &
     pid=$!
     sleep "$FAULT_AT"
     target="$(leader)"

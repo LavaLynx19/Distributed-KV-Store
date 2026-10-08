@@ -4,8 +4,8 @@
 // and what became of each proposal. A core owns no threads, clocks, sockets
 // or files, so the same core runs under the real shell and the Simulation.
 //
-// The contract grows with the Rungs. Read requests arrive in Rung 2, and
-// durable writes and Snapshots in Rung 3 (PLAN.md).
+// The contract grows with the Rungs. Durable writes and Snapshots arrive in
+// Rung 3 (PLAN.md).
 package core
 
 // NodeID identifies a Node. Zero means "none" (for example, no known Leader).
@@ -44,7 +44,8 @@ type Message struct {
 	Body any
 }
 
-// Event is one input to a core. The events are Tick, Receive and Propose.
+// Event is one input to a core. The events are Tick, Receive, Propose and
+// Read.
 type Event interface{ event() }
 
 // Tick tells the core that one unit of time has passed. Timeouts are counted
@@ -62,9 +63,17 @@ type Propose struct {
 	Payload []byte
 }
 
+// Read asks the core when the shell may answer a read from this Member's
+// state machine, without putting the read in the Log (A§6.2). The core
+// reports exactly once, in Output.Reads, with the same Ref.
+type Read struct {
+	Ref uint64
+}
+
 func (Tick) event()    {}
 func (Receive) event() {}
 func (Propose) event() {}
+func (Read) event()    {}
 
 // Reason says why a proposal did not commit.
 type Reason uint8
@@ -103,6 +112,10 @@ type Output struct {
 	Committed []Entry
 	// Results for proposals whose fate is now known.
 	Results []Result
+	// Reads the core has ruled on. With Reason OK the shell may answer the
+	// read now, from the state machine as it stands after applying this
+	// Output's Committed Entries. Index is unused.
+	Reads []Result
 }
 
 // Role is a Member's part in its Group right now.

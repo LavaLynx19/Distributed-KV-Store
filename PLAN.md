@@ -26,13 +26,13 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P1.13 `retros/rung-1.md`; set relative targets for later Rungs in README → §P1
 
 ### Phase 2 — Rung 2: Stale read and double apply (§P2)
-- [ ] P2.1 Simulation network Faults: delay, reorder, duplicate, one-way Partition → §P2
-- [ ] P2.2 Naive shortcuts: the Leader answers reads from memory; clients retry unanswered requests → §P2
-- [ ] P2.3 Expose: Stale read from a cut-off Leader; a retried compare-and-set applied twice → §P2
-- [ ] P2.4 Sessions: open, deduplicate on apply, saved responses (A§6.3) → §P2
-- [ ] P2.5 Read index, with the own-Term commit rule (A§6.2) → §P2
-- [ ] P2.6 Rung 2 suite under the new Faults; measure Log reads vs read index → §P2
-- [ ] P2.7 `retros/rung-2.md` → §P2
+- [x] P2.1 Simulation network Faults: delay, reorder, duplicate, one-way Partition → §P2
+- [x] P2.2 Naive shortcuts: the Leader answers reads from memory; clients retry unanswered requests → §P2
+- [x] P2.3 Expose: Stale read from a cut-off Leader; a retried compare-and-set applied twice → §P2
+- [x] P2.4 Sessions: open, deduplicate on apply, saved responses (A§6.3) → §P2
+- [x] P2.5 Read index, with the own-Term commit rule (A§6.2) → §P2
+- [x] P2.6 Rung 2 suite under the new Faults; measure Log reads vs read index → §P2
+- [x] P2.7 `retros/rung-2.md` → §P2
 
 ### Phase 3 — Rung 3: restart amnesia and an endless Log (§P3)
 - [ ] P3.1 Simulation disk: writes pending until durable, lost at a crash, stalls → §P3
@@ -42,7 +42,7 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [ ] P3.5 Copy-on-write ordered tree replaces the v1 state → §P3
 - [ ] P3.6 Snapshots: take, write, trim the Log (A§6.4) → §P3
 - [ ] P3.7 Catch-up by Snapshot then Log → §P3
-- [ ] P3.8 Rung 3 suite: full restart, crash mid-write, stalled disk; measure Snapshot cost → §P3
+- [ ] P3.8 Rung 3 suite: full restart, crash mid-write, stalled disk; measure Snapshot cost, and read index against Log reads (target moved from Rung 2) → §P3
 - [ ] P3.9 `retros/rung-3.md` → §P3
 
 ### Phase 4 — Rung 4: a disk that lies (§P4)

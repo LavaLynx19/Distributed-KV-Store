@@ -35,15 +35,19 @@ type Append struct {
 	PrevTerm  core.Term
 	Entries   []core.Entry
 	Commit    core.Index
+	// ReadRound numbers the Leader's rounds of leadership confirmation
+	// (read.go). The follower echoes it.
+	ReadRound uint64
 }
 
 // AppendReply answers an Append. On success, Match is the last Index the
 // follower now shares with the Leader. On failure it is a hint: the Leader
 // should try again from Match+1.
 type AppendReply struct {
-	Term    core.Term
-	Success bool
-	Match   core.Index
+	Term      core.Term
+	Success   bool
+	Match     core.Index
+	ReadRound uint64
 }
 
 // MessageBodies lists the types this core puts in a Message, for the
@@ -51,6 +55,23 @@ type AppendReply struct {
 func MessageBodies() []any {
 	return []any{RequestVote{}, VoteReply{}, Append{}, AppendReply{}}
 }
+
+// ReadMode is how a Member answers core.Read events (A§6.2).
+type ReadMode uint8
+
+const (
+	// ReadsThroughLog: the shell sends reads as proposals, and never sends
+	// core.Read. This is Rung 1's path.
+	ReadsThroughLog ReadMode = iota
+	// ReadsFromMemory: a Member that believes it leads says yes at once.
+	// This is Rung 2's naive shortcut, wrong on purpose: a Leader that has
+	// been replaced without knowing it hands out Stale reads.
+	ReadsFromMemory
+	// ReadsByIndex: Raft's read index (read.go). The Leader answers from
+	// memory only once it has Committed an Entry of its own Term and a
+	// Majority has confirmed, after the read arrived, that it still leads.
+	ReadsByIndex
+)
 
 // Config sets up one Member.
 type Config struct {
@@ -63,6 +84,7 @@ type Config struct {
 	// A Leader sends a heartbeat every HeartbeatTicks.
 	HeartbeatTicks int
 	Rand           core.Rand
+	Reads          ReadMode
 }
 
 // maxBatch caps the Entries in one Append.
@@ -96,6 +118,12 @@ type Node struct {
 	heard     map[core.NodeID]int        // tick of each follower's last reply
 	heartbeat int                        // ticks since the last heartbeat
 	pending   map[core.Index]uint64      // proposals awaiting commit, by Index
+
+	// Read index state (read.go).
+	readRound  uint64                 // the latest confirmation round sent
+	roundOpen  bool                   // that round isn't confirmed yet
+	roundAcked map[core.NodeID]uint64 // highest round each follower has echoed
+	reads      []pendingRead
 }
 
 // New builds a Member, which starts as a follower in Term 0.
@@ -138,8 +166,11 @@ func (n *Node) Step(ev core.Event) core.Output {
 		n.receive(&out, ev.Msg)
 	case core.Propose:
 		n.propose(&out, ev)
+	case core.Read:
+		n.read(&out, ev)
 	}
 	n.deliverCommitted(&out)
+	n.releaseReads(&out)
 	return out
 }
 
@@ -193,6 +224,7 @@ func (n *Node) send(out *core.Output, to core.NodeID, body any) {
 func (n *Node) becomeFollower(out *core.Output, term core.Term, leader core.NodeID) {
 	if n.role == core.LeaderRole {
 		n.failPending(out)
+		n.failReads(out)
 	}
 	if term > n.term {
 		n.term = term
@@ -281,6 +313,22 @@ func (n *Node) propose(out *core.Output, p core.Propose) {
 		}
 	}
 	n.advanceCommit()
+}
+
+// read rules on a read that bypasses the Log.
+func (n *Node) read(out *core.Output, r core.Read) {
+	switch {
+	case n.cfg.Reads == ReadsThroughLog:
+		panic("raft: core.Read sent to a Member configured for reads through the Log")
+	case n.role == core.LeaderRole && n.cfg.Reads == ReadsByIndex:
+		n.queueRead(out, r)
+	case n.role == core.LeaderRole:
+		out.Reads = append(out.Reads, core.Result{Ref: r.Ref, Reason: core.OK})
+	case n.role == core.Follower && n.leader != 0:
+		out.Reads = append(out.Reads, core.Result{Ref: r.Ref, Reason: core.NotLeader, Leader: n.leader})
+	default:
+		out.Reads = append(out.Reads, core.Result{Ref: r.Ref, Reason: core.NoMajority})
+	}
 }
 
 func (n *Node) String() string {

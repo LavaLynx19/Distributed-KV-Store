@@ -47,6 +47,7 @@ func (r *relay) Step(ev core.Event) core.Output {
 type echo struct{ applied int }
 
 func (e *echo) Apply(en core.Entry) []byte { e.applied++; return en.Payload }
+func (e *echo) Read(query []byte) []byte   { return query }
 
 func newRelaySim(seed uint64, n int) (*Sim, map[core.NodeID]*relay) {
 	relays := map[core.NodeID]*relay{}
@@ -195,5 +196,83 @@ func TestLossDropsSomeMessages(t *testing.T) {
 	s.Run(s.Now() + 100)
 	if relays[2].received != before+1 {
 		t.Fatal("with loss off, a message was still lost")
+	}
+}
+
+func TestCutIsOneWay(t *testing.T) {
+	s, relays := newRelaySim(13, 2)
+	s.Cut([]core.NodeID{1}, []core.NodeID{2}) // 1 can't reach 2; 2 still reaches 1
+	s.Propose(1, []byte("x"), func(Reply) {})
+	s.Propose(2, []byte("y"), func(Reply) {})
+	s.Run(100)
+	if relays[2].received != 0 || relays[1].received != 1 {
+		t.Fatalf("node 2 got %d (want 0), node 1 got %d (want 1)", relays[2].received, relays[1].received)
+	}
+	if s.Reachable(1, 2) || !s.Reachable(2, 1) {
+		t.Fatal("Reachable disagrees with the cut")
+	}
+	s.Heal()
+	s.Propose(1, []byte("z"), func(Reply) {})
+	s.Run(200)
+	if relays[2].received != 1 {
+		t.Fatalf("after healing node 2 got %d, want 1", relays[2].received)
+	}
+}
+
+func TestDuplicateDeliversSomeTwice(t *testing.T) {
+	s, relays := newRelaySim(17, 2)
+	s.SetDuplicate(0.5)
+	const sent = 200
+	for i := range sent {
+		s.At(int64(i*20), func() { s.Propose(1, []byte("m"), func(Reply) {}) })
+	}
+	s.Run(sent*20 + 100)
+	if got := relays[2].received; got <= sent || got >= 2*sent {
+		t.Fatalf("with 50%% duplication, node 2 received %d for %d sent", got, sent)
+	}
+}
+
+// order records the payloads a Member receives, in arrival order.
+type order struct {
+	relay
+	got []byte
+}
+
+func (o *order) Step(ev core.Event) core.Output {
+	if r, ok := ev.(core.Receive); ok {
+		o.got = append(o.got, r.Msg.Body.([]byte)[0])
+	}
+	return o.relay.Step(ev)
+}
+
+func TestWideDelayReorders(t *testing.T) {
+	var receiver *order
+	s := New(Config{
+		Seed: 19, Nodes: 2,
+		NewNode: func(id core.NodeID, members []core.NodeID, _ core.Rand) core.Node {
+			o := &order{relay: relay{id: id, members: members}}
+			if id == 2 {
+				receiver = o
+			}
+			return o
+		},
+		NewMachine: func() Machine { return &echo{} },
+	})
+	s.SetDelay(1, 200)
+	for i := range 50 {
+		s.At(int64(i*10), func() { s.Propose(1, []byte{byte(i)}, func(Reply) {}) })
+	}
+	s.Run(2000)
+	if len(receiver.got) != 50 {
+		t.Fatalf("received %d of 50", len(receiver.got))
+	}
+	inOrder := true
+	for i := 1; i < len(receiver.got); i++ {
+		if receiver.got[i] < receiver.got[i-1] {
+			inOrder = false
+		}
+	}
+	if inOrder {
+		t.Fatal("a 1..200 delay with sends 10 apart should let later messages overtake earlier ones")
 	}
 }

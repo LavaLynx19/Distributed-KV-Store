@@ -22,6 +22,8 @@ const (
 	OpPut
 	// OpDelete removes a key.
 	OpDelete
+	// OpOpenSession registers a Session. The response carries its id.
+	OpOpenSession
 )
 
 // Command is one client request, carried in an Entry's payload.
@@ -34,6 +36,12 @@ type Command struct {
 	// doesn't exist".
 	Conditional bool
 	IfVersion   uint64
+	// Session and Seq identify the request, so that a retry takes effect
+	// once (A§6.3). A client sends Seq 1, 2, 3… within its Session, and
+	// repeats a Seq only to retry that request. Session 0 means no Session:
+	// every copy of the request is applied.
+	Session uint64
+	Seq     uint64
 }
 
 // Status is the outcome of applying a Command.
@@ -45,8 +53,12 @@ const (
 	StatusNotFound
 	// StatusVersionMismatch: a compare-and-set found a different version.
 	StatusVersionMismatch
-	// StatusInvalid: the Entry's payload wasn't a valid Command.
+	// StatusInvalid: the Entry's payload wasn't a valid Command, or its Seq
+	// is older than one the Session has already moved past.
 	StatusInvalid
+	// StatusSessionExpired: the Command named a Session the store doesn't
+	// have.
+	StatusSessionExpired
 )
 
 // Response is what the client gets back. Version is the key's version after
@@ -56,6 +68,8 @@ type Response struct {
 	Status  Status
 	Value   []byte
 	Version uint64
+	// Session is the new Session's id, in the answer to OpOpenSession.
+	Session uint64
 }
 
 // Item is one key with its value and version.
@@ -70,12 +84,23 @@ type entry struct {
 	version uint64
 }
 
-// Machine holds the keys. The zero value is not usable; call New.
-type Machine struct {
-	keys map[string]entry
+// session is what the store remembers about one client: the last request it
+// applied for that client, and what it answered.
+type session struct {
+	lastSeq  uint64
+	lastResp []byte
 }
 
-func New() *Machine { return &Machine{keys: map[string]entry{}} }
+// Machine holds the keys and the Sessions. The zero value is not usable;
+// call New.
+type Machine struct {
+	keys     map[string]entry
+	sessions map[uint64]*session
+}
+
+func New() *Machine {
+	return &Machine{keys: map[string]entry{}, sessions: map[uint64]*session{}}
+}
 
 // Apply executes a Committed Entry and returns its encoded Response. A no-op
 // Entry changes nothing and returns nil.
@@ -87,7 +112,42 @@ func (m *Machine) Apply(e core.Entry) []byte {
 	if err != nil {
 		return Response{Status: StatusInvalid}.Encode()
 	}
-	return m.apply(cmd, uint64(e.Index)).Encode()
+	index := uint64(e.Index)
+	if cmd.Op == OpOpenSession {
+		// The Entry's Index is unique and the same on every Member, which
+		// makes it a ready-made Session id.
+		m.sessions[index] = &session{}
+		return Response{Status: StatusOK, Session: index}.Encode()
+	}
+	if cmd.Session == 0 {
+		return m.apply(cmd, index).Encode()
+	}
+
+	s, ok := m.sessions[cmd.Session]
+	switch {
+	case !ok:
+		return Response{Status: StatusSessionExpired}.Encode()
+	case cmd.Seq == s.lastSeq && s.lastSeq != 0:
+		return s.lastResp // a retry: answer as before, change nothing
+	case cmd.Seq < s.lastSeq:
+		return Response{Status: StatusInvalid}.Encode()
+	}
+	s.lastSeq = cmd.Seq
+	s.lastResp = m.apply(cmd, index).Encode()
+	return s.lastResp
+}
+
+// Sessions is how many Sessions are open, for tests and End-state checks.
+func (m *Machine) Sessions() int { return len(m.sessions) }
+
+// Read answers an encoded get from the state as it stands, without an Entry.
+// Whether that answer is safe to give a client is the core's call (A§6.2).
+func (m *Machine) Read(query []byte) []byte {
+	cmd, err := DecodeCommand(query)
+	if err != nil || cmd.Op != OpGet {
+		return Response{Status: StatusInvalid}.Encode()
+	}
+	return m.apply(cmd, 0).Encode()
 }
 
 // A key's version is the Index of the Entry that last wrote it. Versions
@@ -141,10 +201,10 @@ func cmpString(a, b string) int {
 
 var errMalformed = errors.New("fsm: malformed payload")
 
-// Encode lays a Command out as: op, flags, if-version, key length, key,
-// value length, value. Integers are unsigned varints.
+// Encode lays a Command out as: op, flags, if-version, session, seq, key
+// length, key, value length, value. Integers are unsigned varints.
 func (c Command) Encode() []byte {
-	b := make([]byte, 0, 4+len(c.Key)+len(c.Value)+3*binary.MaxVarintLen64)
+	b := make([]byte, 0, 4+len(c.Key)+len(c.Value)+5*binary.MaxVarintLen64)
 	b = append(b, byte(c.Op))
 	var flags byte
 	if c.Conditional {
@@ -152,6 +212,8 @@ func (c Command) Encode() []byte {
 	}
 	b = append(b, flags)
 	b = binary.AppendUvarint(b, c.IfVersion)
+	b = binary.AppendUvarint(b, c.Session)
+	b = binary.AppendUvarint(b, c.Seq)
 	b = binary.AppendUvarint(b, uint64(len(c.Key)))
 	b = append(b, c.Key...)
 	b = binary.AppendUvarint(b, uint64(len(c.Value)))
@@ -164,12 +226,18 @@ func DecodeCommand(b []byte) (Command, error) {
 		return Command{}, errMalformed
 	}
 	c := Command{Op: Op(b[0]), Conditional: b[1]&1 != 0}
-	if c.Op < OpGet || c.Op > OpDelete {
+	if c.Op < OpGet || c.Op > OpOpenSession {
 		return Command{}, errMalformed
 	}
 	b = b[2:]
 	var ok bool
 	if c.IfVersion, b, ok = uvarint(b); !ok {
+		return Command{}, errMalformed
+	}
+	if c.Session, b, ok = uvarint(b); !ok {
+		return Command{}, errMalformed
+	}
+	if c.Seq, b, ok = uvarint(b); !ok {
 		return Command{}, errMalformed
 	}
 	var key []byte
@@ -183,11 +251,13 @@ func DecodeCommand(b []byte) (Command, error) {
 	return c, nil
 }
 
-// Encode lays a Response out as: status, version, value length, value.
+// Encode lays a Response out as: status, version, session, value length,
+// value.
 func (r Response) Encode() []byte {
-	b := make([]byte, 0, 1+len(r.Value)+2*binary.MaxVarintLen64)
+	b := make([]byte, 0, 1+len(r.Value)+3*binary.MaxVarintLen64)
 	b = append(b, byte(r.Status))
 	b = binary.AppendUvarint(b, r.Version)
+	b = binary.AppendUvarint(b, r.Session)
 	b = binary.AppendUvarint(b, uint64(len(r.Value)))
 	b = append(b, r.Value...)
 	return b
@@ -201,6 +271,9 @@ func DecodeResponse(b []byte) (Response, error) {
 	b = b[1:]
 	var ok bool
 	if r.Version, b, ok = uvarint(b); !ok {
+		return Response{}, errMalformed
+	}
+	if r.Session, b, ok = uvarint(b); !ok {
 		return Response{}, errMalformed
 	}
 	if r.Value, b, ok = lengthPrefixed(b); !ok || len(b) != 0 {

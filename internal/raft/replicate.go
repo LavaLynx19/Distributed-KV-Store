@@ -19,6 +19,7 @@ func (n *Node) sendAppend(out *core.Output, m core.NodeID) {
 		PrevTerm:  n.termAt(prev),
 		Entries:   slices.Clone(n.log[prev:end]),
 		Commit:    n.commit,
+		ReadRound: n.readRound,
 	})
 	n.next[m] = end + 1
 }
@@ -42,11 +43,11 @@ func (n *Node) handleAppend(out *core.Output, from core.NodeID, m Append) {
 	n.elapsed = 0
 
 	if m.PrevIndex > n.lastIndex() {
-		n.send(out, from, AppendReply{Term: n.term, Match: n.lastIndex()})
+		n.send(out, from, AppendReply{Term: n.term, Match: n.lastIndex(), ReadRound: m.ReadRound})
 		return
 	}
 	if n.termAt(m.PrevIndex) != m.PrevTerm {
-		n.send(out, from, AppendReply{Term: n.term, Match: m.PrevIndex - 1})
+		n.send(out, from, AppendReply{Term: n.term, Match: m.PrevIndex - 1, ReadRound: m.ReadRound})
 		return
 	}
 
@@ -70,7 +71,7 @@ func (n *Node) handleAppend(out *core.Output, from core.NodeID, m Append) {
 	if c := min(m.Commit, confirmed); c > n.commit {
 		n.commit = c
 	}
-	n.send(out, from, AppendReply{Term: n.term, Success: true, Match: confirmed})
+	n.send(out, from, AppendReply{Term: n.term, Success: true, Match: confirmed, ReadRound: m.ReadRound})
 }
 
 func (n *Node) handleAppendReply(out *core.Output, from core.NodeID, m AppendReply) {
@@ -78,6 +79,12 @@ func (n *Node) handleAppendReply(out *core.Output, from core.NodeID, m AppendRep
 		return
 	}
 	n.heard[from] = n.now
+	// Any reply in this Term, success or not, says the follower still
+	// recognised this Leader when it handled that round's Append.
+	if m.ReadRound > n.roundAcked[from] {
+		n.roundAcked[from] = m.ReadRound
+		n.roundConfirmed(out)
+	}
 	if !m.Success {
 		// Back up to the follower's hint, but never behind what it has
 		// already confirmed.

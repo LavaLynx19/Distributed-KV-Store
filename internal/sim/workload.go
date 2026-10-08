@@ -21,6 +21,18 @@ type Workload struct {
 	Keys    int   // keys are "k0".."k<Keys-1>"; a small number forces contention
 	Timeout int64 // how long a client waits for a reply before giving up
 	Think   int64 // a client pauses 1..Think units between requests
+
+	// ReadsBypassLog sends gets as core.Read events instead of proposals, so
+	// the core's read path answers them (A§6.2).
+	ReadsBypassLog bool
+	// Retry makes a client send a request again, to another Member, when it
+	// gets no definite answer or is turned away, until it is answered or
+	// four Timeouts have passed. The History records one request, from the
+	// first attempt to the final answer.
+	Retry bool
+	// Sessions makes each client open a Session first and number its
+	// requests within it, so the store can recognise a retry (A§6.3).
+	Sessions bool
 }
 
 // DefaultWorkload is enough contention to make ordering mistakes visible.
@@ -32,6 +44,9 @@ type client struct {
 	leader core.NodeID       // where this client currently sends requests
 	seen   map[string]uint64 // last version this client observed per key
 	count  int
+	// session and seq identify this client's requests when Sessions is on.
+	session uint64
+	seq     uint64
 }
 
 // Start launches the clients. They stop issuing requests at time until.
@@ -39,12 +54,76 @@ func (w Workload) Start(s *Sim, h *check.History, until int64) {
 	ids := s.IDs()
 	for i := range w.Clients {
 		c := &client{id: i, home: ids[i%len(ids)], leader: ids[s.Rand().IntN(len(ids))], seen: map[string]uint64{}}
-		s.After(1+s.Rand().Int64N(w.Think), func() { w.next(s, h, c, until) })
+		start := func() { w.next(s, h, c, until) }
+		if w.Sessions {
+			start = func() { w.openSession(s, c, func() { w.next(s, h, c, until) }) }
+		}
+		s.After(1+s.Rand().Int64N(w.Think), start)
 	}
+}
+
+// openSession keeps trying until some Leader has registered a Session for
+// the client, then calls then.
+func (w Workload) openSession(s *Sim, c *client, then func()) {
+	ids := s.IDs()
+	done := false
+	var attempt func()
+	attempt = func() {
+		if done {
+			return
+		}
+		target := c.leader
+		over := false
+		move := func(to core.NodeID) {
+			if over {
+				return
+			}
+			over = true
+			if c.leader = to; to == 0 {
+				c.leader = ids[s.Rand().IntN(len(ids))]
+			}
+			s.After(10+s.Rand().Int64N(20), attempt)
+		}
+		if !s.Reachable(c.home, target) {
+			move(0)
+			return
+		}
+		s.After(w.Timeout, func() { move(0) })
+		s.Propose(target, fsm.Command{Op: fsm.OpOpenSession}.Encode(), func(r Reply) {
+			if over || !s.Reachable(target, c.home) {
+				return
+			}
+			if r.Refused || r.Reason != core.OK {
+				move(r.Leader)
+				return
+			}
+			resp, err := fsm.DecodeResponse(r.Response)
+			if err != nil || resp.Session == 0 {
+				panic(fmt.Sprintf("sim: bad answer to OpOpenSession: %+v, %v", resp, err))
+			}
+			over, done = true, true
+			c.session = resp.Session
+			then()
+		})
+	}
+	attempt()
+}
+
+// dispatch sends cmd to a Member by the path the Workload is configured for.
+func (w Workload) dispatch(s *Sim, to core.NodeID, cmd fsm.Command, done func(Reply)) {
+	if w.ReadsBypassLog && cmd.Op == fsm.OpGet {
+		s.Read(to, cmd.Encode(), done)
+		return
+	}
+	s.Propose(to, cmd.Encode(), done)
 }
 
 func (w Workload) next(s *Sim, h *check.History, c *client, until int64) {
 	if s.Now() >= until {
+		return
+	}
+	if w.Retry {
+		w.nextRetrying(s, h, c, until)
 		return
 	}
 	cmd := w.pick(s, c)
@@ -78,7 +157,7 @@ func (w Workload) next(s *Sim, h *check.History, c *client, until int64) {
 			finish(check.Lost, fsm.Response{})
 		}
 	})
-	s.Propose(target, cmd.Encode(), func(r Reply) {
+	w.dispatch(s, target, cmd, func(r Reply) {
 		if settled || !s.Reachable(target, c.home) {
 			return // the reply can't get back; the client will time out
 		}
@@ -105,9 +184,20 @@ func (w Workload) next(s *Sim, h *check.History, c *client, until int64) {
 	})
 }
 
-// pick chooses the client's next request: mostly reads and writes, with
-// compare-and-sets against the version the client last saw.
+// pick chooses the client's next request and, if the client has a Session,
+// gives it the next request number.
 func (w Workload) pick(s *Sim, c *client) fsm.Command {
+	cmd := w.choose(s, c)
+	if c.session != 0 {
+		c.seq++
+		cmd.Session, cmd.Seq = c.session, c.seq
+	}
+	return cmd
+}
+
+// choose picks mostly reads and writes, with compare-and-sets against the
+// version the client last saw.
+func (w Workload) choose(s *Sim, c *client) fsm.Command {
 	key := fmt.Sprintf("k%d", s.Rand().IntN(w.Keys))
 	c.count++
 	value := []byte(fmt.Sprintf("c%d-%d", c.id, c.count))
@@ -130,4 +220,74 @@ func (c *client) observe(cmd fsm.Command, resp fsm.Response) {
 	case fsm.StatusNotFound:
 		c.seen[cmd.Key] = 0
 	}
+}
+
+// nextRetrying is next for a client that retries. Each attempt gets Timeout
+// to produce an answer; the client gives up, recording the request as lost,
+// four Timeouts after the first attempt.
+func (w Workload) nextRetrying(s *Sim, h *check.History, c *client, until int64) {
+	cmd := w.pick(s, c)
+	id := h.Begin(c.id, cmd, s.Now())
+	giveUp := s.Now() + 4*w.Timeout
+	settled := false
+	finish := func(result check.Result, resp fsm.Response) {
+		if settled {
+			return
+		}
+		settled = true
+		h.End(id, result, resp, s.Now())
+		s.After(1+s.Rand().Int64N(w.Think), func() { w.next(s, h, c, until) })
+	}
+	elsewhere := func() core.NodeID {
+		ids := s.IDs()
+		return ids[s.Rand().IntN(len(ids))]
+	}
+
+	var attempt func()
+	again := func() { s.After(10+s.Rand().Int64N(20), attempt) }
+	attempt = func() {
+		if settled {
+			return
+		}
+		if s.Now() >= giveUp {
+			finish(check.Lost, fsm.Response{})
+			return
+		}
+		target := c.leader
+		if !s.Reachable(c.home, target) {
+			c.leader = elsewhere()
+			again()
+			return
+		}
+		over := false // this attempt has ended, one way or another
+		s.After(w.Timeout, func() {
+			if !over && !settled {
+				over = true
+				c.leader = elsewhere()
+				attempt()
+			}
+		})
+		w.dispatch(s, target, cmd, func(r Reply) {
+			if over || settled || !s.Reachable(target, c.home) {
+				return // too late, or the reply can't get back
+			}
+			over = true
+			switch {
+			case !r.Refused && r.Reason == core.OK:
+				resp, err := fsm.DecodeResponse(r.Response)
+				if err != nil {
+					panic(fmt.Sprintf("sim: undecodable response: %v", err))
+				}
+				c.observe(cmd, resp)
+				finish(check.Answered, resp)
+			case !r.Refused && r.Reason == core.NotLeader && r.Leader != 0:
+				c.leader = r.Leader
+				again()
+			default: // refused, no Leader known, or outcome unknown
+				c.leader = elsewhere()
+				again()
+			}
+		})
+	}
+	attempt()
 }

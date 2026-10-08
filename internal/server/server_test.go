@@ -29,6 +29,11 @@ type member struct {
 // front, a 5ms tick.
 func cluster(t *testing.T, n int) map[core.NodeID]*member {
 	t.Helper()
+	return clusterReading(t, n, raft.ReadsByIndex)
+}
+
+func clusterReading(t *testing.T, n int, reads raft.ReadMode) map[core.NodeID]*member {
+	t.Helper()
 	transport.Register(raft.MessageBodies()...)
 
 	listeners := map[core.NodeID]net.Listener{}
@@ -51,11 +56,11 @@ func cluster(t *testing.T, n int) map[core.NodeID]*member {
 		var node *server.Node
 		tr := transport.New(id, listeners[id], peers, func(m core.Message) { node.Deliver(m) })
 		c := raft.New(raft.Config{ID: id, Members: ids, ElectionTicks: 10, HeartbeatTicks: 1,
-			Rand: rand.New(rand.NewPCG(uint64(id), 99))})
+			Rand: rand.New(rand.NewPCG(uint64(id), 99)), Reads: reads})
 		node = server.NewNode(c, fsm.New(), tr.Send, 5*time.Millisecond)
 		ctx, cancel := context.WithCancel(context.Background())
 		go node.Run(ctx)
-		api := &server.API{Node: node, Clients: clients, Timeout: 2 * time.Second}
+		api := &server.API{Node: node, Clients: clients, Timeout: 2 * time.Second, ReadsBypassLog: reads != raft.ReadsThroughLog}
 		m := &member{api: httptest.NewServer(api.Handler()), cancel: cancel, tr: tr}
 		members[id] = m
 		clients[id] = m.api.URL
@@ -69,11 +74,14 @@ type answer struct {
 	body map[string]any
 }
 
-func call(t *testing.T, method, url, body string) answer {
+func call(t *testing.T, method, url, body string, headers ...string) answer {
 	t.Helper()
 	req, err := http.NewRequest(method, url, bytes.NewBufferString(body))
 	if err != nil {
 		t.Fatal(err)
+	}
+	for i := 0; i+1 < len(headers); i += 2 {
+		req.Header.Set(headers[i], headers[i+1])
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -186,5 +194,64 @@ func TestSurvivesLeaderLoss(t *testing.T) {
 	next := leaderURL(t, members)
 	if a := call(t, "GET", next+"/v1/kv/a", ""); a.code != 200 || a.body["value"] != "kept" {
 		t.Fatalf("after losing the Leader: %+v, want the Acknowledged write", a)
+	}
+}
+
+func TestSessionMakesARetrySafe(t *testing.T) {
+	members := cluster(t, 3)
+	leader := leaderURL(t, members)
+
+	open := call(t, "POST", leader+"/v1/sessions", "")
+	if open.code != 200 || open.body["session"] == nil {
+		t.Fatalf("open session: %+v", open)
+	}
+	sid := fmt.Sprint(int(open.body["session"].(float64)))
+
+	// The same request twice: create "a" only if it doesn't exist.
+	body := `{"value":"once","if_version":0}`
+	first := call(t, "PUT", leader+"/v1/kv/a", body, "Session-Id", sid, "Request-Seq", "1")
+	retry := call(t, "PUT", leader+"/v1/kv/a", body, "Session-Id", sid, "Request-Seq", "1")
+	if first.code != 200 || retry.code != 200 || first.body["version"] != retry.body["version"] {
+		t.Fatalf("first %+v, retry %+v: the retry should get the first answer", first, retry)
+	}
+	// Without a Session the repeat is a new request, and fails.
+	if a := call(t, "PUT", leader+"/v1/kv/a", body); a.code != 409 {
+		t.Fatalf("repeat without a Session: %+v, want 409", a)
+	}
+
+	if a := call(t, "PUT", leader+"/v1/kv/b", `{"value":"x"}`, "Session-Id", "424242", "Request-Seq", "1"); a.code != 410 || a.body["reason"] != "session_expired" {
+		t.Fatalf("unknown Session: %+v", a)
+	}
+	if a := call(t, "PUT", leader+"/v1/kv/b", `{"value":"x"}`, "Session-Id", sid); a.code != 400 {
+		t.Fatalf("Session-Id without Request-Seq: %+v", a)
+	}
+}
+
+// The client API behaves the same whether gets go through the Log (Rung 1)
+// or the read index.
+func TestClientAPIWithReadsThroughLog(t *testing.T) {
+	members := clusterReading(t, 3, raft.ReadsThroughLog)
+	leader := leaderURL(t, members)
+	if a := call(t, "PUT", leader+"/v1/kv/a", `{"value":"1"}`); a.code != 200 {
+		t.Fatalf("put: %+v", a)
+	}
+	if a := call(t, "GET", leader+"/v1/kv/a", ""); a.code != 200 || a.body["value"] != "1" {
+		t.Fatalf("get: %+v", a)
+	}
+}
+
+func TestReadIndexFollowerRedirectsGets(t *testing.T) {
+	members := cluster(t, 3)
+	leader := leaderURL(t, members)
+	if a := call(t, "PUT", leader+"/v1/kv/a", `{"value":"1"}`); a.code != 200 {
+		t.Fatalf("put: %+v", a)
+	}
+	for _, m := range members {
+		if m.api.URL == leader {
+			continue
+		}
+		if a := call(t, "GET", m.api.URL+"/v1/kv/a", ""); a.code != 421 || a.body["leader"] != leader {
+			t.Fatalf("a follower answered a get with %+v, want 421 and a hint", a)
+		}
 	}
 }

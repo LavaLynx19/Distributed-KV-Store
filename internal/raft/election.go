@@ -60,6 +60,8 @@ func (n *Node) becomeLeader(out *core.Output) {
 	n.next = map[core.NodeID]core.Index{}
 	n.match = map[core.NodeID]core.Index{}
 	n.heard = map[core.NodeID]int{}
+	n.roundAcked = map[core.NodeID]uint64{}
+	n.roundOpen = false
 	for _, m := range n.members {
 		n.next[m] = n.lastIndex() + 1
 		n.heard[m] = n.now
