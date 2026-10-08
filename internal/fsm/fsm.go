@@ -90,6 +90,16 @@ func (m *Machine) Apply(e core.Entry) []byte {
 	return m.apply(cmd, uint64(e.Index)).Encode()
 }
 
+// Read answers an encoded get from the state as it stands, without an Entry.
+// Whether that answer is safe to give a client is the core's call (A§6.2).
+func (m *Machine) Read(query []byte) []byte {
+	cmd, err := DecodeCommand(query)
+	if err != nil || cmd.Op != OpGet {
+		return Response{Status: StatusInvalid}.Encode()
+	}
+	return m.apply(cmd, 0).Encode()
+}
+
 // A key's version is the Index of the Entry that last wrote it. Versions
 // therefore never repeat, even when a key is deleted and created again.
 func (m *Machine) apply(cmd Command, index uint64) Response {

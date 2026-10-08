@@ -325,3 +325,21 @@ func TestCatchUpDoesNotWaitForHeartbeats(t *testing.T) {
 		t.Fatalf("a caught-up follower was sent %d more messages", len(out.Messages))
 	}
 }
+
+// Rung 2's naive read path: whoever believes it leads says yes.
+func TestReadsFromMemory(t *testing.T) {
+	n := newNode(1, 3)
+	n.cfg.Reads = ReadsFromMemory
+
+	if out := n.Step(core.Read{Ref: 1}); len(out.Reads) != 1 || out.Reads[0].Reason != core.NoMajority {
+		t.Fatalf("with no known Leader: %+v, want NoMajority", out.Reads)
+	}
+	recv(n, 2, Append{Term: 1})
+	if out := n.Step(core.Read{Ref: 2}); out.Reads[0].Reason != core.NotLeader || out.Reads[0].Leader != 2 {
+		t.Fatalf("as a follower: %+v, want NotLeader with hint 2", out.Reads)
+	}
+	elect(t, n, 3)
+	if out := n.Step(core.Read{Ref: 3}); out.Reads[0] != (core.Result{Ref: 3, Reason: core.OK}) {
+		t.Fatalf("as Leader: %+v, want OK", out.Reads)
+	}
+}

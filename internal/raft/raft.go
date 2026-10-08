@@ -52,6 +52,19 @@ func MessageBodies() []any {
 	return []any{RequestVote{}, VoteReply{}, Append{}, AppendReply{}}
 }
 
+// ReadMode is how a Member answers core.Read events (A§6.2).
+type ReadMode uint8
+
+const (
+	// ReadsThroughLog: the shell sends reads as proposals, and never sends
+	// core.Read. This is Rung 1's path.
+	ReadsThroughLog ReadMode = iota
+	// ReadsFromMemory: a Member that believes it leads says yes at once.
+	// This is Rung 2's naive shortcut, wrong on purpose: a Leader that has
+	// been replaced without knowing it hands out Stale reads.
+	ReadsFromMemory
+)
+
 // Config sets up one Member.
 type Config struct {
 	ID      core.NodeID
@@ -63,6 +76,7 @@ type Config struct {
 	// A Leader sends a heartbeat every HeartbeatTicks.
 	HeartbeatTicks int
 	Rand           core.Rand
+	Reads          ReadMode
 }
 
 // maxBatch caps the Entries in one Append.
@@ -138,6 +152,8 @@ func (n *Node) Step(ev core.Event) core.Output {
 		n.receive(&out, ev.Msg)
 	case core.Propose:
 		n.propose(&out, ev)
+	case core.Read:
+		n.read(&out, ev)
 	}
 	n.deliverCommitted(&out)
 	return out
@@ -281,6 +297,20 @@ func (n *Node) propose(out *core.Output, p core.Propose) {
 		}
 	}
 	n.advanceCommit()
+}
+
+// read rules on a read that bypasses the Log.
+func (n *Node) read(out *core.Output, r core.Read) {
+	switch {
+	case n.cfg.Reads == ReadsThroughLog:
+		panic("raft: core.Read sent to a Member configured for reads through the Log")
+	case n.role == core.LeaderRole:
+		out.Reads = append(out.Reads, core.Result{Ref: r.Ref, Reason: core.OK})
+	case n.role == core.Follower && n.leader != 0:
+		out.Reads = append(out.Reads, core.Result{Ref: r.Ref, Reason: core.NotLeader, Leader: n.leader})
+	default:
+		out.Reads = append(out.Reads, core.Result{Ref: r.Ref, Reason: core.NoMajority})
+	}
 }
 
 func (n *Node) String() string {

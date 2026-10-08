@@ -14,9 +14,11 @@ import (
 )
 
 // Machine is the state machine a Member applies Committed Entries to. Apply
-// returns the response for the client that proposed the Entry.
+// returns the response for the client that proposed the Entry. Read answers
+// a query from the current state without an Entry.
 type Machine interface {
 	Apply(core.Entry) []byte
+	Read(query []byte) []byte
 }
 
 // Config describes one simulated Group.
@@ -58,6 +60,7 @@ type member struct {
 	machine Machine
 	up      bool
 	pending map[uint64]func(Reply)
+	queries map[uint64][]byte // the query of each pending read, by Ref
 }
 
 // Sim is one simulated Group. It is not safe for concurrent use: everything
@@ -105,6 +108,7 @@ func New(cfg Config) *Sim {
 			machine: cfg.NewMachine(),
 			up:      true,
 			pending: map[uint64]func(Reply){},
+			queries: map[uint64][]byte{},
 		}
 		s.members[id] = m
 		// Members tick out of phase with each other.
@@ -167,6 +171,22 @@ func (s *Sim) Propose(to core.NodeID, payload []byte, done func(Reply)) {
 	s.step(m, core.Propose{Ref: ref, Payload: payload})
 }
 
+// Read asks one Member to answer a query from its own state, bypassing the
+// Log. done is called exactly once.
+func (s *Sim) Read(to core.NodeID, query []byte, done func(Reply)) {
+	m := s.members[to]
+	if !m.up {
+		done(Reply{Refused: true})
+		return
+	}
+	s.nextRef++
+	ref := s.nextRef
+	m.pending[ref] = done
+	m.queries[ref] = query
+	s.mix('Q', uint64(to), ref)
+	s.step(m, core.Read{Ref: ref})
+}
+
 // Crash stops a Member. It receives nothing while down, messages to and from
 // it are lost, and its pending proposals end as Unknown. In Rungs 1–2 its
 // state survives intact (PLAN §P1), so a crash behaves like a long freeze.
@@ -185,6 +205,7 @@ func (s *Sim) Crash(id core.NodeID) {
 	for _, ref := range refs {
 		done := m.pending[ref]
 		delete(m.pending, ref)
+		delete(m.queries, ref)
 		done(Reply{Reason: core.Unknown})
 	}
 }
@@ -286,6 +307,19 @@ func (s *Sim) step(m *member, ev core.Event) {
 		}
 		delete(m.pending, r.Ref)
 		done(Reply{Reason: r.Reason, Response: responses[r.Index], Leader: r.Leader})
+	}
+	for _, r := range out.Reads {
+		done, ok := m.pending[r.Ref]
+		if !ok {
+			continue
+		}
+		reply := Reply{Reason: r.Reason, Leader: r.Leader}
+		if r.Reason == core.OK {
+			reply.Response = m.machine.Read(m.queries[r.Ref])
+		}
+		delete(m.pending, r.Ref)
+		delete(m.queries, r.Ref)
+		done(reply)
 	}
 	for _, msg := range out.Messages {
 		s.send(msg)

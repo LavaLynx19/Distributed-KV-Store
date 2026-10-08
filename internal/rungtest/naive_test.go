@@ -8,10 +8,15 @@ import (
 	"distributed-kv-store/internal/core"
 	"distributed-kv-store/internal/naive"
 	"distributed-kv-store/internal/rungtest"
+	"distributed-kv-store/internal/sim"
 )
 
-func newNaive(id core.NodeID, members []core.NodeID, _ core.Rand) core.Node {
-	return naive.New(id, members, naive.DefaultTimeout)
+// naiveStore is Rung 1's primary-backup store with Rung 1's clients.
+var naiveStore = rungtest.Store{
+	NewNode: func(id core.NodeID, members []core.NodeID, _ core.Rand) core.Node {
+		return naive.New(id, members, naive.DefaultTimeout)
+	},
+	Workload: sim.DefaultWorkload,
 }
 
 func scenario(t *testing.T, name string) rungtest.Scenario {
@@ -29,7 +34,7 @@ func scenario(t *testing.T, name string) rungtest.Scenario {
 func TestNaivePassesWithoutFaults(t *testing.T) {
 	for _, members := range []int{3, 5} {
 		for seed := uint64(1); seed <= 10; seed++ {
-			if r := rungtest.Run(newNaive, scenario(t, "none"), members, seed); !r.Passed() {
+			if r := rungtest.Run(naiveStore, scenario(t, "none"), members, seed); !r.Passed() {
 				t.Errorf("%v", r)
 			}
 		}
@@ -58,7 +63,7 @@ func TestNaiveIsExposed(t *testing.T) {
 		{"random", 5, 1, true, true, true},
 	}
 	for _, tt := range tests {
-		r := rungtest.Run(newNaive, scenario(t, tt.scenario), tt.members, tt.seed)
+		r := rungtest.Run(naiveStore, scenario(t, tt.scenario), tt.members, tt.seed)
 		t.Log(r)
 		if tt.twoLeaders && r.TwoLeaders == "" {
 			t.Errorf("%s seed %d: expected two primaries at once", tt.scenario, tt.seed)

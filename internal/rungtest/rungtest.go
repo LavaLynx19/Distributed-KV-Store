@@ -19,6 +19,12 @@ import (
 // NewNode builds one Member's core.
 type NewNode func(id core.NodeID, members []core.NodeID, rng core.Rand) core.Node
 
+// Store is what a run puts under test: a core, and how clients use it.
+type Store struct {
+	NewNode  NewNode
+	Workload sim.Workload
+}
+
 // Scenario injects Faults into a running Simulation between times from and
 // to. It must leave repair to Run, which heals and restarts everything.
 type Scenario struct {
@@ -85,11 +91,11 @@ const (
 // middle, then repair and a quiet period before the verdicts. Messages pass
 // through the network encoding, so the core's message types must have been
 // given to transport.Register.
-func Run(newNode NewNode, sc Scenario, members int, seed uint64) Report {
+func Run(store Store, sc Scenario, members int, seed uint64) Report {
 	s := sim.New(sim.Config{
 		Seed:       seed,
 		Nodes:      members,
-		NewNode:    newNode,
+		NewNode:    store.NewNode,
 		NewMachine: func() sim.Machine { return fsm.New() },
 		Copy:       transport.NewLoopback().Copy,
 	})
@@ -97,7 +103,7 @@ func Run(newNode NewNode, sc Scenario, members int, seed uint64) Report {
 	rep := Report{Scenario: sc.Name, Seed: seed, Members: members, History: h}
 
 	faultsEnd := int64(warmup + faultSpan)
-	sim.DefaultWorkload.Start(s, h, faultsEnd+cooldown/3)
+	store.Workload.Start(s, h, faultsEnd+cooldown/3)
 	sc.Faults(s, warmup, faultsEnd)
 	s.At(faultsEnd, func() {
 		s.Heal()

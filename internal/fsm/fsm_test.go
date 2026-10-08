@@ -124,3 +124,22 @@ func TestItemsAreSortedAndDeterministic(t *testing.T) {
 		t.Errorf("a = %+v\nb = %+v\nwant %+v", a.Items(), b.Items(), want)
 	}
 }
+
+func TestReadBypassesTheLog(t *testing.T) {
+	m := New()
+	run(t, m, put("a", "1"))
+	r, err := DecodeResponse(m.Read(get("a").Encode()))
+	if err != nil || r.Status != StatusOK || string(r.Value) != "1" || r.Version != 1 {
+		t.Fatalf("read = %+v, %v", r, err)
+	}
+	if r, _ := DecodeResponse(m.Read(get("missing").Encode())); r.Status != StatusNotFound {
+		t.Fatalf("read of a missing key = %+v", r)
+	}
+	// Only gets may bypass the Log.
+	if r, _ := DecodeResponse(m.Read(put("a", "2").Encode())); r.Status != StatusInvalid {
+		t.Fatalf("a put through Read = %+v, want StatusInvalid", r)
+	}
+	if got := m.Items(); len(got) != 1 || string(got[0].Value) != "1" {
+		t.Fatalf("Read changed the state: %+v", got)
+	}
+}

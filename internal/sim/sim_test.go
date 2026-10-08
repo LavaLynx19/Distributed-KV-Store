@@ -47,6 +47,7 @@ func (r *relay) Step(ev core.Event) core.Output {
 type echo struct{ applied int }
 
 func (e *echo) Apply(en core.Entry) []byte { e.applied++; return en.Payload }
+func (e *echo) Read(query []byte) []byte   { return query }
 
 func newRelaySim(seed uint64, n int) (*Sim, map[core.NodeID]*relay) {
 	relays := map[core.NodeID]*relay{}
