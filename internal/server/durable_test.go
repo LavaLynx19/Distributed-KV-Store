@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
@@ -290,16 +291,12 @@ func TestReturningMemberIsCaughtUpBySnapshot(t *testing.T) {
 				got[it.Key] = it.Value
 			}
 		}
-		if len(got) == len(want) {
-			for k, v := range want {
-				if got[k] != v {
-					t.Fatalf("after catching up, %s = %q, want %q", k, got[k], v)
-				}
-			}
+		// It passes through older values on the way; wait for the final ones.
+		if reflect.DeepEqual(got, want) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the returning Member holds %d keys after 10s, want %d", len(got), len(want))
+			t.Fatalf("after 10s the returning Member holds %v, want %v", got, want)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
