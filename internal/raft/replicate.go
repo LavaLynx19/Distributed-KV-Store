@@ -21,7 +21,7 @@ func (n *Node) sendAppend(out *core.Output, m core.NodeID) {
 		// the Snapshot, which it will refuse.
 		prev = n.log.base
 	}
-	end := min(n.lastIndex(), prev+maxBatch)
+	end := min(n.lastIndex(), prev+core.Index(n.cfg.MaxBatch))
 	n.send(out, m, Append{
 		Term:       n.term,
 		PrevIndex:  prev,

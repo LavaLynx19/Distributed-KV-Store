@@ -79,6 +79,8 @@ type Report struct {
 	// purpose (A§6.8). It has kept its safety but not its availability, so
 	// its Members aren't expected to have converged.
 	Stalled bool
+	// StillRecovering counts Members that were Recovering at the end.
+	StillRecovering int
 
 	verdict check.Verdict
 }
@@ -181,7 +183,9 @@ func Run(store Store, sc Scenario, members int, seed uint64) Report {
 			continue // it holds no state to compare
 		}
 		items[id] = s.Machine(id).(*fsm.Machine).Items()
-		if !s.Status(id).Recovering {
+		if s.Status(id).Recovering {
+			rep.StillRecovering++
+		} else {
 			fit++
 		}
 	}
@@ -517,5 +521,50 @@ var Rung4 = []Scenario{
 			s.After(100+s.Rand().Int64N(250), step)
 		}
 		s.At(from, func() { messy(s); step() })
+	}},
+
+	// The Leader and the followers on its side of a Partition carry on while
+	// the rest fall behind. Then those followers' disks are damaged, and
+	// while they are being brought back up to date the Leader is lost and
+	// the Partition heals. What is left is Members that have lost Entries
+	// they acknowledged and Members that never had them.
+	{"half-repaired", func(s *sim.Sim, from, to int64) {
+		var step func()
+		step = func() {
+			if s.Now() >= to {
+				return
+			}
+			s.Heal()
+			for _, id := range s.IDs() {
+				s.Restart(id)
+			}
+			s.After(250, func() {
+				l := leader(s)
+				if s.Now() >= to-400 {
+					return // no time left to finish the sequence before the repair
+				}
+				if l == 0 {
+					s.After(100, step)
+					return
+				}
+				rest := others(s, l)
+				s.Rand().Shuffle(len(rest), func(i, j int) { rest[i], rest[j] = rest[j], rest[i] })
+				with, behind := rest[:len(rest)/2], rest[len(rest)/2:]
+				s.Partition(append([]core.NodeID{l}, with...), behind)
+				s.After(200+s.Rand().Int64N(150), func() {
+					for _, id := range with {
+						s.FlipBit(id)
+						s.Crash(id)
+						s.Restart(id)
+					}
+					s.After(10+s.Rand().Int64N(60), func() {
+						s.Crash(l)
+						s.Heal()
+						s.After(300, step)
+					})
+				})
+			})
+		}
+		s.At(from, step)
 	}},
 }

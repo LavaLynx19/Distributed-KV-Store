@@ -52,6 +52,11 @@ var careless = durable(func(c *raft.Config) { c.RepairWithoutAbstaining = true }
 // found damage stays out of elections until it has caught up.
 var rung4Store = durable(func(*raft.Config) {})
 
+// smallSteps is rung4Store with Appends that carry two Entries at most, so a
+// Member that is catching up does it over many messages and can be caught
+// halfway.
+var smallSteps = durable(func(c *raft.Config) { c.MaxBatch = 2 })
+
 // phantomKeys lists keys in the differences that no client ever wrote.
 // Clients only use k0, k1 and k2.
 func phantomKeys(diverged []string) []string {
@@ -103,6 +108,11 @@ func TestCarelessRepairIsExposed(t *testing.T) {
 	// and the Leader's core stops on an Index it doesn't hold.
 	if r := rungtest.Run(careless, scenario(t, "rot-and-everything"), 3, 27); r.Panic == "" {
 		t.Errorf("seed 27: expected the core's own check to trip, got %v", r)
+	}
+	// The scenario built to catch it: followers damaged, then their Leader
+	// lost before they have caught up.
+	if r := rungtest.Run(careless, scenario(t, "half-repaired"), 3, 7); r.Panic == "" {
+		t.Errorf("seed 7: expected the core's own check to trip, got %v", r)
 	}
 	// One Member damaged at a time, with the others healthy, is repaired
 	// before it matters. The careless store usually gets away with it.
@@ -157,9 +167,34 @@ func TestRung4(t *testing.T) {
 	for _, tt := range []struct {
 		scenario string
 		seed     uint64
-	}{{"bit-flips", 87}, {"bit-flips", 7}, {"bit-flips", 9}, {"bit-flips", 1}, {"rolling-crashes", 2}, {"rot-and-everything", 6}, {"rot-and-everything", 27}} {
+	}{{"bit-flips", 87}, {"bit-flips", 7}, {"bit-flips", 9}, {"bit-flips", 1}, {"rolling-crashes", 2}, {"rot-and-everything", 6}, {"rot-and-everything", 27}, {"half-repaired", 7}} {
 		if r := rungtest.Run(rung4Store, scenario(t, tt.scenario), 3, tt.seed); !r.Safe() || (!r.Stalled && len(r.Diverged) > 0) {
 			t.Errorf("a seed that exposed an earlier store still fails: %v", r)
+		}
+	}
+}
+
+// A Recovering Member must stay out of elections until it holds everything
+// its Leader holds, not just until its first successful Append. With small
+// Appends that difference lasts many messages, long enough for the Leader to
+// be lost in the middle of it.
+//
+// A run that isn't Stalled must converge. It isn't required to answer a
+// write in the clients' last stretch: with one Member abstaining, an election
+// needs every other Member of a three-Member Group, and can take that long.
+func TestRecoveryInSmallSteps(t *testing.T) {
+	seeds := uint64(100)
+	if testing.Short() {
+		seeds = 10
+	}
+	for _, sc := range rungtest.Rung4 {
+		for _, members := range []int{3, 5} {
+			for seed := uint64(1); seed <= seeds; seed++ {
+				r := rungtest.Run(smallSteps, sc, members, seed)
+				if !r.Safe() || (!r.Stalled && len(r.Diverged) > 0) {
+					t.Errorf("%v\n  diverged: %v", r, r.Diverged)
+				}
+			}
 		}
 	}
 }

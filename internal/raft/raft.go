@@ -103,6 +103,8 @@ type Config struct {
 	// Stored is the Member's durable state from before a restart. The zero
 	// value is a Member starting for the first time.
 	Stored core.Stored
+	// MaxBatch caps the Entries in one Append. Zero means 64.
+	MaxBatch int
 	// RepairWithoutAbstaining lets a Member that found damage on its disk
 	// vote and stand for election before it has recovered. It is unsafe, and
 	// exists so that Rung 4's exposure of that stays reproducible.
@@ -116,7 +118,7 @@ type Config struct {
 	Volatile bool
 }
 
-// maxBatch caps the Entries in one Append.
+// maxBatch is the default for Config.MaxBatch.
 const maxBatch = 64
 
 // Node is one Member's consensus state.
@@ -174,6 +176,9 @@ type Node struct {
 func New(cfg Config) *Node {
 	members := slices.Clone(cfg.Members)
 	slices.Sort(members)
+	if cfg.MaxBatch == 0 {
+		cfg.MaxBatch = maxBatch
+	}
 	n := &Node{id: cfg.ID, members: members, cfg: cfg, pending: map[core.Index]uint64{}}
 	n.term, n.votedFor = cfg.Stored.HardState.Term, cfg.Stored.HardState.VotedFor
 	if snap := cfg.Stored.Snapshot; snap != nil {
