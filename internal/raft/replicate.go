@@ -2,7 +2,6 @@ package raft
 
 import (
 	"fmt"
-	"slices"
 
 	"distributed-kv-store/internal/core"
 )
@@ -17,7 +16,7 @@ func (n *Node) sendAppend(out *core.Output, m core.NodeID) {
 		Term:      n.term,
 		PrevIndex: prev,
 		PrevTerm:  n.termAt(prev),
-		Entries:   slices.Clone(n.log[prev:end]),
+		Entries:   n.log.after(prev, end),
 		Commit:    n.commit,
 		ReadRound: n.readRound,
 	})
@@ -60,9 +59,10 @@ func (n *Node) handleAppend(out *core.Output, from core.NodeID, m Append) {
 			if index <= n.commit {
 				panic(fmt.Sprintf("raft: node %d asked to replace Committed Entry %d", n.id, index))
 			}
-			n.log = n.log[:index-1]
+			n.log.truncateFrom(index)
+			persist(out).TruncateFrom = index
 		}
-		n.log = append(n.log, e)
+		n.appendEntry(out, e)
 	}
 
 	// Only Entries this Append has just confirmed can be marked Committed:

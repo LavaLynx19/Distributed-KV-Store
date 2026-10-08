@@ -14,9 +14,28 @@ import (
 // its vote and its Log.
 var forgetful = func() rungtest.Store {
 	s := rung2Store
-	fresh := newRaft(raft.ReadsByIndex)
+	fresh := func(id core.NodeID, members []core.NodeID, rng core.Rand) core.Node {
+		cfg := raftConfig(id, members, rng, raft.ReadsByIndex)
+		cfg.Volatile = true
+		return raft.New(cfg)
+	}
+	s.NewNode = fresh
 	s.Restart = func(id core.NodeID, members []core.NodeID, rng core.Rand, _ core.Stored) core.Node {
 		return fresh(id, members, rng)
+	}
+	return s
+}()
+
+// rung3Store keeps its Term, vote and Log on disk, and a Member that
+// restarts is rebuilt from what its disk holds. Writes take 1 to 6 units to
+// become durable, so crashes often land in the middle of one.
+var rung3Store = func() rungtest.Store {
+	s := rung2Store
+	s.DiskDelay = [2]int64{1, 6}
+	s.Restart = func(id core.NodeID, members []core.NodeID, rng core.Rand, stored core.Stored) core.Node {
+		cfg := raftConfig(id, members, rng, raft.ReadsByIndex)
+		cfg.Stored = stored
+		return raft.New(cfg)
 	}
 	return s
 }()
@@ -55,5 +74,37 @@ func TestForgettingIsExposed(t *testing.T) {
 	}
 	if !tripped {
 		t.Error("rolling crashes: expected some run to try to replace a Committed Entry")
+	}
+}
+
+func everyScenario() []rungtest.Scenario {
+	return append(allScenarios(), rungtest.Rung3...)
+}
+
+// Rung 3's promise (README): every Acknowledged write survives a full
+// restart, a crash in the middle of a write and a stalled disk, on top of
+// everything Rungs 1 and 2 survive.
+func TestRung3(t *testing.T) {
+	seeds := uint64(200)
+	if testing.Short() {
+		seeds = 20
+	}
+	for _, sc := range everyScenario() {
+		for _, members := range []int{3, 5} {
+			for seed := uint64(1); seed <= seeds; seed++ {
+				r := rungtest.Run(rung3Store, sc, members, seed)
+				if !r.Passed() {
+					t.Errorf("%v\n  diverged: %v", r, r.Diverged)
+				}
+				if r.Recovery < 0 {
+					t.Errorf("%v\n  no write succeeded after the Faults were repaired", r)
+				}
+			}
+		}
+	}
+	for _, members := range []int{3, 5} {
+		if r := rungtest.Run(rung3Store, scenario(t, "full-restart"), members, 1); !r.Passed() {
+			t.Errorf("a seed that exposed forgetting still fails: %v", r)
+		}
 	}
 }

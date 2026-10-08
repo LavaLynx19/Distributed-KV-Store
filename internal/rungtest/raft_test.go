@@ -9,9 +9,13 @@ import (
 	"distributed-kv-store/internal/sim"
 )
 
+func raftConfig(id core.NodeID, members []core.NodeID, rng core.Rand, reads raft.ReadMode) raft.Config {
+	return raft.Config{ID: id, Members: members, ElectionTicks: 10, HeartbeatTicks: 1, Rand: rng, Reads: reads}
+}
+
 func newRaft(reads raft.ReadMode) rungtest.NewNode {
 	return func(id core.NodeID, members []core.NodeID, rng core.Rand) core.Node {
-		return raft.New(raft.Config{ID: id, Members: members, ElectionTicks: 10, HeartbeatTicks: 1, Rand: rng, Reads: reads})
+		return raft.New(raftConfig(id, members, rng, reads))
 	}
 }
 

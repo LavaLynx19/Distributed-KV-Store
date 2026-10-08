@@ -357,6 +357,24 @@ var Rung3 = []Scenario{
 		s.At(from, step)
 	}},
 
+	// Members blink: each crash is followed by a restart a moment later, on
+	// a slow network. A Member can vote, forget and be asked again within
+	// one election, which is what storing the vote is for.
+	{"blink", func(s *sim.Sim, from, to int64) {
+		var step func()
+		step = func() {
+			if s.Now() >= to {
+				return
+			}
+			ids := s.IDs()
+			id := ids[s.Rand().IntN(len(ids))]
+			s.Crash(id)
+			s.After(1+s.Rand().Int64N(15), func() { s.Restart(id) })
+			s.After(5+s.Rand().Int64N(40), step)
+		}
+		s.At(from, func() { s.SetDelay(1, 60); step() })
+	}},
+
 	// Disks stall for a while, one Member at a time, the Leader included.
 	{"stalled-disk", func(s *sim.Sim, from, to int64) {
 		var step func()

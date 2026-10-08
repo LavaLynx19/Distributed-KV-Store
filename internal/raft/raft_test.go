@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"reflect"
 	"testing"
 
 	"distributed-kv-store/internal/core"
@@ -64,8 +65,8 @@ func entries(terms ...core.Term) []core.Entry {
 }
 
 func logTerms(n *Node) []core.Term {
-	terms := make([]core.Term, len(n.log))
-	for i, e := range n.log {
+	terms := make([]core.Term, len(n.log.entries))
+	for i, e := range n.log.entries {
 		terms[i] = e.Term
 	}
 	return terms
@@ -138,8 +139,8 @@ func TestFollowerChecksAndRepairsItsLog(t *testing.T) {
 	}
 	// A duplicate of an old Append changes nothing.
 	recv(n, 2, Append{Term: 2, PrevIndex: 0, Entries: []core.Entry{{Index: 1, Term: 1}}})
-	if len(n.log) != 2 {
-		t.Fatalf("a duplicate Append truncated the Log to %d", len(n.log))
+	if len(n.log.entries) != 2 {
+		t.Fatalf("a duplicate Append truncated the Log to %d", len(n.log.entries))
 	}
 }
 
@@ -174,7 +175,7 @@ func TestLeaderCommitsOnlyThroughItsOwnTerm(t *testing.T) {
 		t.Fatalf("stepping down should end the pending proposal as Unknown, got %+v", out.Results)
 	}
 	elect(t, n, 2, 3)
-	if n.term != 3 || len(n.log) != 3 {
+	if n.term != 3 || len(n.log.entries) != 3 {
 		t.Fatalf("want Leader of Term 3 with a new no-op, got %v", n)
 	}
 
@@ -460,5 +461,92 @@ func TestReadIndexSingleMember(t *testing.T) {
 	}
 	if out := n.Step(core.Read{Ref: 1}); len(out.Reads) != 1 || out.Reads[0].Reason != core.OK {
 		t.Fatalf("a Group of one confirms itself, got %+v", out.Reads)
+	}
+}
+
+// restarted builds a new core from what the given Outputs asked to store, as
+// a shell does after a crash.
+func restarted(n *Node, outs ...core.Output) *Node {
+	var stored core.Stored
+	for _, out := range outs {
+		if out.Persist != nil {
+			stored.Apply(out.Persist)
+		}
+	}
+	cfg := n.cfg
+	cfg.Rand = new(counter)
+	cfg.Stored = stored
+	return New(cfg)
+}
+
+// A vote must be stored before it is sent. A Member that forgot its vote
+// could give a second one in the same Term, and two candidates could each
+// count a Majority.
+func TestVoteIsStoredAndSurvivesRestart(t *testing.T) {
+	n := newNode(1, 3)
+	out := recv(n, 2, RequestVote{Term: 5})
+	if v := reply[VoteReply](t, out); !v.Granted {
+		t.Fatal("vote not granted")
+	}
+	if out.Persist == nil || out.Persist.HardState == nil || *out.Persist.HardState != (core.HardState{Term: 5, VotedFor: 2}) {
+		t.Fatalf("the Output that grants a vote must store it, got %+v", out.Persist)
+	}
+
+	again := restarted(n, out)
+	if v := reply[VoteReply](t, recv(again, 3, RequestVote{Term: 5})); v.Granted {
+		t.Fatal("after a restart the Member voted for a second candidate in the same Term")
+	}
+	if v := reply[VoteReply](t, recv(again, 2, RequestVote{Term: 5})); !v.Granted {
+		t.Fatal("after a restart the Member should still confirm the vote it gave")
+	}
+}
+
+// Term and Log survive a restart; the commit index doesn't, and is learned
+// again from the Leader.
+func TestLogAndTermSurviveRestart(t *testing.T) {
+	n := newNode(1, 3)
+	out1 := recv(n, 2, Append{Term: 3, Entries: entries(1, 3, 3), Commit: 2})
+	if out1.Persist == nil || len(out1.Persist.Entries) != 3 || out1.Persist.HardState.Term != 3 {
+		t.Fatalf("an Append must store its Entries and the new Term, got %+v", out1.Persist)
+	}
+	// A conflicting suffix: Entry 3 is replaced.
+	out2 := recv(n, 2, Append{Term: 4, PrevIndex: 2, PrevTerm: 3, Entries: []core.Entry{{Index: 3, Term: 4}}})
+	if out2.Persist.TruncateFrom != 3 || len(out2.Persist.Entries) != 1 {
+		t.Fatalf("a conflict must store the truncation and the replacement, got %+v", out2.Persist)
+	}
+
+	again := restarted(n, out1, out2)
+	if again.term != 4 || !reflect.DeepEqual(logTerms(again), []core.Term{1, 3, 4}) {
+		t.Fatalf("after restart: term %d, Log terms %v; want 4 and [1 3 4]", again.term, logTerms(again))
+	}
+	if again.commit != 0 {
+		t.Fatalf("the commit index isn't stored, yet it is %d after restart", again.commit)
+	}
+	// The Leader's next heartbeat tells it what is Committed, and the shell
+	// gets those Entries again to rebuild the state machine.
+	out := recv(again, 2, Append{Term: 4, PrevIndex: 3, PrevTerm: 4, Commit: 3})
+	if len(out.Committed) != 3 {
+		t.Fatalf("want all 3 Entries handed over again after restart, got %d", len(out.Committed))
+	}
+}
+
+// A candidate stores its own vote, and a Leader stores what it appends,
+// before any message about either goes out.
+func TestCandidateAndLeaderStoreBeforeSending(t *testing.T) {
+	n := newNode(1, 3)
+	var out core.Output
+	for n.role != core.Candidate {
+		out = n.Step(core.Tick{})
+	}
+	if out.Persist == nil || *out.Persist.HardState != (core.HardState{Term: 1, VotedFor: 1}) || len(out.Messages) != 2 {
+		t.Fatalf("standing for election must store the Term and self-vote with the requests, got %+v", out.Persist)
+	}
+	out = recv(n, 2, VoteReply{Term: 1, Granted: true})
+	if out.Persist == nil || len(out.Persist.Entries) != 1 || out.Persist.Entries[0].Kind != core.EntryNoop {
+		t.Fatalf("a new Leader must store its no-op, got %+v", out.Persist)
+	}
+	out = n.Step(core.Propose{Ref: 1, Payload: []byte("x")})
+	if out.Persist == nil || len(out.Persist.Entries) != 1 || string(out.Persist.Entries[0].Payload) != "x" {
+		t.Fatalf("a proposal must be stored with the Append that carries it, got %+v", out.Persist)
 	}
 }
