@@ -50,10 +50,19 @@ type AppendReply struct {
 	ReadRound uint64
 }
 
+// InstallSnapshot carries the Leader's Snapshot to a follower that needs
+// Entries the Leader's Log no longer holds (A§6.4). The follower answers
+// with an AppendReply.
+type InstallSnapshot struct {
+	Term      core.Term
+	Snapshot  core.Snapshot
+	ReadRound uint64
+}
+
 // MessageBodies lists the types this core puts in a Message, for the
 // transport to register.
 func MessageBodies() []any {
-	return []any{RequestVote{}, VoteReply{}, Append{}, AppendReply{}}
+	return []any{RequestVote{}, VoteReply{}, Append{}, AppendReply{}, InstallSnapshot{}}
 }
 
 // ReadMode is how a Member answers core.Read events (A§6.2).
@@ -129,6 +138,7 @@ type Node struct {
 	next      map[core.NodeID]core.Index // next Index to send each follower
 	match     map[core.NodeID]core.Index // highest Index known to be on each
 	heard     map[core.NodeID]int        // tick of each follower's last reply
+	sentSnap  map[core.NodeID]int        // tick at which each was last sent the Snapshot
 	heartbeat int                        // ticks since the last heartbeat
 	pending   map[core.Index]uint64      // proposals awaiting commit, by Index
 
@@ -248,7 +258,7 @@ func (n *Node) tick(out *core.Output) {
 			}
 			// Anything sent but not yet confirmed is sent again.
 			n.next[m] = n.match[m] + 1
-			n.sendAppend(out, m)
+			n.sendHeartbeat(out, m)
 		}
 	}
 }
@@ -318,6 +328,11 @@ func (n *Node) receive(out *core.Output, msg core.Message) {
 			n.becomeFollower(out, m.Term, 0)
 		}
 		n.handleAppendReply(out, msg.From, m)
+	case InstallSnapshot:
+		if m.Term > n.term {
+			n.becomeFollower(out, m.Term, msg.From)
+		}
+		n.handleInstallSnapshot(out, msg.From, m)
 	}
 }
 

@@ -28,10 +28,13 @@ var forgetful = func() rungtest.Store {
 
 // rung3Store keeps its Term, vote and Log on disk, and a Member that
 // restarts is rebuilt from what its disk holds. Writes take 1 to 6 units to
-// become durable, so crashes often land in the middle of one.
+// become durable, so crashes often land in the middle of one. It takes a
+// Snapshot every 20 Entries, so Logs are always being trimmed and Members
+// that fall behind are caught up by Snapshot.
 var rung3Store = func() rungtest.Store {
 	s := rung2Store
 	s.DiskDelay = [2]int64{1, 6}
+	s.SnapshotEvery = 20
 	s.Restart = func(id core.NodeID, members []core.NodeID, rng core.Rand, stored core.Stored) core.Node {
 		cfg := raftConfig(id, members, rng, raft.ReadsByIndex)
 		cfg.Stored = stored
@@ -145,6 +148,14 @@ func TestRung3(t *testing.T) {
 	for _, members := range []int{3, 5} {
 		if r := rungtest.Run(rung3Store, scenario(t, "full-restart"), members, 1); !r.Passed() {
 			t.Errorf("a seed that exposed forgetting still fails: %v", r)
+		}
+	}
+	for _, tt := range []struct {
+		scenario string
+		members  int
+	}{{"isolate-leader", 3}, {"crash-leader", 5}, {"rolling-crashes", 3}} {
+		if r := rungtest.Run(rung3Store, scenario(t, tt.scenario), tt.members, 1); !r.Passed() {
+			t.Errorf("a seed that stranded a Member still fails: %v", r)
 		}
 	}
 }

@@ -210,6 +210,9 @@ type Result struct {
 type Output struct {
 	// Persist must be durable before the shell acts on any other field.
 	Persist *Persist
+	// Restore, if set, replaces the state machine's contents with this
+	// Snapshot, before any Committed Entries in this Output are applied.
+	Restore *Snapshot
 	// Messages to send to other Members.
 	Messages []Message
 	// Committed Entries to apply to the state machine, in Log order. Each

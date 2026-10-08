@@ -19,6 +19,7 @@ type Machine interface {
 	Apply(core.Entry) []byte
 	Read(query []byte) []byte
 	Capture() func() []byte
+	Restore(data []byte) error
 }
 
 // Reply is the outcome of one proposal.
@@ -122,6 +123,12 @@ func (n *Node) Run(ctx context.Context) {
 	}
 
 	act := func(out core.Output) {
+		if snap := out.Restore; snap != nil {
+			if err := n.machine.Restore(snap.Data); err != nil {
+				log.Fatalf("server: can't install the Snapshot at Entry %d: %v", snap.Index, err)
+			}
+			applied, snapshotAt = snap.Index, snap.Index
+		}
 		responses := make(map[core.Index][]byte, len(out.Committed))
 		for _, e := range out.Committed {
 			responses[e.Index] = n.machine.Apply(e)

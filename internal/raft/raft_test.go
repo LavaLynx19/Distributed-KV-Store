@@ -595,3 +595,154 @@ func TestSnapshotTrimsTheLog(t *testing.T) {
 		t.Fatalf("after restart: base %d, last %d, commit %d, applied %d; want 3, 6, 3, 3", again.log.base, again.lastIndex(), again.commit, again.applied)
 	}
 }
+
+// leaderWithSnapshot is a Leader of three whose Log starts after Entry 4:
+// no-op, then five commands, all Committed with follower 2, and a Snapshot
+// taken at Entry 4.
+func leaderWithSnapshot(t *testing.T) *Node {
+	t.Helper()
+	n := newNode(1, 3)
+	elect(t, n, 2)
+	for i := range 5 {
+		n.Step(core.Propose{Ref: uint64(i), Payload: []byte("x")})
+	}
+	recv(n, 2, AppendReply{Term: 1, Success: true, Match: 6})
+	if n.commit != 6 {
+		t.Fatalf("setup: commit %d, want 6", n.commit)
+	}
+	n.Step(core.Snapshotted{Index: 4, Data: []byte("state at 4")})
+	return n
+}
+
+// A follower that needs Entries the Leader has trimmed is sent the Snapshot
+// instead, then the Log after it.
+func TestLeaderSendsSnapshotToAMemberBehindIt(t *testing.T) {
+	n := leaderWithSnapshot(t)
+
+	// Follower 3 reports that it has nothing.
+	out := recv(n, 3, AppendReply{Term: 1, Match: 0})
+	snap := reply[InstallSnapshot](t, out)
+	if snap.Snapshot.Index != 4 || string(snap.Snapshot.Data) != "state at 4" || snap.Term != 1 {
+		t.Fatalf("sent %+v, want the Snapshot at Entry 4", snap)
+	}
+	// Asking again straight away doesn't send it twice.
+	if out := recv(n, 3, AppendReply{Term: 1, Match: 0}); len(out.Messages) != 0 {
+		t.Fatalf("the Snapshot was sent again at once: %+v", out.Messages)
+	}
+	// Meanwhile heartbeats still reach the follower.
+	hb := n.Step(core.Tick{})
+	var toThree []any
+	for _, m := range hb.Messages {
+		if m.To == 3 {
+			toThree = append(toThree, m.Body)
+		}
+	}
+	if len(toThree) != 1 {
+		t.Fatalf("want one heartbeat to follower 3 while the Snapshot is on its way, got %+v", toThree)
+	}
+	if _, isAppend := toThree[0].(Append); !isAppend {
+		t.Fatalf("the heartbeat should be an Append, not a second %T", toThree[0])
+	}
+
+	// Once the follower confirms the Snapshot, the rest of the Log follows.
+	a := reply[Append](t, recv(n, 3, AppendReply{Term: 1, Success: true, Match: 4}))
+	if a.PrevIndex != 4 || len(a.Entries) != 2 {
+		t.Fatalf("after the Snapshot the Leader sent %d Entries from %d, want 2 from 4", len(a.Entries), a.PrevIndex)
+	}
+}
+
+// If no confirmation comes, the Snapshot is sent again after an election
+// timeout's worth of ticks.
+func TestSnapshotIsResentAfterSilence(t *testing.T) {
+	n := leaderWithSnapshot(t)
+	reply[InstallSnapshot](t, recv(n, 3, AppendReply{Term: 1, Match: 0}))
+	resent := false
+	for range n.cfg.ElectionTicks + 1 {
+		recv(n, 2, AppendReply{Term: 1, Success: true, Match: 6}) // follower 2 keeps the Leader in touch with a Majority
+		for _, m := range n.Step(core.Tick{}).Messages {
+			if _, ok := m.Body.(InstallSnapshot); ok && m.To == 3 {
+				resent = true
+			}
+		}
+	}
+	if !resent {
+		t.Fatal("the Snapshot was never sent again")
+	}
+}
+
+func TestFollowerInstallsSnapshot(t *testing.T) {
+	n := newNode(3, 3)
+	recv(n, 1, Append{Term: 1, Entries: entries(1, 1), Commit: 1}) // an old, short Log
+
+	snap := core.Snapshot{Index: 10, Term: 2, Data: []byte("state at 10")}
+	out := recv(n, 1, InstallSnapshot{Term: 2, Snapshot: snap, ReadRound: 7})
+	r := reply[AppendReply](t, out)
+	if !r.Success || r.Match != 10 || r.ReadRound != 7 {
+		t.Fatalf("reply %+v, want success at 10 echoing round 7", r)
+	}
+	if out.Restore == nil || string(out.Restore.Data) != "state at 10" {
+		t.Fatalf("the shell must be told to replace the state machine, got %+v", out.Restore)
+	}
+	if p := out.Persist; p == nil || p.Snapshot == nil || p.Snapshot.Index != 10 || !p.ResetLog {
+		t.Fatalf("the Snapshot must be stored and the old Log dropped, got %+v", out.Persist)
+	}
+	if n.log.base != 10 || n.lastIndex() != 10 || n.commit != 10 || n.applied != 10 || len(out.Committed) != 0 {
+		t.Fatalf("after install: base %d, last %d, commit %d, applied %d", n.log.base, n.lastIndex(), n.commit, n.applied)
+	}
+
+	// The Log carries on from the Snapshot.
+	out = recv(n, 1, Append{Term: 2, PrevIndex: 10, PrevTerm: 2, Entries: []core.Entry{{Index: 11, Term: 2}}, Commit: 11})
+	if r := reply[AppendReply](t, out); !r.Success || r.Match != 11 || len(out.Committed) != 1 {
+		t.Fatalf("append after install: %+v with %d Committed", r, len(out.Committed))
+	}
+	// A Snapshot of what is already Committed here changes nothing.
+	out = recv(n, 1, InstallSnapshot{Term: 2, Snapshot: core.Snapshot{Index: 5, Term: 1}})
+	if r := reply[AppendReply](t, out); !r.Success || r.Match != 11 || out.Restore != nil || out.Persist != nil {
+		t.Fatalf("an old Snapshot: reply %+v, restore %v, persist %v", r, out.Restore, out.Persist)
+	}
+	// One from a stale Leader is refused.
+	if r := reply[AppendReply](t, recv(n, 2, InstallSnapshot{Term: 1, Snapshot: core.Snapshot{Index: 99, Term: 1}})); r.Success || r.Term != 2 {
+		t.Fatalf("a Snapshot from an old Term: %+v", r)
+	}
+}
+
+// A follower that already holds the Snapshot's last Entry keeps the Entries
+// after it. It may have acknowledged them, and dropping them would leave the
+// Leader counting a copy that no longer exists.
+func TestInstallKeepsAcknowledgedEntriesAfterTheSnapshot(t *testing.T) {
+	n := newNode(3, 3)
+	r := reply[AppendReply](t, recv(n, 1, Append{Term: 1, Entries: entries(1, 1, 1, 1, 1), Commit: 2}))
+	if !r.Success || r.Match != 5 {
+		t.Fatalf("setup: %+v", r)
+	}
+
+	// The Leader's Snapshot ends at 4. This Member holds 4 and has
+	// acknowledged 5.
+	out := recv(n, 1, InstallSnapshot{Term: 1, Snapshot: core.Snapshot{Index: 4, Term: 1, Data: []byte("state at 4")}})
+	if r := reply[AppendReply](t, out); !r.Success || r.Match != 4 {
+		t.Fatalf("reply %+v", r)
+	}
+	if n.lastIndex() != 5 || n.log.base != 4 {
+		t.Fatalf("after install: base %d, last %d; Entry 5 must survive", n.log.base, n.lastIndex())
+	}
+	if out.Persist.ResetLog {
+		t.Fatal("the stored Log was reset, which drops the acknowledged Entry 5 from disk too")
+	}
+	if out.Restore == nil || n.commit != 4 || n.applied != 4 {
+		t.Fatalf("the state machine should be restored to Entry 4: restore %v, commit %d, applied %d", out.Restore != nil, n.commit, n.applied)
+	}
+	// Entry 5 is still there for the Leader to commit.
+	out = recv(n, 1, Append{Term: 1, PrevIndex: 5, PrevTerm: 1, Commit: 5})
+	if len(out.Committed) != 1 || out.Committed[0].Index != 5 {
+		t.Fatalf("Entry 5 should now be handed over as Committed, got %+v", out.Committed)
+	}
+
+	// A Member whose Log disagrees with the Snapshot at its last Entry does
+	// drop its Log.
+	other := newNode(3, 3)
+	recv(other, 1, Append{Term: 1, Entries: entries(1, 1, 1, 1, 1)})
+	out = recv(other, 2, InstallSnapshot{Term: 2, Snapshot: core.Snapshot{Index: 4, Term: 2}})
+	if other.lastIndex() != 4 || !out.Persist.ResetLog {
+		t.Fatalf("a Log that doesn't match the Snapshot must go: last %d, reset %v", other.lastIndex(), out.Persist.ResetLog)
+	}
+}

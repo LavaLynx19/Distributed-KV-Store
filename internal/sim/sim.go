@@ -404,6 +404,12 @@ func (s *Sim) completeWrite(m *member, life int, out core.Output) {
 
 // finish carries out everything in an Output except its Persist.
 func (s *Sim) finish(m *member, out core.Output) {
+	if snap := out.Restore; snap != nil {
+		if err := m.machine.Restore(snap.Data); err != nil {
+			panic(fmt.Sprintf("sim: node %d can't install a Snapshot: %v", m.id, err))
+		}
+		m.applied, m.snapshotAt = snap.Index, snap.Index
+	}
 	responses := make(map[core.Index][]byte, len(out.Committed))
 	for _, e := range out.Committed {
 		responses[e.Index] = m.machine.Apply(e)

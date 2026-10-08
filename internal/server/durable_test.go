@@ -251,3 +251,67 @@ func TestFullRestartFromSnapshots(t *testing.T) {
 		}
 	}
 }
+
+// A Member is away while the others write enough to trim their Logs past
+// where it stopped. When it returns it is caught up by Snapshot, then Log.
+func TestReturningMemberIsCaughtUpBySnapshot(t *testing.T) {
+	d := newDurableSnapshotting(t, 3, 25)
+	leader := d.leader()
+	var away core.NodeID
+	for _, id := range d.ids {
+		if "http://"+d.clients[id] != leader {
+			away = id
+			break
+		}
+	}
+	if a := call(t, "PUT", leader+"/v1/kv/before", `{"value":"x"}`); a.code != 200 {
+		t.Fatalf("put: %+v", a)
+	}
+	d.stop(away)
+	for i := range 100 {
+		if a := call(t, "PUT", leader+"/v1/kv/k"+strconv.Itoa(i%10), `{"value":"v`+strconv.Itoa(i)+`"}`); a.code != 200 {
+			t.Fatalf("put %d with one Member away: %+v", i, a)
+		}
+	}
+	d.start(away)
+
+	want := map[string]string{"before": "x"}
+	for i := 90; i < 100; i++ {
+		want["k"+strconv.Itoa(i%10)] = "v" + strconv.Itoa(i)
+	}
+	url := "http://" + d.clients[away] + "/v1/debug/items"
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		got := map[string]string{}
+		if resp, err := http.Get(url); err == nil {
+			var items []server.ItemJSON
+			decode(t, resp, &items)
+			for _, it := range items {
+				got[it.Key] = it.Value
+			}
+		}
+		if len(got) == len(want) {
+			for k, v := range want {
+				if got[k] != v {
+					t.Fatalf("after catching up, %s = %q, want %q", k, got[k], v)
+				}
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the returning Member holds %d keys after 10s, want %d", len(got), len(want))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// It was sent a Snapshot: its own Log no longer starts at Entry 1.
+	d.stop(away)
+	store, stored, err := storage.Open(filepath.Join(d.dir, "node"+strconv.Itoa(int(away))), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	if stored.Snapshot == nil || stored.Snapshot.Index < 50 {
+		t.Fatalf("expected the returning Member to hold a Snapshot well past where it stopped, got %+v", stored.Snapshot != nil)
+	}
+}
