@@ -126,9 +126,9 @@ Any other dependency needs the tradeoff discussion and an entry here first.
 ```
 
 ### 4.2 The core's contract
-- **Events in:** a tick, a message from another Member, a client proposal, a read request, and "these writes are now durable".
+- **Events in:** a tick, a message from another Member, a client proposal, a read request, and (from Rung 3) "here is a Snapshot of the state machine".
 - **Outputs:** Entries and vote state to make durable, messages to send, Committed Entries to apply, read requests now safe to answer, and a Snapshot to install or send.
-- **Order rule:** the shell must make an output's writes durable before it sends that output's messages. A vote or an Entry that isn't on disk must never be acted on by another Member.
+- **Order rule:** the shell must make an output's writes durable before it does anything else the output asks for: sending its messages, applying its Committed Entries, answering its clients. A vote or an Entry that isn't on disk must never be acted on by anyone. Because of this rule the core needs no "now durable" event: once a step returns, the core may treat what it asked to store as stored.
 - **Time:** the core counts ticks. It never reads a clock. Election and heartbeat timeouts are tick counts.
 - **Randomness:** election jitter comes from a seeded source passed in at start.
 - **Determinism rules:** no goroutines, no `time.Now`, no reliance on map iteration order, no global state. Given the same events in the same order, a core produces the same outputs.

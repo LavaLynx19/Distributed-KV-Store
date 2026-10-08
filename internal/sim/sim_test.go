@@ -276,3 +276,122 @@ func TestWideDelayReorders(t *testing.T) {
 		t.Fatal("a 1..200 delay with sends 10 apart should let later messages overtake earlier ones")
 	}
 }
+
+// journal is a test core that stores every proposal before acknowledging it.
+type journal struct {
+	id    core.NodeID
+	index core.Index
+	ticks int
+}
+
+func (j *journal) Status() core.Status { return core.Status{ID: j.id, Commit: j.index} }
+
+func (j *journal) Step(ev core.Event) core.Output {
+	var out core.Output
+	switch ev := ev.(type) {
+	case core.Tick:
+		j.ticks++
+	case core.Propose:
+		j.index++
+		e := core.Entry{Index: j.index, Kind: core.EntryCommand, Payload: ev.Payload}
+		out.Persist = &core.Persist{Entries: []core.Entry{e}}
+		out.Committed = []core.Entry{e}
+		out.Results = []core.Result{{Ref: ev.Ref, Reason: core.OK, Index: e.Index}}
+	}
+	return out
+}
+
+func newJournalSim(seed uint64, delay [2]int64) (*Sim, map[core.NodeID]*journal) {
+	journals := map[core.NodeID]*journal{}
+	s := New(Config{
+		Seed: seed, Nodes: 1, DiskDelay: delay,
+		NewNode: func(id core.NodeID, _ []core.NodeID, _ core.Rand) core.Node {
+			journals[id] = &journal{id: id}
+			return journals[id]
+		},
+		Restart: func(id core.NodeID, _ []core.NodeID, _ core.Rand, stored core.Stored) core.Node {
+			journals[id] = &journal{id: id, index: core.Index(len(stored.Entries))}
+			return journals[id]
+		},
+		NewMachine: func() Machine { return &echo{} },
+	})
+	return s, journals
+}
+
+func TestAnswerWaitsForTheDisk(t *testing.T) {
+	s, _ := newJournalSim(1, [2]int64{30, 30})
+	var got []Reply
+	s.At(10, func() { s.Propose(1, []byte("a"), func(r Reply) { got = append(got, r) }) })
+	s.Run(39)
+	if len(got) != 0 || len(s.Disk(1).Entries) != 0 {
+		t.Fatalf("at t=39 the write (started t=10, 30 units) isn't done, yet: %d replies, %d Entries on disk", len(got), len(s.Disk(1).Entries))
+	}
+	s.Run(41)
+	if len(got) != 1 || got[0].Reason != core.OK || len(s.Disk(1).Entries) != 1 {
+		t.Fatalf("at t=41: %+v, %d Entries on disk", got, len(s.Disk(1).Entries))
+	}
+}
+
+func TestEventsQueueBehindAWrite(t *testing.T) {
+	s, journals := newJournalSim(2, [2]int64{50, 50})
+	var order []string
+	s.At(5, func() { s.Propose(1, []byte("a"), func(Reply) { order = append(order, "a") }) })
+	s.At(6, func() { s.Propose(1, []byte("b"), func(Reply) { order = append(order, "b") }) })
+	s.Run(54)
+	if journals[1].index != 1 {
+		t.Fatalf("the second proposal was handled while the first write was in progress (index %d)", journals[1].index)
+	}
+	s.Run(200)
+	if len(order) != 2 || order[0] != "a" || order[1] != "b" || len(s.Disk(1).Entries) != 2 {
+		t.Fatalf("order %v with %d Entries on disk; want a then b, 2 Entries", order, len(s.Disk(1).Entries))
+	}
+	if journals[1].ticks == 0 {
+		t.Fatal("ticks that arrived during the writes were dropped")
+	}
+}
+
+func TestCrashLosesTheWriteInProgress(t *testing.T) {
+	s, journals := newJournalSim(3, [2]int64{30, 30})
+	var first, second Reply
+	s.At(10, func() { s.Propose(1, []byte("kept"), func(r Reply) { first = r }) })
+	s.At(50, func() { s.Propose(1, []byte("lost"), func(r Reply) { second = r }) })
+	s.At(60, func() { s.Crash(1) }) // the second write would finish at t=80
+	s.At(100, func() { s.Restart(1) })
+	s.Run(200)
+
+	if first.Reason != core.OK {
+		t.Fatalf("first write: %+v", first)
+	}
+	if second.Reason != core.Unknown {
+		t.Fatalf("a proposal whose write was cut short should end Unknown, got %+v", second)
+	}
+	if got := s.Disk(1).Entries; len(got) != 1 || string(got[0].Payload) != "kept" {
+		t.Fatalf("disk holds %+v, want only the first Entry", got)
+	}
+	if journals[1].index != 1 {
+		t.Fatalf("the restarted core should know 1 Entry, has %d", journals[1].index)
+	}
+}
+
+func TestStalledDiskHoldsWrites(t *testing.T) {
+	s, _ := newJournalSim(4, [2]int64{})
+	var at int64 = -1
+	s.At(10, func() { s.StallDisk(1, 100) })
+	s.At(20, func() { s.Propose(1, []byte("a"), func(Reply) { at = s.Now() }) })
+	s.Run(300)
+	if at != 110 {
+		t.Fatalf("answered at t=%d, want t=110 (when the stall ends)", at)
+	}
+}
+
+// Without Config.Restart a crash is still a freeze, as Rungs 1–2 rely on.
+func TestNilRestartKeepsMemory(t *testing.T) {
+	s, relays := newRelaySim(5, 1)
+	s.Propose(1, []byte("x"), func(Reply) {})
+	s.Crash(1)
+	s.Restart(1)
+	s.Run(100)
+	if relays[1].index != 1 {
+		t.Fatalf("a frozen Member lost its held proposal (index %d)", relays[1].index)
+	}
+}

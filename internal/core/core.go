@@ -4,8 +4,9 @@
 // and what became of each proposal. A core owns no threads, clocks, sockets
 // or files, so the same core runs under the real shell and the Simulation.
 //
-// The contract grows with the Rungs. Durable writes and Snapshots arrive in
-// Rung 3 (PLAN.md).
+// Durability follows one rule: the shell makes an Output's Persist durable
+// before it does anything else the Output asks for. A core may therefore
+// treat whatever it has put in a Persist as safely stored once Step returns.
 package core
 
 // NodeID identifies a Node. Zero means "none" (for example, no known Leader).
@@ -34,6 +35,98 @@ type Entry struct {
 	Term    Term
 	Kind    EntryKind
 	Payload []byte
+}
+
+// HardState is what a Member must remember across a restart besides its Log:
+// the latest Term it has seen and who it voted for in that Term.
+type HardState struct {
+	Term     Term
+	VotedFor NodeID
+}
+
+// Snapshot is a state machine's full contents as of the Entry at Index, which
+// had Term. It stands in for the Log up to and including that Entry.
+type Snapshot struct {
+	Index Index
+	Term  Term
+	Data  []byte
+}
+
+// Persist is the change a step makes to a Member's durable state. Its parts
+// apply in the order of its fields.
+type Persist struct {
+	// HardState replaces the stored one.
+	HardState *HardState
+	// Snapshot replaces the stored one, and Entries it covers are dropped.
+	// With ResetLog every stored Entry is dropped, covered or not.
+	Snapshot *Snapshot
+	ResetLog bool
+	// TruncateFrom drops stored Entries at this Index and after. Zero means
+	// none.
+	TruncateFrom Index
+	// Entries are appended. They continue the stored Log without a gap.
+	Entries []Entry
+}
+
+// Stored is a Member's durable state, as a restarted core is given it.
+type Stored struct {
+	HardState HardState
+	Snapshot  *Snapshot
+	// Entries follow the Snapshot, or start at Index 1 if there is none.
+	Entries []Entry
+}
+
+// Apply makes the change p describes. Both shells keep a Member's durable
+// state through this one function, so they can't disagree on what a Persist
+// means.
+func (s *Stored) Apply(p *Persist) {
+	if p.HardState != nil {
+		s.HardState = *p.HardState
+	}
+	if p.Snapshot != nil {
+		first := s.firstIndex()
+		s.Snapshot = p.Snapshot
+		switch covered := p.Snapshot.Index + 1 - first; {
+		case p.ResetLog || covered >= Index(len(s.Entries)):
+			s.Entries = nil
+		case p.Snapshot.Index >= first:
+			s.Entries = append([]Entry(nil), s.Entries[covered:]...)
+		}
+	}
+	if p.TruncateFrom != 0 {
+		first := s.firstIndex()
+		if p.TruncateFrom < first {
+			panic("core: Persist truncates into the Snapshot")
+		}
+		if keep := p.TruncateFrom - first; keep < Index(len(s.Entries)) {
+			s.Entries = s.Entries[:keep]
+		}
+	}
+	for _, e := range p.Entries {
+		if want := s.firstIndex() + Index(len(s.Entries)); e.Index != want {
+			panic("core: Persist appends an Entry that doesn't continue the stored Log")
+		}
+		s.Entries = append(s.Entries, e)
+	}
+}
+
+// firstIndex is the Index the first stored Entry has, or would have.
+func (s *Stored) firstIndex() Index {
+	if s.Snapshot != nil {
+		return s.Snapshot.Index + 1
+	}
+	return 1
+}
+
+// Clone returns a copy that shares no memory with s, except Snapshot data and
+// Entry payloads, which nothing modifies.
+func (s *Stored) Clone() Stored {
+	c := Stored{HardState: s.HardState, Entries: append([]Entry(nil), s.Entries...)}
+	if s.Snapshot != nil {
+		snap := *s.Snapshot
+		c.Snapshot = &snap
+	}
+	return c
 }
 
 // Message is sent from one Member's core to another's. Body is specific to
@@ -105,6 +198,8 @@ type Result struct {
 // Output is everything one step asks the shell to do. A nil slice means
 // nothing of that kind.
 type Output struct {
+	// Persist must be durable before the shell acts on any other field.
+	Persist *Persist
 	// Messages to send to other Members.
 	Messages []Message
 	// Committed Entries to apply to the state machine, in Log order. Each
