@@ -8,6 +8,8 @@
 #   harness/local.sh resume <id>       # let it continue (SIGCONT)
 #   harness/local.sh kill <id>         # kill -9 one Member
 #   harness/local.sh restart <id>      # start it again from its data directory
+#   harness/local.sh corrupt <id>      # flip one bit in the middle of its newest
+#                                      # Log segment (kill it first)
 #   harness/local.sh stop
 #
 # Each Member keeps its durable state in harness/out/local/data<id>. "start"
@@ -75,6 +77,14 @@ case "${1:-}" in
     launch "$id" "$(members)"
     echo "restarted node $id"
     ;;
+  corrupt)
+    id="${2:?usage: local.sh corrupt <id>}"
+    seg="$(ls "$OUT/data$id/log"/*.seg | tail -1)"
+    off=$(($(wc -c <"$seg") / 2))
+    byte="$(dd if="$seg" bs=1 skip="$off" count=1 2>/dev/null | od -An -tu1 | tr -d ' ')"
+    printf "\\$(printf '%03o' $((byte ^ 16)))" | dd of="$seg" bs=1 seek="$off" conv=notrunc 2>/dev/null
+    echo "flipped a bit at byte $off of node $id's $(basename "$seg")"
+    ;;
   stop)
     for f in "$OUT"/node*.pid; do
       [[ -e "$f" ]] || continue
@@ -86,7 +96,7 @@ case "${1:-}" in
     echo "stopped"
     ;;
   *)
-    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

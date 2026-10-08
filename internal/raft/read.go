@@ -61,11 +61,12 @@ func (n *Node) startRound(out *core.Output) {
 			// it will refuse the Append, but its echo counts all the same.
 			at := max(n.match[m], n.log.base)
 			n.send(out, m, Append{
-				Term:      n.term,
-				PrevIndex: at,
-				PrevTerm:  n.termAt(at),
-				Commit:    n.commit,
-				ReadRound: n.readRound,
+				Term:       n.term,
+				PrevIndex:  at,
+				PrevTerm:   n.termAt(at),
+				Commit:     n.commit,
+				ReadRound:  n.readRound,
+				LeaderLast: n.lastIndex(),
 			})
 		}
 	}

@@ -149,7 +149,7 @@ func TestIncompleteLastRecordIsDropped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, cut := range []int{1, 3, 5, len(encodeRecord(es(3, 3, 1)[0])) - 1} {
+	for _, cut := range []int{1, 3, 5, len(encodeRecord(es(3, 3, 1)[0], true)) - 1} {
 		if err := os.WriteFile(path, whole[:len(whole)-cut], 0o644); err != nil {
 			t.Fatal(err)
 		}

@@ -13,6 +13,8 @@
 #                    (docker only: it needs toxiproxy)
 #   kill-leader      kill -9 the Leader, then start it again from its disk
 #   restart-all      kill -9 every Member at once, then start them all again
+#   corrupt-follower kill -9 a follower, flip a bit in its Log, start it again
+#   corrupt-leader   the same to the Leader (both local only)
 #
 # Environment:
 #   CLIENTS=8  DURATION=10s  FAULT_AT=3  FAULT_FOR=3   (seconds for the last two)
@@ -41,6 +43,7 @@ case "$BACKEND" in
 esac
 case "$FAULT" in
   none | pause-leader | kill-leader | restart-all) ;;
+  corrupt-follower | corrupt-leader) [[ $BACKEND == local ]] || { echo "$FAULT needs the local backend" >&2; exit 2; } ;;
   isolate-leader) [[ $BACKEND == docker ]] || { echo "isolate-leader needs the docker backend" >&2; exit 2; } ;;
   *) echo "unknown fault $FAULT" >&2; exit 2 ;;
 esac
@@ -87,10 +90,13 @@ log="$OUT/run-$BACKEND-$N-$FAULT${TAG:+-$TAG}.txt"
     pid=$!
     sleep "$FAULT_AT"
     target="$(leader)"
+    [[ $FAULT == corrupt-follower ]] && target=$((target % N + 1))
     case "$FAULT" in
       pause-leader)   "$ctl" pause "$target";   sleep "$FAULT_FOR"; "$ctl" resume "$target" ;;
       isolate-leader) "$ctl" isolate "$target"; sleep "$FAULT_FOR"; "$ctl" heal ;;
       kill-leader)    "$ctl" kill "$target";    sleep "$FAULT_FOR"; "$ctl" restart "$target" ;;
+      corrupt-follower | corrupt-leader)
+        "$ctl" kill "$target"; "$ctl" corrupt "$target"; sleep "$FAULT_FOR"; "$ctl" restart "$target" ;;
       restart-all)
         for i in $(seq 1 "$N"); do "$ctl" kill "$i"; done
         sleep "$FAULT_FOR"
@@ -100,6 +106,9 @@ log="$OUT/run-$BACKEND-$N-$FAULT${TAG:+-$TAG}.txt"
     wait "$pid"
     status=$?
     set -e
+    if [[ $FAULT == corrupt-* ]]; then
+      grep -h "found damage" "$OUT/local/node$target.log" || echo "node $target found no damage"
+    fi
   fi
   exit "$status"
 } 2>&1 | tee "$log"

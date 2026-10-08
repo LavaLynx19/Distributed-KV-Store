@@ -33,7 +33,7 @@ func (n *Node) handleRequestVote(out *core.Output, from core.NodeID, m RequestVo
 	}
 	lastTerm := n.termAt(n.lastIndex())
 	upToDate := m.LastTerm > lastTerm || (m.LastTerm == lastTerm && m.LastIndex >= n.lastIndex())
-	granted := upToDate && (n.votedFor == 0 || n.votedFor == from)
+	granted := upToDate && (n.votedFor == 0 || n.votedFor == from) && !n.abstaining()
 	if granted {
 		n.votedFor = from
 		n.storeHardState(out)

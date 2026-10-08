@@ -91,6 +91,9 @@ func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string
 			return err
 		}
 		defer store.Close()
+		if stored.Damaged {
+			log.Printf("kvnode %d: found damage in %q and removed what it couldn't verify; Recovering", id, data)
+		}
 	}
 
 	transport.Register(raft.MessageBodies()...)

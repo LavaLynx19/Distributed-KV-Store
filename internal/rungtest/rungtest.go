@@ -31,6 +31,11 @@ type Store struct {
 	// SnapshotEvery makes Members take a Snapshot every so many applied
 	// Entries (sim.Config). Zero means never.
 	SnapshotEvery int
+	// TearWrites makes a crash leave part of a write in progress on disk,
+	// possibly with zeros in it (sim.Config).
+	TearWrites bool
+	// UncheckedDisk stores files without checksums, as in Rung 3.
+	UncheckedDisk bool
 }
 
 // Scenario injects Faults into a running Simulation between times from and
@@ -65,13 +70,31 @@ type Report struct {
 	TwoLeaders string
 	// Panic is set when a core's own safety check stopped the run.
 	Panic string
+	// Unreadable lists Members that could not restart because they could
+	// not read their own disk, with the reason.
+	Unreadable []string
+	// Stalled is set when, at the end, too few Members are fit to vote for
+	// a Leader to be elected: the rest found damage on their disks and are
+	// recovering, or can't start at all. A stalled Group has stopped on
+	// purpose (A§6.8). It has kept its safety but not its availability, so
+	// its Members aren't expected to have converged.
+	Stalled bool
+	// StillRecovering counts Members that were Recovering at the end.
+	StillRecovering int
 
 	verdict check.Verdict
 }
 
-// Passed is true when the run kept every Rung 1 guarantee.
+// Safe is true when nothing false was ever said or done: the History is
+// Linearizable, no Term had two Leaders, and no core tripped its own check.
+func (r Report) Safe() bool {
+	return r.Linearizable && !r.TimedOut && r.TwoLeaders == "" && r.Panic == ""
+}
+
+// Passed is true when the run kept every guarantee: it was Safe, every
+// Member could start, and they all ended with the same data.
 func (r Report) Passed() bool {
-	return r.Linearizable && !r.TimedOut && len(r.Diverged) == 0 && r.TwoLeaders == "" && r.Panic == ""
+	return r.Safe() && len(r.Diverged) == 0 && len(r.Unreadable) == 0
 }
 
 // Visualize writes the checked History as an HTML timeline.
@@ -90,6 +113,12 @@ func (r Report) String() string {
 	}
 	if r.Panic != "" {
 		s += " panic: " + r.Panic
+	}
+	if len(r.Unreadable) > 0 {
+		s += fmt.Sprintf(" unreadable: %v", r.Unreadable)
+	}
+	if r.Stalled {
+		s += " stalled"
 	}
 	return s
 }
@@ -114,6 +143,8 @@ func Run(store Store, sc Scenario, members int, seed uint64) Report {
 		Restart:       store.Restart,
 		DiskDelay:     store.DiskDelay,
 		SnapshotEvery: store.SnapshotEvery,
+		TearWrites:    store.TearWrites,
+		UncheckedDisk: store.UncheckedDisk,
 	})
 	h := &check.History{}
 	rep := Report{Scenario: sc.Name, Seed: seed, Members: members, History: h}
@@ -145,9 +176,20 @@ func Run(store Store, sc Scenario, members int, seed uint64) Report {
 	rep.verdict = h.Linearizable(20 * time.Second)
 	rep.Linearizable, rep.TimedOut = rep.verdict.Linearizable, rep.verdict.TimedOut
 	items := map[core.NodeID][]fsm.Item{}
+	fit := 0
 	for _, id := range s.IDs() {
+		if err := s.StartError(id); err != nil {
+			rep.Unreadable = append(rep.Unreadable, fmt.Sprintf("node %d: %v", id, err))
+			continue // it holds no state to compare
+		}
 		items[id] = s.Machine(id).(*fsm.Machine).Items()
+		if s.Status(id).Recovering {
+			rep.StillRecovering++
+		} else {
+			fit++
+		}
 	}
+	rep.Stalled = fit < members/2+1
 	rep.Diverged = check.Diverged(items)
 	rep.Signals = h.Signals
 	rep.Recovery = h.Signals.RecoveryAfter(faultsEnd)
@@ -425,5 +467,104 @@ var Rung3 = []Scenario{
 			s.After(100+s.Rand().Int64N(250), step)
 		}
 		s.At(from, func() { messy(s); step() })
+	}},
+}
+
+// Rung4 adds a disk that lies (README): it can flip a bit in something a
+// Member stored long ago. Damage is only noticed when a Member reads its
+// disk, so each flip is followed by a crash and a restart of that Member.
+// Torn writes are the Store's TearWrites setting, and apply to every crash
+// in every scenario.
+var Rung4 = []Scenario{
+	// One Member at a time has a bit flipped on its disk and restarts.
+	{"bit-flips", func(s *sim.Sim, from, to int64) {
+		var step func()
+		step = func() {
+			if s.Now() >= to {
+				return
+			}
+			ids := s.IDs()
+			id := ids[s.Rand().IntN(len(ids))]
+			s.FlipBit(id)
+			s.Crash(id)
+			s.After(50+s.Rand().Int64N(150), func() { s.Restart(id) })
+			s.After(300+s.Rand().Int64N(300), step)
+		}
+		s.At(from, step)
+	}},
+
+	// Bit flips on top of everything else.
+	{"rot-and-everything", func(s *sim.Sim, from, to int64) {
+		var step func()
+		step = func() {
+			if s.Now() >= to {
+				return
+			}
+			ids := s.IDs()
+			s.Rand().Shuffle(len(ids), func(i, j int) { ids[i], ids[j] = ids[j], ids[i] })
+			cut := 1 + s.Rand().IntN(len(ids)-1)
+			switch s.Rand().IntN(10) {
+			case 0, 1:
+				s.Crash(ids[0])
+			case 2, 3:
+				s.Restart(ids[0])
+			case 4:
+				s.Partition(ids[:cut], ids[cut:])
+			case 5:
+				s.StallDisk(ids[0], 100+s.Rand().Int64N(300))
+			case 6, 7:
+				s.FlipBit(ids[0])
+				s.Crash(ids[0])
+			case 8, 9:
+				s.Heal()
+			}
+			s.After(100+s.Rand().Int64N(250), step)
+		}
+		s.At(from, func() { messy(s); step() })
+	}},
+
+	// The Leader and the followers on its side of a Partition carry on while
+	// the rest fall behind. Then those followers' disks are damaged, and
+	// while they are being brought back up to date the Leader is lost and
+	// the Partition heals. What is left is Members that have lost Entries
+	// they acknowledged and Members that never had them.
+	{"half-repaired", func(s *sim.Sim, from, to int64) {
+		var step func()
+		step = func() {
+			if s.Now() >= to {
+				return
+			}
+			s.Heal()
+			for _, id := range s.IDs() {
+				s.Restart(id)
+			}
+			s.After(250, func() {
+				l := leader(s)
+				if s.Now() >= to-400 {
+					return // no time left to finish the sequence before the repair
+				}
+				if l == 0 {
+					s.After(100, step)
+					return
+				}
+				rest := others(s, l)
+				s.Rand().Shuffle(len(rest), func(i, j int) { rest[i], rest[j] = rest[j], rest[i] })
+				with, behind := rest[:len(rest)/2], rest[len(rest)/2:]
+				s.Partition(append([]core.NodeID{l}, with...), behind)
+				s.After(200+s.Rand().Int64N(150), func() {
+					for _, id := range with {
+						s.FlipBit(id)
+						s.Crash(id)
+						s.Restart(id)
+					}
+					s.After(10+s.Rand().Int64N(60), func() {
+						s.Crash(l)
+						s.Heal()
+						s.After(300, step)
+					})
+				})
+			})
+		}
+		s.At(from, step)
 	}},
 }

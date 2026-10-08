@@ -21,14 +21,15 @@ func (n *Node) sendAppend(out *core.Output, m core.NodeID) {
 		// the Snapshot, which it will refuse.
 		prev = n.log.base
 	}
-	end := min(n.lastIndex(), prev+maxBatch)
+	end := min(n.lastIndex(), prev+core.Index(n.cfg.MaxBatch))
 	n.send(out, m, Append{
-		Term:      n.term,
-		PrevIndex: prev,
-		PrevTerm:  n.termAt(prev),
-		Entries:   n.log.after(prev, end),
-		Commit:    n.commit,
-		ReadRound: n.readRound,
+		Term:       n.term,
+		PrevIndex:  prev,
+		PrevTerm:   n.termAt(prev),
+		Entries:    n.log.after(prev, end),
+		Commit:     n.commit,
+		ReadRound:  n.readRound,
+		LeaderLast: n.lastIndex(),
 	})
 	n.next[m] = end + 1
 }
@@ -38,7 +39,7 @@ func (n *Node) sendAppend(out *core.Output, m core.NodeID) {
 // follower keeps hearing from its Leader meanwhile.
 func (n *Node) sendHeartbeat(out *core.Output, m core.NodeID) {
 	if n.next[m]-1 < n.log.base && !n.cfg.NoSnapshotTransfer && !n.snapshotDue(m) {
-		n.send(out, m, Append{Term: n.term, PrevIndex: n.log.base, PrevTerm: n.log.baseTerm, Commit: n.commit, ReadRound: n.readRound})
+		n.send(out, m, Append{Term: n.term, PrevIndex: n.log.base, PrevTerm: n.log.baseTerm, Commit: n.commit, ReadRound: n.readRound, LeaderLast: n.lastIndex()})
 		return
 	}
 	n.sendAppend(out, m)
@@ -77,7 +78,7 @@ func (n *Node) sendSnapshot(out *core.Output, m core.NodeID) {
 // its Log entirely.
 func (n *Node) handleInstallSnapshot(out *core.Output, from core.NodeID, m InstallSnapshot) {
 	if m.Term < n.term {
-		n.send(out, from, AppendReply{Term: n.term})
+		n.sendReply(out, from, AppendReply{Term: n.term})
 		return
 	}
 	if n.role == core.LeaderRole {
@@ -92,7 +93,7 @@ func (n *Node) handleInstallSnapshot(out *core.Output, from core.NodeID, m Insta
 	if m.Snapshot.Index <= n.commit {
 		// Nothing new: everything it covers is already Committed here, and
 		// Committed Entries are the same on every Member.
-		n.send(out, from, AppendReply{Term: n.term, Success: true, Match: n.commit, ReadRound: m.ReadRound})
+		n.sendReply(out, from, AppendReply{Term: n.term, Success: true, Match: n.commit, ReadRound: m.ReadRound})
 		return
 	}
 	snap := m.Snapshot
@@ -107,7 +108,14 @@ func (n *Node) handleInstallSnapshot(out *core.Output, from core.NodeID, m Insta
 	}
 	n.commit, n.applied = snap.Index, snap.Index
 	out.Restore = &snap
-	n.send(out, from, AppendReply{Term: n.term, Success: true, Match: snap.Index, ReadRound: m.ReadRound})
+	n.sendReply(out, from, AppendReply{Term: n.term, Success: true, Match: snap.Index, ReadRound: m.ReadRound})
+}
+
+// sendReply answers the Leader. A recovering Member flags every answer, so
+// the Leader stops assuming it still holds what it confirmed before.
+func (n *Node) sendReply(out *core.Output, to core.NodeID, r AppendReply) {
+	r.Reset = n.recovering
+	n.send(out, to, r)
 }
 
 // handleAppend is the follower's side of replication. It accepts Entries only
@@ -115,7 +123,7 @@ func (n *Node) handleInstallSnapshot(out *core.Output, from core.NodeID, m Insta
 // Entries that conflict with the Leader's.
 func (n *Node) handleAppend(out *core.Output, from core.NodeID, m Append) {
 	if m.Term < n.term {
-		n.send(out, from, AppendReply{Term: n.term})
+		n.sendReply(out, from, AppendReply{Term: n.term})
 		return
 	}
 	// An Append in the current Term comes from its one Leader.
@@ -134,18 +142,18 @@ func (n *Node) handleAppend(out *core.Output, from core.NodeID, m Append) {
 		// skip them and check from the Snapshot's edge.
 		covered := n.log.base - m.PrevIndex
 		if covered >= core.Index(len(m.Entries)) {
-			n.send(out, from, AppendReply{Term: n.term, Success: true, Match: n.log.base, ReadRound: m.ReadRound})
+			n.sendReply(out, from, AppendReply{Term: n.term, Success: true, Match: n.log.base, ReadRound: m.ReadRound})
 			return
 		}
 		m.Entries = m.Entries[covered:]
 		m.PrevIndex, m.PrevTerm = n.log.base, n.log.baseTerm
 	}
 	if m.PrevIndex > n.lastIndex() {
-		n.send(out, from, AppendReply{Term: n.term, Match: n.lastIndex(), ReadRound: m.ReadRound})
+		n.sendReply(out, from, AppendReply{Term: n.term, Match: n.lastIndex(), ReadRound: m.ReadRound})
 		return
 	}
 	if n.termAt(m.PrevIndex) != m.PrevTerm {
-		n.send(out, from, AppendReply{Term: n.term, Match: m.PrevIndex - 1, ReadRound: m.ReadRound})
+		n.sendReply(out, from, AppendReply{Term: n.term, Match: m.PrevIndex - 1, ReadRound: m.ReadRound})
 		return
 	}
 
@@ -170,7 +178,14 @@ func (n *Node) handleAppend(out *core.Output, from core.NodeID, m Append) {
 	if c := min(m.Commit, confirmed); c > n.commit {
 		n.commit = c
 	}
-	n.send(out, from, AppendReply{Term: n.term, Success: true, Match: confirmed, ReadRound: m.ReadRound})
+	n.sendReply(out, from, AppendReply{Term: n.term, Success: true, Match: confirmed, ReadRound: m.ReadRound})
+
+	// A recovering Member that now matches the Leader's whole Log holds
+	// everything that is Committed, and can be trusted to vote again (A§6.8).
+	if n.recovering && confirmed >= m.LeaderLast {
+		n.recovering = false
+		persist(out).Recovered = true
+	}
 }
 
 func (n *Node) handleAppendReply(out *core.Output, from core.NodeID, m AppendReply) {
@@ -178,6 +193,14 @@ func (n *Node) handleAppendReply(out *core.Output, from core.NodeID, m AppendRep
 		return
 	}
 	n.heard[from] = n.now
+	if m.Reset {
+		// The follower found damage on its disk and holds less than it once
+		// confirmed. What it says it has now is all that can be counted on.
+		// Entries already Committed stay Committed: a Majority held them
+		// when that was decided.
+		n.match[from] = m.Match
+		n.next[from] = m.Match + 1
+	}
 	// Any reply in this Term, success or not, says the follower still
 	// recognised this Leader when it handled that round's Append.
 	if m.ReadRound > n.roundAcked[from] {

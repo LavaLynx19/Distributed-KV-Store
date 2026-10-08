@@ -66,6 +66,10 @@ type Persist struct {
 	TruncateFrom Index
 	// Entries are appended. They continue the stored Log without a gap.
 	Entries []Entry
+	// Recovered clears the mark a Member's storage sets when it finds
+	// damage (Stored.Damaged). The core sets it once the Member again holds
+	// everything that is Committed.
+	Recovered bool
 }
 
 // Stored is a Member's durable state, as a restarted core is given it.
@@ -74,6 +78,13 @@ type Stored struct {
 	Snapshot  *Snapshot
 	// Entries follow the Snapshot, or start at Index 1 if there is none.
 	Entries []Entry
+	// Damaged means the storage found part of what it held unreadable, at
+	// this start or an earlier one, and the Member hasn't recovered since.
+	// The Snapshot and Entries here are what could be verified, and may be
+	// missing things the Member once stored and acknowledged. The Term and
+	// vote are always the true ones: a Member that can't establish those
+	// doesn't start.
+	Damaged bool
 }
 
 // Apply makes the change p describes. Both shells keep a Member's durable
@@ -108,6 +119,9 @@ func (s *Stored) Apply(p *Persist) {
 		}
 		s.Entries = append(s.Entries, e)
 	}
+	if p.Recovered {
+		s.Damaged = false
+	}
 }
 
 // firstIndex is the Index the first stored Entry has, or would have.
@@ -121,7 +135,7 @@ func (s *Stored) firstIndex() Index {
 // Clone returns a copy that shares no memory with s, except Snapshot data and
 // Entry payloads, which nothing modifies.
 func (s *Stored) Clone() Stored {
-	c := Stored{HardState: s.HardState, Entries: append([]Entry(nil), s.Entries...)}
+	c := Stored{HardState: s.HardState, Entries: append([]Entry(nil), s.Entries...), Damaged: s.Damaged}
 	if s.Snapshot != nil {
 		snap := *s.Snapshot
 		c.Snapshot = &snap
@@ -242,6 +256,9 @@ type Status struct {
 	Term   Term
 	Leader NodeID
 	Commit Index
+	// Recovering is set while a Member that found damage on its disk is
+	// staying out of elections (A§6.8).
+	Recovering bool
 }
 
 // Node is a consensus core. Step must be called from one goroutine at a

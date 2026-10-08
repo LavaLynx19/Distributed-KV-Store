@@ -12,7 +12,19 @@ import (
 	"slices"
 
 	"distributed-kv-store/internal/core"
+	"distributed-kv-store/internal/storage"
 )
+
+// dataDir is each Member's data directory on its own simulated filesystem.
+const dataDir = "data"
+
+// must stops the run on a storage error. On the in-memory filesystem that
+// can only mean the Store was asked to do something impossible.
+func must(err error) {
+	if err != nil {
+		panic("sim: " + err.Error())
+	}
+}
 
 // Machine is the state machine a Member applies Committed Entries to. Apply
 // returns the response for the client that proposed the Entry. Read answers
@@ -44,6 +56,13 @@ type Config struct {
 	// DiskDelay is how long a write takes to become durable: DiskDelay[0] to
 	// DiskDelay[1] units. Zero means at once.
 	DiskDelay [2]int64
+	// TearWrites makes a crash treat a write in progress as a real disk
+	// might: part of it may survive, and part of that may be zeros (Rung 4).
+	// It only matters with Restart set.
+	TearWrites bool
+	// UncheckedDisk makes Members store their files without checksums, as
+	// in Rung 3, so that Rung 4's exposure of that stays reproducible.
+	UncheckedDisk bool
 	// SnapshotEvery makes each Member take a Snapshot of its state machine
 	// whenever it has applied this many Entries since the last one, and hand
 	// it to the core (A§6.4). Zero means never.
@@ -80,10 +99,16 @@ type member struct {
 	pending map[uint64]func(Reply)
 	queries map[uint64][]byte // the query of each pending read, by Ref
 
-	// The simulated disk (A§8.1). disk is what has become durable. While a
+	// The simulated disk (A§8.1): the real storage code on a filesystem held
+	// in memory, which loses whatever wasn't synced when the Member crashes
+	// and can be made to tear writes and flip bits. startErr is why the last
+	// restart failed, if it did: the Member then stays down.
+	fs       *storage.MemFS
+	store    *storage.Store
+	startErr error
+	// While a
 	// write is on its way there the Member does nothing else: events wait in
 	// inbox. A crash discards the write in progress and the inbox.
-	disk         core.Stored
 	writing      bool
 	inbox        []core.Event
 	life         int   // counts crashes, so a write from a past life is ignored
@@ -139,7 +164,9 @@ func New(cfg Config) *Sim {
 			up:      true,
 			pending: map[uint64]func(Reply){},
 			queries: map[uint64][]byte{},
+			fs:      storage.NewMemFS(),
 		}
+		m.store, _, _ = s.openDisk(m.fs) // an empty MemFS can't fail to open
 		s.members[id] = m
 		// Members tick out of phase with each other.
 		s.schedule(s.rng.Int64N(cfg.TickEvery), func() { s.tick(m) })
@@ -230,6 +257,14 @@ func (s *Sim) Crash(id core.NodeID) {
 	m.writing = false
 	m.inbox = nil
 	s.mix('C', uint64(id), 0)
+	if s.cfg.Restart != nil {
+		// The process is gone, and with it anything not yet on disk.
+		if s.cfg.TearWrites {
+			m.fs.Crash(s.rng, true)
+		} else {
+			m.fs.Crash(nil, false)
+		}
+	}
 	refs := make([]uint64, 0, len(m.pending))
 	for ref := range m.pending {
 		refs = append(refs, ref)
@@ -250,24 +285,59 @@ func (s *Sim) Restart(id core.NodeID) {
 	if m.up {
 		return
 	}
-	m.up = true
 	s.mix('R', uint64(id), 0)
-	if s.cfg.Restart != nil {
-		rng := rand.New(rand.NewPCG(s.cfg.Seed, uint64(id)+uint64(m.life)<<32))
-		m.core = s.cfg.Restart(id, slices.Clone(s.ids), rng, m.disk.Clone())
+	if s.cfg.Restart == nil {
+		m.up = true
+		return
+	}
+	store, stored, err := s.openDisk(m.fs)
+	if err == nil && stored.Snapshot != nil {
+		machine := s.cfg.NewMachine()
+		if err = machine.Restore(stored.Snapshot.Data); err == nil {
+			m.machine = machine
+			m.applied, m.snapshotAt = stored.Snapshot.Index, stored.Snapshot.Index
+		}
+	} else if err == nil {
 		m.machine = s.cfg.NewMachine()
 		m.applied, m.snapshotAt = 0, 0
-		if snap := m.disk.Snapshot; snap != nil {
-			if err := m.machine.Restore(snap.Data); err != nil {
-				panic(fmt.Sprintf("sim: node %d can't restore its Snapshot: %v", id, err))
-			}
-			m.applied, m.snapshotAt = snap.Index, snap.Index
-		}
 	}
+	if err != nil {
+		// What is on disk can't be read back. A real process would exit.
+		m.startErr = err
+		s.mix('E', uint64(id), 0)
+		return
+	}
+	m.up, m.store, m.startErr = true, store, nil
+	rng := rand.New(rand.NewPCG(s.cfg.Seed, uint64(id)+uint64(m.life)<<32))
+	m.core = s.cfg.Restart(id, slices.Clone(s.ids), rng, stored)
 }
 
-// Disk is what a Member has durably stored.
-func (s *Sim) Disk(id core.NodeID) core.Stored { return s.members[id].disk.Clone() }
+func (s *Sim) openDisk(fs *storage.MemFS) (*storage.Store, core.Stored, error) {
+	return storage.OpenWith(fs, dataDir, storage.Options{Unchecked: s.cfg.UncheckedDisk})
+}
+
+// StartError is why a Member's last restart failed, or nil. A Member that
+// can't read its own disk stays down.
+func (s *Sim) StartError(id core.NodeID) error { return s.members[id].startErr }
+
+// Disk is what a Member would find on its disk if it crashed now and
+// restarted. It panics if the disk can't be read.
+func (s *Sim) Disk(id core.NodeID) core.Stored {
+	_, stored, err := s.openDisk(s.members[id].fs.Durable())
+	if err != nil {
+		panic(fmt.Sprintf("sim: node %d's disk is unreadable: %v", id, err))
+	}
+	return stored
+}
+
+// FlipBit inverts one bit somewhere in what a Member has on disk, and
+// reports which file, or "" if its disk is empty. Nothing notices until the
+// Member next reads its disk, which is when it restarts.
+func (s *Sim) FlipBit(id core.NodeID) string {
+	path := s.members[id].fs.FlipBit(s.rng)
+	s.mix('B', uint64(id), uint64(len(path)))
+	return path
+}
 
 // StallDisk makes a Member's disk unresponsive for d units: any write it has
 // in progress or starts in that time completes only afterwards.
@@ -367,8 +437,12 @@ func (s *Sim) step(m *member, ev core.Event) {
 		delay += s.rng.Int64N(span + 1)
 	}
 	delay = max(delay, m.stalledUntil-s.now)
+	// The write starts now: its bytes reach the filesystem, unsynced. It is
+	// durable only once the sync below has run.
+	must(m.store.Write(out.Persist))
+	must(m.store.Flush())
 	if delay <= 0 {
-		m.disk.Apply(out.Persist)
+		must(m.store.Sync())
 		s.finish(m, out)
 		return
 	}
@@ -391,7 +465,7 @@ func (s *Sim) completeWrite(m *member, life int, out core.Output) {
 	if m.life != life {
 		return
 	}
-	m.disk.Apply(out.Persist)
+	must(m.store.Sync())
 	m.writing = false
 	s.mix('W', uint64(m.id), 0)
 	s.finish(m, out)

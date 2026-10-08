@@ -80,6 +80,10 @@ _Avoid_: Split, netsplit
 A failure the harness injects on purpose: a crash, a Partition, a delayed or duplicated message, a slow or corrupted disk, or a skewed clock.
 _Avoid_: Error, chaos, failure injection
 
+**Recovering**:
+Said of a Member that found part of what it stored damaged and hasn't yet been brought back up to date. It takes no part in elections until it has.
+_Avoid_: Repairing, degraded, quarantined
+
 **Unsafe recovery**:
 An operator action that forces the surviving minority of a Group to continue after its Majority is lost for good. It can discard Acknowledged writes.
 _Avoid_: Force restart, disaster recovery

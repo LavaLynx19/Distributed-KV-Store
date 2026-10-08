@@ -54,6 +54,9 @@ type statusResponse struct {
 	Term   core.Term   `json:"term"`
 	Leader core.NodeID `json:"leader"`
 	Commit core.Index  `json:"commit"`
+	// Recovering is set while the Member stays out of elections after
+	// finding damage on its disk (A§6.8).
+	Recovering bool `json:"recovering,omitempty"`
 }
 
 const maxBody = 1 << 20
@@ -193,7 +196,7 @@ func (a *API) status(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	role := map[core.Role]string{core.Follower: "follower", core.Candidate: "candidate", core.LeaderRole: "leader"}[st.Role]
-	writeJSON(w, http.StatusOK, statusResponse{ID: st.ID, Role: role, Term: st.Term, Leader: st.Leader, Commit: st.Commit})
+	writeJSON(w, http.StatusOK, statusResponse{ID: st.ID, Role: role, Term: st.Term, Leader: st.Leader, Commit: st.Commit, Recovering: st.Recovering})
 }
 
 // ItemJSON is one key in the debug dump (A§7.4).

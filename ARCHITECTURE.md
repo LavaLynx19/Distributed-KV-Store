@@ -172,15 +172,26 @@ A Member's data directory (`internal/storage`):
 
 | File | Content | How it changes |
 |---|---|---|
-| `state` | Term and vote, 16 bytes | Replaced whole: written to a temporary file, synced, renamed |
+| `state.a`, `state.b` | Term and vote, 16 bytes, twice | Each replaced whole, one after the other: written to a temporary file, synced, renamed |
 | `snapshot` | Index, Term, then the state machine's data | Replaced whole, the same way |
-| `log/<first>.seg` | Log segments, named by their first Entry's index. Each is a run of records: a 4-byte length, then one Entry | Appended to; a new segment starts every 4 MB |
+| `log/<first>.seg` | Log segments, named by their first Entry's index. Each is a run of records | Appended to; a new segment starts every 4 MB |
+| `damaged` | Empty. Present while the Member is **Recovering** (§6.8) | Created when damage is found, removed when the core says it has recovered |
+
+Everything carries a CRC-32C checksum. The whole files end with one over their contents. A Log record is:
+
+| Part | Size | |
+|---|---|---|
+| Length | 4 bytes | Size of the body |
+| Checksum | 4 bytes | Of the length |
+| Checksum | 4 bytes | Of the body |
+| Body | | One Entry |
+| End mark | 1 byte | `0xA5` |
 
 - **A change is durable when the files and their directories have been synced.** Several changes can share one sync (§4.3).
 - **Trimming** deletes the segments a Snapshot has made unnecessary. **Replacing a conflicting tail** deletes later segments first, then cuts the one holding the conflict, so a crash part way never leaves a gap.
-- **A crash can leave the last record incomplete.** Opening the directory drops it: nothing after it can have been acknowledged.
-- **A crash between saving a Snapshot and trimming** can leave Entries the Snapshot has made obsolete. Opening the directory drops those too.
-- Records carry **no checksum until Rung 4**, which exists to expose that gap (Decision Log). A record that is complete but damaged is read back as if valid.
+- **A record that was never completely written is dropped on opening.** The file ends inside it, or zeros sit where its end should be with nothing after. Only the last write before a crash can look like this. It was never synced, so nothing in it was acknowledged.
+- **A record that was complete and no longer matches its checksums is damage** (§6.8). The length has its own checksum because a damaged length would otherwise make a record seem to run past the end of the file, and pass for one never completely written. The end mark is non-zero because a file can grow before its data arrives, leaving zeros that a crash makes permanent.
+- **Two copies of the Term and vote**, because a Member that loses them can't safely take part again (Decision Log). Either copy is enough, and a restart rewrites one that is damaged or behind. The newer copy is the one with the higher Term, or with a vote where the other has none.
 
 ## 6. Paths
 
@@ -220,6 +231,22 @@ An operator command, run on a surviving Member while the Group is stopped, rewri
 
 ### 6.7 Expiry
 A key written with a time-to-live stores a deadline: the Entry's stamp plus the time-to-live. It stops existing when Log time passes the deadline. Reads compare against Log time, so a read on any Member at the same applied index gives the same answer. Expired keys are removed lazily and by a periodic sweep that is itself deterministic.
+
+### 6.8 Damage and recovery
+When a Member starts and its storage finds damage, the storage first leaves a durable mark, then removes what it can't verify:
+- **A damaged Log record:** that record and everything after it.
+- **A damaged Snapshot:** the Snapshot and the whole Log, which means nothing without it.
+- **Both copies of the Term and vote damaged:** nothing is removed, and the Member doesn't start.
+
+The Member that starts is **Recovering**. It may have acknowledged Entries it no longer holds, so:
+- **It stays out of elections.** It doesn't stand, and it grants no votes. An Entry is Committed because a Majority holds it. If a Member that has lost it could still vote, a candidate without the Entry could reach a Majority.
+- **It tells the Leader.** Every reply it sends is flagged, and the Leader lowers its record of what that follower holds to what the follower now says. What was already Committed stays Committed.
+- **It is repaired like any follower that is behind:** by the Log, or by Snapshot if the Leader has trimmed past it.
+- **It resumes** once an Append from a Leader of its Term or later leaves its Log matching the Leader's whole Log. A Leader holds every Committed Entry, so now this Member does too. The core tells the storage, which removes the mark.
+
+The mark survives restarts, so a Member that restarts while Recovering is still Recovering.
+
+**The cost.** A Group needs a Majority of Members fit to vote. If most are damaged at once, nobody can be elected, and the Group stops until an operator intervenes (§6.6). It stops with its safety intact.
 
 ## 7. API contract
 
@@ -334,3 +361,9 @@ The Log, Snapshot files and the copy-on-write tree are written by hand rather th
 
 ### The shell stores before it acts, and the core is never told
 The original contract had an event telling the core "these writes are now durable", so it could carry on while the disk worked. Rung 3 dropped it. The rule is simpler: a shell makes an output's writes durable before it does anything else that output asks for. A core can then treat whatever it asked to store as stored the moment a step returns, and there is no state in which a vote or an Entry exists in memory but not on disk and something has already been said about it. The cost is that a Member does nothing else while its disk is busy. Group commit recovers most of that under load: the real shell syncs once for every event that was ready. Don't reintroduce the event to make the core "asynchronous" without measuring what it would buy.
+
+### A damaged Member abstains until repaired
+A Member that finds damage on its disk drops what it can't verify and fetches it again. The tempting version lets it carry on as a full Member meanwhile. That loses Committed Entries: the Member acknowledged an Entry, no longer has it, and votes for a candidate that never did. In simulation that version produced Histories that weren't Linearizable in up to 81 of 300 runs. So a damaged Member stays out of elections until its Log matches a Leader's (§6.8). The cost is availability: with most Members damaged at once the Group stops, where the tempting version would have kept going and been wrong. Staying down until an operator replaces the Member was the other safe choice, and was rejected because it turns every flipped bit into a lost Member.
+
+### A Member that can't say how it voted doesn't start
+The first design let a Member that had lost its Term and vote adopt the Leader's Term and carry on. That is unsafe. The Member may have voted in a Term higher than the Leader has seen, for a candidate that was cut off and kept standing. When the Group reaches that Term, the Member would vote in it a second time, and two Leaders could be elected. Nothing the Member can learn from others tells it what it promised. So the Term and vote are stored twice, either copy is enough, and a Member with both copies damaged stays down until it can be replaced under a new identity (Rung 6).
