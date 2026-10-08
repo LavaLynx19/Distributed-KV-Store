@@ -50,10 +50,19 @@ type AppendReply struct {
 	ReadRound uint64
 }
 
+// InstallSnapshot carries the Leader's Snapshot to a follower that needs
+// Entries the Leader's Log no longer holds (A§6.4). The follower answers
+// with an AppendReply.
+type InstallSnapshot struct {
+	Term      core.Term
+	Snapshot  core.Snapshot
+	ReadRound uint64
+}
+
 // MessageBodies lists the types this core puts in a Message, for the
 // transport to register.
 func MessageBodies() []any {
-	return []any{RequestVote{}, VoteReply{}, Append{}, AppendReply{}}
+	return []any{RequestVote{}, VoteReply{}, Append{}, AppendReply{}, InstallSnapshot{}}
 }
 
 // ReadMode is how a Member answers core.Read events (A§6.2).
@@ -85,6 +94,16 @@ type Config struct {
 	HeartbeatTicks int
 	Rand           core.Rand
 	Reads          ReadMode
+	// Stored is the Member's durable state from before a restart. The zero
+	// value is a Member starting for the first time.
+	Stored core.Stored
+	// NoSnapshotTransfer stops a Leader sending its Snapshot to a follower
+	// that needs Entries the Log no longer holds. It exists so that Rung 3's
+	// exposure of a Member that can't catch up stays reproducible.
+	NoSnapshotTransfer bool
+	// Volatile makes the Member store nothing, as before Rung 3. It exists so
+	// that Rung 3's exposure of a store with no disk stays reproducible.
+	Volatile bool
 }
 
 // maxBatch caps the Entries in one Append.
@@ -101,9 +120,12 @@ type Node struct {
 	role     core.Role
 	leader   core.NodeID
 
-	log     []core.Entry // log[i] holds Index i+1
-	commit  core.Index
-	applied core.Index // last Index handed to the shell in Output.Committed
+	log raftLog
+	// snapshot is the latest Snapshot, kept to send to Members that need
+	// Entries the Log no longer holds. Nil until one is taken or installed.
+	snapshot *core.Snapshot
+	commit   core.Index
+	applied  core.Index // last Index handed to the shell in Output.Committed
 
 	now     int // ticks since start
 	elapsed int // ticks since a Leader was heard from, or the election began
@@ -116,6 +138,7 @@ type Node struct {
 	next      map[core.NodeID]core.Index // next Index to send each follower
 	match     map[core.NodeID]core.Index // highest Index known to be on each
 	heard     map[core.NodeID]int        // tick of each follower's last reply
+	sentSnap  map[core.NodeID]int        // tick at which each was last sent the Snapshot
 	heartbeat int                        // ticks since the last heartbeat
 	pending   map[core.Index]uint64      // proposals awaiting commit, by Index
 
@@ -126,29 +149,55 @@ type Node struct {
 	reads      []pendingRead
 }
 
-// New builds a Member, which starts as a follower in Term 0.
+// New builds a Member as a follower, with whatever cfg.Stored says it had
+// stored. What it stored is all it knows: the commit index starts again at
+// its Snapshot, and Committed Entries after that are handed to the shell
+// afresh as the Leader confirms them, so the shell rebuilds the state machine
+// by applying them to the Snapshot.
 func New(cfg Config) *Node {
 	members := slices.Clone(cfg.Members)
 	slices.Sort(members)
 	n := &Node{id: cfg.ID, members: members, cfg: cfg, pending: map[core.Index]uint64{}}
+	n.term, n.votedFor = cfg.Stored.HardState.Term, cfg.Stored.HardState.VotedFor
+	if snap := cfg.Stored.Snapshot; snap != nil {
+		n.snapshot = snap
+		n.log.base, n.log.baseTerm = snap.Index, snap.Term
+		n.commit, n.applied = snap.Index, snap.Index
+	}
+	n.log.entries = slices.Clone(cfg.Stored.Entries)
+	n.cfg.Stored = core.Stored{} // not needed again; don't hold the Log twice
 	n.resetElection()
 	return n
+}
+
+// persist returns the Output's Persist, creating it on first use.
+func persist(out *core.Output) *core.Persist {
+	if out.Persist == nil {
+		out.Persist = &core.Persist{}
+	}
+	return out.Persist
+}
+
+// storeHardState asks for the current Term and vote to be stored. It must
+// follow every change to either.
+func (n *Node) storeHardState(out *core.Output) {
+	persist(out).HardState = &core.HardState{Term: n.term, VotedFor: n.votedFor}
+}
+
+// appendEntry adds an Entry to the Log and asks for it to be stored.
+func (n *Node) appendEntry(out *core.Output, e core.Entry) {
+	n.log.append(e)
+	p := persist(out)
+	p.Entries = append(p.Entries, e)
 }
 
 func (n *Node) Status() core.Status {
 	return core.Status{ID: n.id, Role: n.role, Term: n.term, Leader: n.leader, Commit: n.commit}
 }
 
-func (n *Node) majority() int         { return len(n.members)/2 + 1 }
-func (n *Node) lastIndex() core.Index { return core.Index(len(n.log)) }
-
-// termAt is the Term of the Entry at i, or 0 for the position before the Log.
-func (n *Node) termAt(i core.Index) core.Term {
-	if i == 0 {
-		return 0
-	}
-	return n.log[i-1].Term
-}
+func (n *Node) majority() int                 { return len(n.members)/2 + 1 }
+func (n *Node) lastIndex() core.Index         { return n.log.last() }
+func (n *Node) termAt(i core.Index) core.Term { return n.log.term(i) }
 
 func (n *Node) resetElection() {
 	n.elapsed = 0
@@ -168,9 +217,14 @@ func (n *Node) Step(ev core.Event) core.Output {
 		n.propose(&out, ev)
 	case core.Read:
 		n.read(&out, ev)
+	case core.Snapshotted:
+		n.snapshotted(&out, ev)
 	}
 	n.deliverCommitted(&out)
 	n.releaseReads(&out)
+	if n.cfg.Volatile {
+		out.Persist = nil
+	}
 	return out
 }
 
@@ -204,7 +258,7 @@ func (n *Node) tick(out *core.Output) {
 			}
 			// Anything sent but not yet confirmed is sent again.
 			n.next[m] = n.match[m] + 1
-			n.sendAppend(out, m)
+			n.sendHeartbeat(out, m)
 		}
 	}
 }
@@ -229,6 +283,7 @@ func (n *Node) becomeFollower(out *core.Output, term core.Term, leader core.Node
 	if term > n.term {
 		n.term = term
 		n.votedFor = 0
+		n.storeHardState(out)
 	}
 	if n.role != core.Follower {
 		n.resetElection()
@@ -273,6 +328,11 @@ func (n *Node) receive(out *core.Output, msg core.Message) {
 			n.becomeFollower(out, m.Term, 0)
 		}
 		n.handleAppendReply(out, msg.From, m)
+	case InstallSnapshot:
+		if m.Term > n.term {
+			n.becomeFollower(out, m.Term, msg.From)
+		}
+		n.handleInstallSnapshot(out, msg.From, m)
 	}
 }
 
@@ -281,7 +341,7 @@ func (n *Node) receive(out *core.Output, msg core.Message) {
 func (n *Node) deliverCommitted(out *core.Output) {
 	for n.applied < n.commit {
 		n.applied++
-		out.Committed = append(out.Committed, n.log[n.applied-1])
+		out.Committed = append(out.Committed, n.log.entry(n.applied))
 		if ref, ok := n.pending[n.applied]; ok {
 			delete(n.pending, n.applied)
 			out.Results = append(out.Results, core.Result{Ref: ref, Reason: core.OK, Index: n.applied})
@@ -303,7 +363,7 @@ func (n *Node) propose(out *core.Output, p core.Propose) {
 	}
 
 	index := n.lastIndex() + 1
-	n.log = append(n.log, core.Entry{Index: index, Term: n.term, Kind: core.EntryCommand, Payload: slices.Clone(p.Payload)})
+	n.appendEntry(out, core.Entry{Index: index, Term: n.term, Kind: core.EntryCommand, Payload: slices.Clone(p.Payload)})
 	n.pending[index] = p.Ref
 	for _, m := range n.members {
 		// A follower that has been sent everything so far gets the new Entry
@@ -313,6 +373,18 @@ func (n *Node) propose(out *core.Output, p core.Propose) {
 		}
 	}
 	n.advanceCommit()
+}
+
+// snapshotted takes a Snapshot from the shell and drops the Log it covers
+// (A§6.4). The Snapshot is stored before the Entries are gone for good.
+func (n *Node) snapshotted(out *core.Output, s core.Snapshotted) {
+	if s.Index <= n.log.base || s.Index > n.applied {
+		return // older than what we have, or of Entries never handed over
+	}
+	snap := &core.Snapshot{Index: s.Index, Term: n.termAt(s.Index), Data: s.Data}
+	n.log.compactTo(s.Index)
+	n.snapshot = snap
+	persist(out).Snapshot = snap
 }
 
 // read rules on a read that bypasses the Log.

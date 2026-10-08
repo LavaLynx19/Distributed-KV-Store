@@ -255,3 +255,11 @@ func TestReadIndexFollowerRedirectsGets(t *testing.T) {
 		}
 	}
 }
+
+func decode(t *testing.T, resp *http.Response, into any) {
+	t.Helper()
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(into); err != nil {
+		t.Fatal(err)
+	}
+}

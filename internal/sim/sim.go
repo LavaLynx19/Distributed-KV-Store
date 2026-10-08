@@ -6,6 +6,7 @@ package sim
 
 import (
 	"container/heap"
+	"fmt"
 	"hash/fnv"
 	"math/rand/v2"
 	"slices"
@@ -15,10 +16,14 @@ import (
 
 // Machine is the state machine a Member applies Committed Entries to. Apply
 // returns the response for the client that proposed the Entry. Read answers
-// a query from the current state without an Entry.
+// a query from the current state without an Entry. Capture returns a function
+// that encodes the state as it was when Capture was called, and Restore
+// replaces the state with an encoded one.
 type Machine interface {
 	Apply(core.Entry) []byte
 	Read(query []byte) []byte
+	Capture() func() []byte
+	Restore(data []byte) error
 }
 
 // Config describes one simulated Group.
@@ -30,6 +35,19 @@ type Config struct {
 	NewNode func(id core.NodeID, members []core.NodeID, rng core.Rand) core.Node
 	// NewMachine builds a Member's state machine.
 	NewMachine func() Machine
+
+	// Restart, if set, makes a crash lose everything that wasn't durable: a
+	// restarted Member gets a new core built from its simulated disk, and a
+	// new state machine. If nil, a crashed Member resumes with its memory
+	// intact, as if frozen (Rungs 1–2, PLAN §P1).
+	Restart func(id core.NodeID, members []core.NodeID, rng core.Rand, stored core.Stored) core.Node
+	// DiskDelay is how long a write takes to become durable: DiskDelay[0] to
+	// DiskDelay[1] units. Zero means at once.
+	DiskDelay [2]int64
+	// SnapshotEvery makes each Member take a Snapshot of its state machine
+	// whenever it has applied this many Entries since the last one, and hand
+	// it to the core (A§6.4). Zero means never.
+	SnapshotEvery int
 
 	// Copy, if set, stands in for the network's encoding: every message is
 	// passed through it on the way, so Members never share memory.
@@ -61,6 +79,18 @@ type member struct {
 	up      bool
 	pending map[uint64]func(Reply)
 	queries map[uint64][]byte // the query of each pending read, by Ref
+
+	// The simulated disk (A§8.1). disk is what has become durable. While a
+	// write is on its way there the Member does nothing else: events wait in
+	// inbox. A crash discards the write in progress and the inbox.
+	disk         core.Stored
+	writing      bool
+	inbox        []core.Event
+	life         int   // counts crashes, so a write from a past life is ignored
+	stalledUntil int64 // writes don't complete before this time
+
+	applied    core.Index // the last Entry applied to machine
+	snapshotAt core.Index // the Entry the last Snapshot was taken at
 }
 
 // Sim is one simulated Group. It is not safe for concurrent use: everything
@@ -196,6 +226,9 @@ func (s *Sim) Crash(id core.NodeID) {
 		return
 	}
 	m.up = false
+	m.life++
+	m.writing = false
+	m.inbox = nil
 	s.mix('C', uint64(id), 0)
 	refs := make([]uint64, 0, len(m.pending))
 	for ref := range m.pending {
@@ -210,7 +243,8 @@ func (s *Sim) Crash(id core.NodeID) {
 	}
 }
 
-// Restart brings a crashed Member back.
+// Restart brings a crashed Member back. With Config.Restart set, it comes
+// back with only what its disk holds.
 func (s *Sim) Restart(id core.NodeID) {
 	m := s.members[id]
 	if m.up {
@@ -218,6 +252,29 @@ func (s *Sim) Restart(id core.NodeID) {
 	}
 	m.up = true
 	s.mix('R', uint64(id), 0)
+	if s.cfg.Restart != nil {
+		rng := rand.New(rand.NewPCG(s.cfg.Seed, uint64(id)+uint64(m.life)<<32))
+		m.core = s.cfg.Restart(id, slices.Clone(s.ids), rng, m.disk.Clone())
+		m.machine = s.cfg.NewMachine()
+		m.applied, m.snapshotAt = 0, 0
+		if snap := m.disk.Snapshot; snap != nil {
+			if err := m.machine.Restore(snap.Data); err != nil {
+				panic(fmt.Sprintf("sim: node %d can't restore its Snapshot: %v", id, err))
+			}
+			m.applied, m.snapshotAt = snap.Index, snap.Index
+		}
+	}
+}
+
+// Disk is what a Member has durably stored.
+func (s *Sim) Disk(id core.NodeID) core.Stored { return s.members[id].disk.Clone() }
+
+// StallDisk makes a Member's disk unresponsive for d units: any write it has
+// in progress or starts in that time completes only afterwards.
+func (s *Sim) StallDisk(id core.NodeID, d int64) {
+	m := s.members[id]
+	m.stalledUntil = max(m.stalledUntil, s.now+d)
+	s.mix('S', uint64(id), uint64(d))
 }
 
 // Partition cuts the network between the given sets of Members, in both
@@ -292,13 +349,71 @@ func (s *Sim) tick(m *member) {
 	}
 }
 
-// step feeds one event to a Member's core and carries out its Output.
+// step feeds one event to a Member's core and carries out its Output. If the
+// Output has something to store, that happens first, and takes time: until
+// the disk is done the Member handles nothing else (A§4.2, the order rule).
 func (s *Sim) step(m *member, ev core.Event) {
+	if m.writing {
+		m.inbox = append(m.inbox, ev)
+		return
+	}
 	out := m.core.Step(ev)
+	if out.Persist == nil {
+		s.finish(m, out)
+		return
+	}
+	delay := s.cfg.DiskDelay[0]
+	if span := s.cfg.DiskDelay[1] - s.cfg.DiskDelay[0]; span > 0 {
+		delay += s.rng.Int64N(span + 1)
+	}
+	delay = max(delay, m.stalledUntil-s.now)
+	if delay <= 0 {
+		m.disk.Apply(out.Persist)
+		s.finish(m, out)
+		return
+	}
+	m.writing = true
+	life := m.life
+	s.schedule(delay, func() {
+		if m.life != life {
+			return // the Member crashed with this write in progress: it's lost
+		}
+		// A stall that began after the write started still holds it up.
+		if wait := m.stalledUntil - s.now; wait > 0 {
+			s.schedule(wait, func() { s.completeWrite(m, life, out) })
+			return
+		}
+		s.completeWrite(m, life, out)
+	})
+}
 
+func (s *Sim) completeWrite(m *member, life int, out core.Output) {
+	if m.life != life {
+		return
+	}
+	m.disk.Apply(out.Persist)
+	m.writing = false
+	s.mix('W', uint64(m.id), 0)
+	s.finish(m, out)
+	for len(m.inbox) > 0 && !m.writing && m.up && m.life == life {
+		ev := m.inbox[0]
+		m.inbox = m.inbox[1:]
+		s.step(m, ev)
+	}
+}
+
+// finish carries out everything in an Output except its Persist.
+func (s *Sim) finish(m *member, out core.Output) {
+	if snap := out.Restore; snap != nil {
+		if err := m.machine.Restore(snap.Data); err != nil {
+			panic(fmt.Sprintf("sim: node %d can't install a Snapshot: %v", m.id, err))
+		}
+		m.applied, m.snapshotAt = snap.Index, snap.Index
+	}
 	responses := make(map[core.Index][]byte, len(out.Committed))
 	for _, e := range out.Committed {
 		responses[e.Index] = m.machine.Apply(e)
+		m.applied = e.Index
 	}
 	for _, r := range out.Results {
 		done, ok := m.pending[r.Ref]
@@ -323,6 +438,11 @@ func (s *Sim) step(m *member, ev core.Event) {
 	}
 	for _, msg := range out.Messages {
 		s.send(msg)
+	}
+	if n := s.cfg.SnapshotEvery; n > 0 && int(m.applied-m.snapshotAt) >= n {
+		m.snapshotAt = m.applied
+		s.mix('N', uint64(m.id), uint64(m.applied))
+		s.step(m, core.Snapshotted{Index: m.applied, Data: m.machine.Capture()()})
 	}
 }
 

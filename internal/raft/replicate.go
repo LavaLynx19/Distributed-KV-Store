@@ -2,7 +2,6 @@ package raft
 
 import (
 	"fmt"
-	"slices"
 
 	"distributed-kv-store/internal/core"
 )
@@ -12,16 +11,103 @@ import (
 // if no confirmation has come back by then.
 func (n *Node) sendAppend(out *core.Output, m core.NodeID) {
 	prev := n.next[m] - 1
+	if prev < n.log.base {
+		// The follower needs Entries a Snapshot has replaced.
+		if !n.cfg.NoSnapshotTransfer {
+			n.sendSnapshot(out, m)
+			return
+		}
+		// With transfer off there is nothing to send it but what follows
+		// the Snapshot, which it will refuse.
+		prev = n.log.base
+	}
 	end := min(n.lastIndex(), prev+maxBatch)
 	n.send(out, m, Append{
 		Term:      n.term,
 		PrevIndex: prev,
 		PrevTerm:  n.termAt(prev),
-		Entries:   slices.Clone(n.log[prev:end]),
+		Entries:   n.log.after(prev, end),
 		Commit:    n.commit,
 		ReadRound: n.readRound,
 	})
 	n.next[m] = end + 1
+}
+
+// sendHeartbeat is the per-tick send to follower m: whatever it is due, or
+// an empty Append if that is a Snapshot already on its way, so that the
+// follower keeps hearing from its Leader meanwhile.
+func (n *Node) sendHeartbeat(out *core.Output, m core.NodeID) {
+	if n.next[m]-1 < n.log.base && !n.cfg.NoSnapshotTransfer && !n.snapshotDue(m) {
+		n.send(out, m, Append{Term: n.term, PrevIndex: n.log.base, PrevTerm: n.log.baseTerm, Commit: n.commit, ReadRound: n.readRound})
+		return
+	}
+	n.sendAppend(out, m)
+}
+
+// snapshotDue reports whether follower m should be sent the Snapshot now. A
+// Snapshot can be large, so it is sent again only after an election
+// timeout's worth of ticks with no confirmation.
+func (n *Node) snapshotDue(m core.NodeID) bool {
+	sent, ever := n.sentSnap[m]
+	return !ever || n.now-sent >= n.cfg.ElectionTicks
+}
+
+// sendSnapshot sends follower m the Leader's Snapshot, unless one went out
+// recently, and expects the follower to continue from just after it.
+func (n *Node) sendSnapshot(out *core.Output, m core.NodeID) {
+	if !n.snapshotDue(m) {
+		return
+	}
+	n.sentSnap[m] = n.now
+	n.send(out, m, InstallSnapshot{Term: n.term, Snapshot: *n.snapshot, ReadRound: n.readRound})
+	n.next[m] = n.log.base + 1
+}
+
+// handleInstallSnapshot is the follower's side of catching up by Snapshot. A
+// Snapshot that reaches past what this Member has Committed replaces its
+// state machine's contents and the Log the Snapshot covers.
+//
+// What happens to the Log after the Snapshot depends on whether this Member
+// already holds the Snapshot's last Entry. If it does, its Log agrees with
+// the Leader's up to there, and everything after is kept: the Member may
+// have acknowledged those Entries, and the Leader may be counting on them.
+// A Leader can send a Snapshot to a follower that is nearly up to date,
+// because its record of the follower lags the acknowledgements in flight.
+// Only a Member whose Log doesn't reach or doesn't match the Snapshot drops
+// its Log entirely.
+func (n *Node) handleInstallSnapshot(out *core.Output, from core.NodeID, m InstallSnapshot) {
+	if m.Term < n.term {
+		n.send(out, from, AppendReply{Term: n.term})
+		return
+	}
+	if n.role == core.LeaderRole {
+		panic(fmt.Sprintf("raft: nodes %d and %d both lead term %d", n.id, from, n.term))
+	}
+	if n.role != core.Follower {
+		n.becomeFollower(out, m.Term, from)
+	}
+	n.leader = from
+	n.elapsed = 0
+
+	if m.Snapshot.Index <= n.commit {
+		// Nothing new: everything it covers is already Committed here, and
+		// Committed Entries are the same on every Member.
+		n.send(out, from, AppendReply{Term: n.term, Success: true, Match: n.commit, ReadRound: m.ReadRound})
+		return
+	}
+	snap := m.Snapshot
+	n.snapshot = &snap
+	p := persist(out)
+	p.Snapshot = &snap
+	if snap.Index <= n.lastIndex() && n.termAt(snap.Index) == snap.Term {
+		n.log.compactTo(snap.Index)
+	} else {
+		n.log = raftLog{base: snap.Index, baseTerm: snap.Term}
+		p.ResetLog = true
+	}
+	n.commit, n.applied = snap.Index, snap.Index
+	out.Restore = &snap
+	n.send(out, from, AppendReply{Term: n.term, Success: true, Match: snap.Index, ReadRound: m.ReadRound})
 }
 
 // handleAppend is the follower's side of replication. It accepts Entries only
@@ -42,6 +128,18 @@ func (n *Node) handleAppend(out *core.Output, from core.NodeID, m Append) {
 	n.leader = from
 	n.elapsed = 0
 
+	if m.PrevIndex < n.log.base {
+		// The Append starts inside this Member's Snapshot. Everything a
+		// Snapshot covers is Committed, so those Entries match by definition:
+		// skip them and check from the Snapshot's edge.
+		covered := n.log.base - m.PrevIndex
+		if covered >= core.Index(len(m.Entries)) {
+			n.send(out, from, AppendReply{Term: n.term, Success: true, Match: n.log.base, ReadRound: m.ReadRound})
+			return
+		}
+		m.Entries = m.Entries[covered:]
+		m.PrevIndex, m.PrevTerm = n.log.base, n.log.baseTerm
+	}
 	if m.PrevIndex > n.lastIndex() {
 		n.send(out, from, AppendReply{Term: n.term, Match: n.lastIndex(), ReadRound: m.ReadRound})
 		return
@@ -60,9 +158,10 @@ func (n *Node) handleAppend(out *core.Output, from core.NodeID, m Append) {
 			if index <= n.commit {
 				panic(fmt.Sprintf("raft: node %d asked to replace Committed Entry %d", n.id, index))
 			}
-			n.log = n.log[:index-1]
+			n.log.truncateFrom(index)
+			persist(out).TruncateFrom = index
 		}
-		n.log = append(n.log, e)
+		n.appendEntry(out, e)
 	}
 
 	// Only Entries this Append has just confirmed can be marked Committed:
@@ -94,6 +193,7 @@ func (n *Node) handleAppendReply(out *core.Output, from core.NodeID, m AppendRep
 	}
 	if m.Match > n.match[from] {
 		n.match[from] = m.Match
+		delete(n.sentSnap, from) // progress: a later Snapshot may go at once
 	}
 	if n.next[from] <= n.match[from] {
 		n.next[from] = n.match[from] + 1

@@ -11,6 +11,8 @@ x-node: &node
   build:
     context: ..
     dockerfile: deploy/Dockerfile
+  # A named volume is owned by root, so the Node runs as root to write to it.
+  user: "0:0"
 
 services:
   toxiproxy:
@@ -20,21 +22,36 @@ services:
 
   node1:
     <<: *node
-    command: ["-id", "1", "-peers", "${PEERS_1:-}", "-clients", "${CLIENTS:-}", "-listen-peer", "0.0.0.0:7000", "-listen-client", "0.0.0.0:8000", "-reads", "${READS:-index}"]
+    command: ["-id", "1", "-peers", "${PEERS_1:-}", "-clients", "${CLIENTS:-}", "-listen-peer", "0.0.0.0:7000", "-listen-client", "0.0.0.0:8000", "-reads", "${READS:-index}", "-data", "${DATA_DIR-/data}"]
     ports: ["127.0.0.1:8001:8000"]
+    volumes: ["data1:/data"]
   node2:
     <<: *node
-    command: ["-id", "2", "-peers", "${PEERS_2:-}", "-clients", "${CLIENTS:-}", "-listen-peer", "0.0.0.0:7000", "-listen-client", "0.0.0.0:8000", "-reads", "${READS:-index}"]
+    command: ["-id", "2", "-peers", "${PEERS_2:-}", "-clients", "${CLIENTS:-}", "-listen-peer", "0.0.0.0:7000", "-listen-client", "0.0.0.0:8000", "-reads", "${READS:-index}", "-data", "${DATA_DIR-/data}"]
     ports: ["127.0.0.1:8002:8000"]
+    volumes: ["data2:/data"]
   node3:
     <<: *node
-    command: ["-id", "3", "-peers", "${PEERS_3:-}", "-clients", "${CLIENTS:-}", "-listen-peer", "0.0.0.0:7000", "-listen-client", "0.0.0.0:8000", "-reads", "${READS:-index}"]
+    command: ["-id", "3", "-peers", "${PEERS_3:-}", "-clients", "${CLIENTS:-}", "-listen-peer", "0.0.0.0:7000", "-listen-client", "0.0.0.0:8000", "-reads", "${READS:-index}", "-data", "${DATA_DIR-/data}"]
     ports: ["127.0.0.1:8003:8000"]
+    volumes: ["data3:/data"]
   node4:
     <<: *node
-    command: ["-id", "4", "-peers", "${PEERS_4:-}", "-clients", "${CLIENTS:-}", "-listen-peer", "0.0.0.0:7000", "-listen-client", "0.0.0.0:8000", "-reads", "${READS:-index}"]
+    command: ["-id", "4", "-peers", "${PEERS_4:-}", "-clients", "${CLIENTS:-}", "-listen-peer", "0.0.0.0:7000", "-listen-client", "0.0.0.0:8000", "-reads", "${READS:-index}", "-data", "${DATA_DIR-/data}"]
     ports: ["127.0.0.1:8004:8000"]
+    volumes: ["data4:/data"]
   node5:
     <<: *node
-    command: ["-id", "5", "-peers", "${PEERS_5:-}", "-clients", "${CLIENTS:-}", "-listen-peer", "0.0.0.0:7000", "-listen-client", "0.0.0.0:8000", "-reads", "${READS:-index}"]
+    command: ["-id", "5", "-peers", "${PEERS_5:-}", "-clients", "${CLIENTS:-}", "-listen-peer", "0.0.0.0:7000", "-listen-client", "0.0.0.0:8000", "-reads", "${READS:-index}", "-data", "${DATA_DIR-/data}"]
     ports: ["127.0.0.1:8005:8000"]
+    volumes: ["data5:/data"]
+
+# Each Member's durable state. harness/docker.sh removes them on "up" and
+# "down", so every run starts empty. DATA_DIR= (empty) runs Members with no
+# data directory, as before Rung 3.
+volumes:
+  data1:
+  data2:
+  data3:
+  data4:
+  data5:

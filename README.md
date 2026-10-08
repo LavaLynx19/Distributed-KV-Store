@@ -108,8 +108,8 @@ Rungs 1–6 are the consensus core. Rungs 7–9 build on it. Earlier Rungs must 
 Rung 1 measured the baseline (`retros/rung-1.md`): with nothing on disk, a **Group** of 3 **Members** answers 42,743 requests/s as local processes, about half of what a single **Node** does, and a client of an isolated **Leader** gets its next write through in 136–185 ms.
 
 - **Throughput: each Rung against the one before.** With no **Faults**, on local processes with 3 Members and the same load, a Rung must answer at least 0.9× the requests/s of the Rung before it.
-- **A Rung that adds a known cost resets the baseline.** Rung 3 puts a disk write before every acknowledgement. Its retro states the cost, and Rung 4 is then measured against Rung 3.
-- **A Rung that adds a faster path must show it.** The read index must answer reads faster than reads through the **Log**. This is judged in Rung 3: while nothing is written to disk the two cost the same network round trip, and Rung 2 measured the read index about 10% slower (`retros/rung-2.md`).
+- **A Rung that adds a known cost resets the baseline.** Rung 3 puts a disk write before every acknowledgement. Its retro states the cost, and Rung 4 is then measured against Rung 3. The new baseline (`retros/rung-3.md`): a Group of 3 local Members with 64 clients answers 1,412 requests/s, where the same store with no disk answered 39,174 with 8.
+- **A Rung that adds a faster path must show it.** The read index must answer reads faster than reads through the **Log**. While nothing was written to disk the two cost the same network round trip, and Rung 2 measured the read index about 10% slower (`retros/rung-2.md`). Rung 3, with a disk write behind every Log read, measured it 1.37× faster locally and 1.53× in Docker (`retros/rung-3.md`).
 - **Recovery:** when a Leader is cut off by a **Partition**, the longest pause in successful writes must stay within 2× the longest election timeout (400 ms at the Rung 1 settings). A frozen Leader is reported separately, because there the delay is the client's own request timeout.
 - Docker numbers are reported beside the local ones, not gated.
 

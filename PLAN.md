@@ -35,15 +35,15 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P2.7 `retros/rung-2.md` → §P2
 
 ### Phase 3 — Rung 3: restart amnesia and an endless Log (§P3)
-- [ ] P3.1 Simulation disk: writes pending until durable, lost at a crash, stalls → §P3
-- [ ] P3.2 Expose: full restart breaks safety; Log grows without bound; a returning Node can't catch up → §P3
-- [ ] P3.3 Disk format: Log segments and vote file, no checksums (A§5.4) → §P3
-- [ ] P3.4 Durable-before-send in both shells; real file storage with fsync → §P3
-- [ ] P3.5 Copy-on-write ordered tree replaces the v1 state → §P3
-- [ ] P3.6 Snapshots: take, write, trim the Log (A§6.4) → §P3
-- [ ] P3.7 Catch-up by Snapshot then Log → §P3
-- [ ] P3.8 Rung 3 suite: full restart, crash mid-write, stalled disk; measure Snapshot cost, and read index against Log reads (target moved from Rung 2) → §P3
-- [ ] P3.9 `retros/rung-3.md` → §P3
+- [x] P3.1 Simulation disk: writes pending until durable, lost at a crash, stalls → §P3
+- [x] P3.2 Expose: full restart breaks safety; Log grows without bound; a returning Node can't catch up → §P3
+- [x] P3.3 Disk format: Log segments and vote file, no checksums (A§5.4) → §P3
+- [x] P3.4 Durable-before-send in both shells; real file storage with fsync → §P3
+- [x] P3.5 Copy-on-write ordered tree replaces the v1 state → §P3
+- [x] P3.6 Snapshots: take, write, trim the Log (A§6.4) → §P3
+- [x] P3.7 Catch-up by Snapshot then Log → §P3
+- [x] P3.8 Rung 3 suite: full restart, crash mid-write, stalled disk; measure Snapshot cost, and read index against Log reads (target moved from Rung 2) → §P3
+- [x] P3.9 `retros/rung-3.md` → §P3
 
 ### Phase 4 — Rung 4: a disk that lies (§P4)
 - [ ] P4.1 Simulation disk Faults: torn write, bit flip → §P4

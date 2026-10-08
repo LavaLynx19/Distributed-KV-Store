@@ -7,6 +7,7 @@ func (n *Node) startElection(out *core.Output) {
 	n.term++
 	n.role = core.Candidate
 	n.votedFor = n.id
+	n.storeHardState(out)
 	n.leader = 0
 	n.votes = map[core.NodeID]bool{n.id: true}
 	n.resetElection()
@@ -35,6 +36,7 @@ func (n *Node) handleRequestVote(out *core.Output, from core.NodeID, m RequestVo
 	granted := upToDate && (n.votedFor == 0 || n.votedFor == from)
 	if granted {
 		n.votedFor = from
+		n.storeHardState(out)
 		n.resetElection()
 	}
 	n.send(out, from, VoteReply{Term: n.term, Granted: granted})
@@ -60,13 +62,14 @@ func (n *Node) becomeLeader(out *core.Output) {
 	n.next = map[core.NodeID]core.Index{}
 	n.match = map[core.NodeID]core.Index{}
 	n.heard = map[core.NodeID]int{}
+	n.sentSnap = map[core.NodeID]int{}
 	n.roundAcked = map[core.NodeID]uint64{}
 	n.roundOpen = false
 	for _, m := range n.members {
 		n.next[m] = n.lastIndex() + 1
 		n.heard[m] = n.now
 	}
-	n.log = append(n.log, core.Entry{Index: n.lastIndex() + 1, Term: n.term, Kind: core.EntryNoop})
+	n.appendEntry(out, core.Entry{Index: n.lastIndex() + 1, Term: n.term, Kind: core.EntryNoop})
 	for _, m := range n.members {
 		if m != n.id {
 			n.sendAppend(out, m)

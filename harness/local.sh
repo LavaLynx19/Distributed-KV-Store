@@ -6,11 +6,13 @@
 #   harness/local.sh status
 #   harness/local.sh pause <id>        # freeze one Member (SIGSTOP)
 #   harness/local.sh resume <id>       # let it continue (SIGCONT)
+#   harness/local.sh kill <id>         # kill -9 one Member
+#   harness/local.sh restart <id>      # start it again from its data directory
 #   harness/local.sh stop
 #
-# Until Rung 3 a Member keeps nothing on disk, so a killed process would come
-# back with no memory of its votes or Log. Rung 1's crash is a freeze instead,
-# as in the Simulation (PLAN §P1).
+# Each Member keeps its durable state in harness/out/local/data<id>. "start"
+# wipes them; "restart" keeps them. NODATA=1 runs Members with no data
+# directory, as before Rung 3.
 #
 # Logs and pid files go to harness/out/local/.
 set -euo pipefail
@@ -26,7 +28,9 @@ addrs() { # base-port members
 }
 
 launch() { # id members
-  "$BIN" -id "$1" -peers "$(addrs 7000 "$2")" -clients "$(addrs 8000 "$2")" ${KVNODE_FLAGS:-} \
+  local data=()
+  [[ -n "${NODATA:-}" ]] || data=(-data "$OUT/data$1")
+  "$BIN" -id "$1" -peers "$(addrs 7000 "$2")" -clients "$(addrs 8000 "$2")" ${data[@]+"${data[@]}"} ${KVNODE_FLAGS:-} \
     >>"$OUT/node$1.log" 2>&1 &
   echo $! >"$OUT/node$1.pid"
 }
@@ -39,6 +43,7 @@ case "${1:-}" in
     mkdir -p "$OUT" "$ROOT/bin"
     go build -o "$BIN" "$ROOT/cmd/kvnode"
     rm -f "$OUT"/node*.log "$OUT"/node*.pid
+    rm -rf "$OUT"/data*
     echo "$n" >"$OUT/members"
     for i in $(seq 1 "$n"); do launch "$i" "$n"; done
     echo "started $n Members; clients on 127.0.0.1:8001..$((8000 + n))"
@@ -60,6 +65,16 @@ case "${1:-}" in
     kill -CONT "$(cat "$OUT/node$id.pid")"
     echo "resumed node $id"
     ;;
+  kill)
+    id="${2:?usage: local.sh kill <id>}"
+    kill -9 "$(cat "$OUT/node$id.pid")" 2>/dev/null || true
+    echo "killed node $id"
+    ;;
+  restart)
+    id="${2:?usage: local.sh restart <id>}"
+    launch "$id" "$(members)"
+    echo "restarted node $id"
+    ;;
   stop)
     for f in "$OUT"/node*.pid; do
       [[ -e "$f" ]] || continue
@@ -71,7 +86,7 @@ case "${1:-}" in
     echo "stopped"
     ;;
   *)
-    sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

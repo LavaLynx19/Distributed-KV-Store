@@ -57,10 +57,13 @@ func (n *Node) startRound(out *core.Output) {
 		if m != n.id {
 			// An empty Append placed at the last Index the follower is known
 			// to hold. It carries the round number and disturbs nothing.
+			// A follower that is behind the Snapshot is probed at its edge:
+			// it will refuse the Append, but its echo counts all the same.
+			at := max(n.match[m], n.log.base)
 			n.send(out, m, Append{
 				Term:      n.term,
-				PrevIndex: n.match[m],
-				PrevTerm:  n.termAt(n.match[m]),
+				PrevIndex: at,
+				PrevTerm:  n.termAt(at),
 				Commit:    n.commit,
 				ReadRound: n.readRound,
 			})

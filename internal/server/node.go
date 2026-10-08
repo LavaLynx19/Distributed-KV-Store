@@ -5,16 +5,21 @@ package server
 
 import (
 	"context"
+	"log"
 	"time"
 
 	"distributed-kv-store/internal/core"
 )
 
 // Machine is the state machine Committed Entries are applied to. Read
-// answers a query from its current state without an Entry.
+// answers a query from its current state without an Entry. Capture returns a
+// function that encodes the state as it was when Capture was called; that
+// function may run on another goroutine while the Machine carries on.
 type Machine interface {
 	Apply(core.Entry) []byte
 	Read(query []byte) []byte
+	Capture() func() []byte
+	Restore(data []byte) error
 }
 
 // Reply is the outcome of one proposal.
@@ -32,12 +37,30 @@ type proposal struct {
 	read bool
 }
 
+// Storage makes a Member's durable state survive a restart. Write applies a
+// change; Sync returns once everything written is on disk.
+type Storage interface {
+	Write(*core.Persist) error
+	Sync() error
+}
+
 // Node runs one Member.
 type Node struct {
 	core    core.Node
 	machine Machine
 	send    func(core.Message)
 	tick    time.Duration
+	// Storage, if set before Run, receives every Persist. Without it the
+	// Member keeps nothing across a restart.
+	Storage Storage
+	// SnapshotEvery, if set before Run, takes a Snapshot of the state machine
+	// whenever this many Entries have been applied since the last one, so
+	// the core can trim its Log (A§6.4). Zero means never.
+	SnapshotEvery int
+	// Restored is the Index of the Snapshot the state machine was restored
+	// from before Run, or 0.
+	Restored  core.Index
+	snapshots chan core.Snapshotted
 
 	inbox     chan core.Message
 	proposals chan proposal
@@ -51,9 +74,10 @@ func NewNode(c core.Node, m Machine, send func(core.Message), tick time.Duration
 	return &Node{
 		core: c, machine: m, send: send, tick: tick,
 		inbox:     make(chan core.Message, 4096),
-		proposals: make(chan proposal),
+		proposals: make(chan proposal, maxBatch),
 		statusReq: make(chan chan core.Status),
 		inspect:   make(chan func(Machine)),
+		snapshots: make(chan core.Snapshotted, 1),
 	}
 }
 
@@ -66,20 +90,49 @@ func (n *Node) Deliver(msg core.Message) {
 	}
 }
 
+// maxBatch is how many events one pass of the loop may take before it stores
+// and acts on their Outputs.
+const maxBatch = 256
+
 // Run drives the core until ctx is cancelled. Proposals still waiting then
 // are answered Unknown.
+//
+// Each pass takes every event that is ready, up to maxBatch, steps the core
+// through them, makes all their Persists durable with one sync, and only
+// then acts on the Outputs (A§4.2, the order rule). Under load many
+// proposals share one disk sync.
 func (n *Node) Run(ctx context.Context) {
 	ticker := time.NewTicker(n.tick)
 	defer ticker.Stop()
 	pending := map[uint64]chan Reply{}
 	queries := map[uint64][]byte{}
 	var nextRef uint64
+	var outs []core.Output
+	applied, snapshotAt := n.Restored, n.Restored
+	encoding := false // a Snapshot is being encoded on another goroutine
 
-	step := func(ev core.Event) {
-		out := n.core.Step(ev)
+	admit := func(p proposal) {
+		nextRef++
+		pending[nextRef] = p.done
+		if p.read {
+			queries[nextRef] = p.payload
+			outs = append(outs, n.core.Step(core.Read{Ref: nextRef}))
+		} else {
+			outs = append(outs, n.core.Step(core.Propose{Ref: nextRef, Payload: p.payload}))
+		}
+	}
+
+	act := func(out core.Output) {
+		if snap := out.Restore; snap != nil {
+			if err := n.machine.Restore(snap.Data); err != nil {
+				log.Fatalf("server: can't install the Snapshot at Entry %d: %v", snap.Index, err)
+			}
+			applied, snapshotAt = snap.Index, snap.Index
+		}
 		responses := make(map[core.Index][]byte, len(out.Committed))
 		for _, e := range out.Committed {
 			responses[e.Index] = n.machine.Apply(e)
+			applied = e.Index
 		}
 		for _, r := range out.Results {
 			if done, ok := pending[r.Ref]; ok {
@@ -105,6 +158,39 @@ func (n *Node) Run(ctx context.Context) {
 		}
 	}
 
+	// flush stores what the batch asked to store, then acts on it.
+	flush := func() {
+		if n.Storage != nil {
+			wrote := false
+			for i := range outs {
+				if p := outs[i].Persist; p != nil {
+					if err := n.Storage.Write(p); err != nil {
+						log.Fatalf("server: can't store: %v", err) // continuing would break the order rule
+					}
+					wrote = true
+				}
+			}
+			if wrote {
+				if err := n.Storage.Sync(); err != nil {
+					log.Fatalf("server: can't store: %v", err)
+				}
+			}
+		}
+		for _, out := range outs {
+			act(out)
+		}
+		outs = outs[:0]
+
+		// Capturing is instant: it keeps the tree's roots. Encoding is the
+		// slow part, and happens off this goroutine while the core carries
+		// on (A§6.4).
+		if n.SnapshotEvery > 0 && !encoding && int(applied-snapshotAt) >= n.SnapshotEvery {
+			encoding = true
+			index, capture := applied, n.machine.Capture()
+			go func() { n.snapshots <- core.Snapshotted{Index: index, Data: capture()} }()
+		}
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -113,23 +199,32 @@ func (n *Node) Run(ctx context.Context) {
 			}
 			return
 		case <-ticker.C:
-			step(core.Tick{})
+			outs = append(outs, n.core.Step(core.Tick{}))
 		case msg := <-n.inbox:
-			step(core.Receive{Msg: msg})
+			outs = append(outs, n.core.Step(core.Receive{Msg: msg}))
 		case p := <-n.proposals:
-			nextRef++
-			pending[nextRef] = p.done
-			if p.read {
-				queries[nextRef] = p.payload
-				step(core.Read{Ref: nextRef})
-			} else {
-				step(core.Propose{Ref: nextRef, Payload: p.payload})
-			}
+			admit(p)
 		case reply := <-n.statusReq:
 			reply <- n.core.Status()
 		case fn := <-n.inspect:
 			fn(n.machine)
+		case snap := <-n.snapshots:
+			encoding = false
+			snapshotAt = snap.Index
+			outs = append(outs, n.core.Step(snap))
 		}
+	drain:
+		for len(outs) > 0 && len(outs) < maxBatch {
+			select {
+			case msg := <-n.inbox:
+				outs = append(outs, n.core.Step(core.Receive{Msg: msg}))
+			case p := <-n.proposals:
+				admit(p)
+			default:
+				break drain
+			}
+		}
+		flush()
 	}
 }
 

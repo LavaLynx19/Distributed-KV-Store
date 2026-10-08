@@ -8,12 +8,14 @@
 #   harness/docker.sh heal                    # restore every link
 #   harness/docker.sh pause <id>              # freeze one Member
 #   harness/docker.sh resume <id>
+#   harness/docker.sh kill <id>               # kill -9 one Member
+#   harness/docker.sh restart <id>            # start it again with its data
 #   harness/docker.sh down
 #
 # By default every Member-to-Member link runs through its own toxiproxy proxy
 # (named "<from>-<to>"), so links can be cut one direction at a time. "direct"
-# connects Members to each other without it, for undistorted numbers. Until
-# Rung 3 a crash is a freeze, as in harness/local.sh.
+# connects Members to each other without it, for undistorted numbers. Each
+# Member keeps its durable state in a volume, which "up" and "down" remove.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -44,8 +46,10 @@ case "${1:-}" in
       export "PEERS_$i=$(IFS=,; echo "${peers[*]}")"
     done
 
-    "${COMPOSE[@]}" down --remove-orphans >/dev/null 2>&1 || true
+    "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
     "${COMPOSE[@]}" build --quiet node1
+    # restart must bring a Member up with the same command line.
+    { echo "export CLIENTS='$CLIENTS'"; for i in $(seq 1 "$n"); do v="PEERS_$i"; echo "export $v='${!v}'"; done; } >"$OUT/env"
     if [[ $mode != direct ]]; then
       "${COMPOSE[@]}" up -d toxiproxy >/dev/null 2>&1
       for _ in $(seq 1 50); do curl -sf -o /dev/null "$TOXI/version" && break; sleep 0.2; done
@@ -91,13 +95,23 @@ case "${1:-}" in
     "${COMPOSE[@]}" unpause "node${2:?usage: docker.sh resume <id>}" >/dev/null 2>&1
     echo "resumed node $2"
     ;;
+  kill)
+    "${COMPOSE[@]}" kill -s KILL "node${2:?usage: docker.sh kill <id>}" >/dev/null 2>&1
+    echo "killed node $2"
+    ;;
+  restart)
+    # shellcheck disable=SC1091
+    source "$OUT/env"
+    "${COMPOSE[@]}" up -d "node${2:?usage: docker.sh restart <id>}" >/dev/null 2>&1
+    echo "restarted node $2"
+    ;;
   down)
-    "${COMPOSE[@]}" down --remove-orphans >/dev/null 2>&1
-    rm -f "$OUT/members" "$OUT/mode"
+    "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1
+    rm -f "$OUT/members" "$OUT/mode" "$OUT/env"
     echo "stopped"
     ;;
   *)
-    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

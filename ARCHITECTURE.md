@@ -126,9 +126,9 @@ Any other dependency needs the tradeoff discussion and an entry here first.
 ```
 
 ### 4.2 The core's contract
-- **Events in:** a tick, a message from another Member, a client proposal, a read request, and "these writes are now durable".
+- **Events in:** a tick, a message from another Member, a client proposal, a read request, and (from Rung 3) "here is a Snapshot of the state machine".
 - **Outputs:** Entries and vote state to make durable, messages to send, Committed Entries to apply, read requests now safe to answer, and a Snapshot to install or send.
-- **Order rule:** the shell must make an output's writes durable before it sends that output's messages. A vote or an Entry that isn't on disk must never be acted on by another Member.
+- **Order rule:** the shell must make an output's writes durable before it does anything else the output asks for: sending its messages, applying its Committed Entries, answering its clients. A vote or an Entry that isn't on disk must never be acted on by anyone. Because of this rule the core needs no "now durable" event: once a step returns, the core may treat what it asked to store as stored.
 - **Time:** the core counts ticks. It never reads a clock. Election and heartbeat timeouts are tick counts.
 - **Randomness:** election jitter comes from a seeded source passed in at start.
 - **Determinism rules:** no goroutines, no `time.Now`, no reliance on map iteration order, no global state. Given the same events in the same order, a core produces the same outputs.
@@ -136,7 +136,7 @@ Any other dependency needs the tradeoff discussion and an entry here first.
 The state machine obeys the same rules, so every Member that applies the same Entries holds the same state.
 
 ### 4.3 Shells
-- **Real shell:** one goroutine drives the core and feeds it events from TCP readers, a ticker, the disk writer and the HTTP handlers. Goroutines exist only here.
+- **Real shell:** one goroutine drives the core and feeds it events from TCP readers, a ticker and the HTTP handlers. Goroutines exist only here. Each pass takes every event that is ready, steps the core through all of them, makes everything they asked to store durable with **one** sync, and only then acts on their outputs. Under load many requests share a sync.
 - **Simulation:** holds every Member's core in one process and delivers events from a queue ordered by a seeded scheduler. It owns a fake clock, an in-memory network and a fake disk (§8.1).
 
 ## 5. Data model
@@ -145,10 +145,12 @@ The state machine obeys the same rules, so every Member that applies the same En
 | Item | Content |
 |---|---|
 | Vote state | Current **Term** and the Member voted for in it |
-| **Log** | **Entries**: index, Term, kind, Leader's time stamp, payload |
-| **Snapshot** | Last included index and Term, the Member list, the state machine's full contents |
+| **Log** | **Entries**: index, Term, kind, payload. The Leader's time stamp joins them in Rung 5 |
+| **Snapshot** | Last included index and Term, and the state machine's full contents: keys and **Sessions**. The Member list joins them in Rung 6 |
 
-Entry kinds: no-op, command, Membership change. Rungs 7–8 add more (§10).
+Entry kinds: no-op, command. Membership change arrives in Rung 6, and Rungs 7–8 add more (§10).
+
+The commit index is not stored. A restarted Member knows only that its Snapshot is Committed, and learns the rest again from the Leader. The shell rebuilds the state machine from the Snapshot plus the Entries the core hands over again as they are confirmed.
 
 ### 5.2 Commands
 | Command | Effect |
@@ -166,7 +168,19 @@ A get is also a command in Rung 1. From Rung 2 on, gets and range scans are read
 - **Log time:** the highest Leader stamp applied so far. Expiry and Session cleanup compare against this and nothing else.
 
 ### 5.4 Disk format
-The Log is a sequence of segment files of length-prefixed records, with a separate small file for vote state. Snapshots are written to a temporary file and renamed into place. Records carry **no checksum until Rung 4**, which exists to expose that gap (Decision Log). The exact layout is fixed in PLAN.md's Rung 3 task.
+A Member's data directory (`internal/storage`):
+
+| File | Content | How it changes |
+|---|---|---|
+| `state` | Term and vote, 16 bytes | Replaced whole: written to a temporary file, synced, renamed |
+| `snapshot` | Index, Term, then the state machine's data | Replaced whole, the same way |
+| `log/<first>.seg` | Log segments, named by their first Entry's index. Each is a run of records: a 4-byte length, then one Entry | Appended to; a new segment starts every 4 MB |
+
+- **A change is durable when the files and their directories have been synced.** Several changes can share one sync (§4.3).
+- **Trimming** deletes the segments a Snapshot has made unnecessary. **Replacing a conflicting tail** deletes later segments first, then cuts the one holding the conflict, so a crash part way never leaves a gap.
+- **A crash can leave the last record incomplete.** Opening the directory drops it: nothing after it can have been acknowledged.
+- **A crash between saving a Snapshot and trimming** can leave Entries the Snapshot has made obsolete. Opening the directory drops those too.
+- Records carry **no checksum until Rung 4**, which exists to expose that gap (Decision Log). A record that is complete but damaged is read back as if valid.
 
 ## 6. Paths
 
@@ -188,7 +202,11 @@ Read paths, in the order they appear:
 In Rung 1 clients never retry: a request with no definite answer is recorded as outcome unknown, which the checker allows for. Rung 2 lets clients retry, shows a compare-and-set applying twice, and adds Sessions. From then on every command carries a Session id and a request number. Before applying, the state machine checks the Session: a request number already applied returns its saved response and changes nothing. Because this happens when an Entry is applied, it is identical on every Member and survives a change of Leader.
 
 ### 6.4 Snapshot and catch-up
-Taking a Snapshot keeps the tree's current root and writes it out in the shell while the core carries on. Entries up to that point are then dropped. A follower that needs dropped Entries receives the Snapshot, then the Log after it.
+- **Taking one.** After every so many applied Entries, the shell captures the state machine by keeping its tree roots, which is instant. The real shell encodes the capture on another goroutine while the core carries on. It then hands the result to the core, which stores it and drops its Log up to that Entry. Each Member does this for itself.
+- **Sending one.** A Leader whose follower needs Entries it has dropped sends its Snapshot instead, at most once per election timeout, with ordinary heartbeats in between. The Log after the Snapshot follows.
+- **Installing one.** A follower ignores a Snapshot of what it has already Committed. Otherwise it replaces its state machine's contents with it. What it does with its Log depends on whether it already holds the Snapshot's last Entry:
+  - **It does:** its Log agrees with the Leader's up to there, and it keeps everything after. It may have acknowledged those Entries, and the Leader may be counting on them. A Leader can send a Snapshot to a follower that is nearly up to date, because its record of the follower lags behind acknowledgements still in flight.
+  - **It doesn't:** its Log is behind or has diverged, and it is dropped.
 
 ### 6.5 Membership change
 One Member is added or removed per change, as a Log Entry. A Member uses a new Member list as soon as the Entry is in its Log. Two rules guard it:
@@ -313,3 +331,6 @@ Membership changes add or remove a single Member rather than using Raft's joint 
 
 ### Hand-written storage and tree
 The Log, Snapshot files and the copy-on-write tree are written by hand rather than taken from a library. They are what Rungs 3–5 are about, and owning the format is what makes disk Faults injectable. The cost is more code to get right.
+
+### The shell stores before it acts, and the core is never told
+The original contract had an event telling the core "these writes are now durable", so it could carry on while the disk worked. Rung 3 dropped it. The rule is simpler: a shell makes an output's writes durable before it does anything else that output asks for. A core can then treat whatever it asked to store as stored the moment a step returns, and there is no state in which a vote or an Entry exists in memory but not on disk and something has already been said about it. The cost is that a Member does nothing else while its disk is busy. Group commit recovers most of that under load: the real shell syncs once for every event that was ready. Don't reintroduce the event to make the core "asynchronous" without measuring what it would buy.
