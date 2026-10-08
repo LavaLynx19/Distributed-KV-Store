@@ -5,6 +5,7 @@ package server
 
 import (
 	"context"
+	"log"
 	"time"
 
 	"distributed-kv-store/internal/core"
@@ -32,12 +33,22 @@ type proposal struct {
 	read bool
 }
 
+// Storage makes a Member's durable state survive a restart. Write applies a
+// change; Sync returns once everything written is on disk.
+type Storage interface {
+	Write(*core.Persist) error
+	Sync() error
+}
+
 // Node runs one Member.
 type Node struct {
 	core    core.Node
 	machine Machine
 	send    func(core.Message)
 	tick    time.Duration
+	// Storage, if set before Run, receives every Persist. Without it the
+	// Member keeps nothing across a restart.
+	Storage Storage
 
 	inbox     chan core.Message
 	proposals chan proposal
@@ -51,7 +62,7 @@ func NewNode(c core.Node, m Machine, send func(core.Message), tick time.Duration
 	return &Node{
 		core: c, machine: m, send: send, tick: tick,
 		inbox:     make(chan core.Message, 4096),
-		proposals: make(chan proposal),
+		proposals: make(chan proposal, maxBatch),
 		statusReq: make(chan chan core.Status),
 		inspect:   make(chan func(Machine)),
 	}
@@ -66,17 +77,37 @@ func (n *Node) Deliver(msg core.Message) {
 	}
 }
 
+// maxBatch is how many events one pass of the loop may take before it stores
+// and acts on their Outputs.
+const maxBatch = 256
+
 // Run drives the core until ctx is cancelled. Proposals still waiting then
 // are answered Unknown.
+//
+// Each pass takes every event that is ready, up to maxBatch, steps the core
+// through them, makes all their Persists durable with one sync, and only
+// then acts on the Outputs (A§4.2, the order rule). Under load many
+// proposals share one disk sync.
 func (n *Node) Run(ctx context.Context) {
 	ticker := time.NewTicker(n.tick)
 	defer ticker.Stop()
 	pending := map[uint64]chan Reply{}
 	queries := map[uint64][]byte{}
 	var nextRef uint64
+	var outs []core.Output
 
-	step := func(ev core.Event) {
-		out := n.core.Step(ev)
+	admit := func(p proposal) {
+		nextRef++
+		pending[nextRef] = p.done
+		if p.read {
+			queries[nextRef] = p.payload
+			outs = append(outs, n.core.Step(core.Read{Ref: nextRef}))
+		} else {
+			outs = append(outs, n.core.Step(core.Propose{Ref: nextRef, Payload: p.payload}))
+		}
+	}
+
+	act := func(out core.Output) {
 		responses := make(map[core.Index][]byte, len(out.Committed))
 		for _, e := range out.Committed {
 			responses[e.Index] = n.machine.Apply(e)
@@ -105,6 +136,30 @@ func (n *Node) Run(ctx context.Context) {
 		}
 	}
 
+	// flush stores what the batch asked to store, then acts on it.
+	flush := func() {
+		if n.Storage != nil {
+			wrote := false
+			for i := range outs {
+				if p := outs[i].Persist; p != nil {
+					if err := n.Storage.Write(p); err != nil {
+						log.Fatalf("server: can't store: %v", err) // continuing would break the order rule
+					}
+					wrote = true
+				}
+			}
+			if wrote {
+				if err := n.Storage.Sync(); err != nil {
+					log.Fatalf("server: can't store: %v", err)
+				}
+			}
+		}
+		for _, out := range outs {
+			act(out)
+		}
+		outs = outs[:0]
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -113,23 +168,28 @@ func (n *Node) Run(ctx context.Context) {
 			}
 			return
 		case <-ticker.C:
-			step(core.Tick{})
+			outs = append(outs, n.core.Step(core.Tick{}))
 		case msg := <-n.inbox:
-			step(core.Receive{Msg: msg})
+			outs = append(outs, n.core.Step(core.Receive{Msg: msg}))
 		case p := <-n.proposals:
-			nextRef++
-			pending[nextRef] = p.done
-			if p.read {
-				queries[nextRef] = p.payload
-				step(core.Read{Ref: nextRef})
-			} else {
-				step(core.Propose{Ref: nextRef, Payload: p.payload})
-			}
+			admit(p)
 		case reply := <-n.statusReq:
 			reply <- n.core.Status()
 		case fn := <-n.inspect:
 			fn(n.machine)
 		}
+	drain:
+		for len(outs) > 0 && len(outs) < maxBatch {
+			select {
+			case msg := <-n.inbox:
+				outs = append(outs, n.core.Step(core.Receive{Msg: msg}))
+			case p := <-n.proposals:
+				admit(p)
+			default:
+				break drain
+			}
+		}
+		flush()
 	}
 }
 

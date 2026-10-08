@@ -27,6 +27,7 @@ import (
 	"distributed-kv-store/internal/fsm"
 	"distributed-kv-store/internal/raft"
 	"distributed-kv-store/internal/server"
+	"distributed-kv-store/internal/storage"
 	"distributed-kv-store/internal/transport"
 )
 
@@ -40,6 +41,7 @@ func main() {
 	electionTicks := flag.Int("election-ticks", 10, "ticks of silence before an election (randomized up to 2×)")
 	heartbeatTicks := flag.Int("heartbeat-ticks", 1, "ticks between a Leader's heartbeats")
 	timeout := flag.Duration("request-timeout", 5*time.Second, "how long a client request waits to commit")
+	data := flag.String("data", "", "directory for this Node's durable state; empty keeps nothing across a restart")
 	reads := flag.String("reads", "index", "how gets are answered: index (read index, A§6.2) or log (as Log Entries)")
 	flag.Parse()
 
@@ -52,12 +54,12 @@ func main() {
 	default:
 		log.Fatalf("kvnode: -reads must be index or log, not %q", *reads)
 	}
-	if err := run(core.NodeID(*id), *peersFlag, *clientsFlag, *listenPeer, *listenClient, *tick, *electionTicks, *heartbeatTicks, *timeout, mode); err != nil {
+	if err := run(core.NodeID(*id), *peersFlag, *clientsFlag, *listenPeer, *listenClient, *tick, *electionTicks, *heartbeatTicks, *timeout, mode, *data); err != nil {
 		log.Fatalf("kvnode: %v", err)
 	}
 }
 
-func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string, tick time.Duration, electionTicks, heartbeatTicks int, timeout time.Duration, reads raft.ReadMode) error {
+func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string, tick time.Duration, electionTicks, heartbeatTicks int, timeout time.Duration, reads raft.ReadMode, data string) error {
 	peers, err := parseAddrs(peersFlag)
 	if err != nil {
 		return fmt.Errorf("-peers: %w", err)
@@ -81,6 +83,15 @@ func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string
 	}
 	slices.Sort(members)
 
+	var store *storage.Store
+	var stored core.Stored
+	if data != "" {
+		if store, stored, err = storage.Open(data, 0); err != nil {
+			return err
+		}
+		defer store.Close()
+	}
+
 	transport.Register(raft.MessageBodies()...)
 	ln, err := net.Listen("tcp", listenPeer)
 	if err != nil {
@@ -93,10 +104,14 @@ func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string
 	c := raft.New(raft.Config{
 		ID: id, Members: members,
 		ElectionTicks: electionTicks, HeartbeatTicks: heartbeatTicks,
-		Rand:  rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), uint64(id))),
-		Reads: reads,
+		Rand:   rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), uint64(id))),
+		Reads:  reads,
+		Stored: stored,
 	})
 	node = server.NewNode(c, fsm.New(), tr.Send, tick)
+	if store != nil {
+		node.Storage = store
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -116,7 +131,8 @@ func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string
 		_ = srv.Shutdown(shutdown) // exiting anyway
 	}()
 
-	log.Printf("kvnode %d: Members on %s, clients on %s, %d Members, tick %s", id, listenPeer, listenClient, len(members), tick)
+	log.Printf("kvnode %d: Members on %s, clients on %s, %d Members, tick %s, data %q (Term %d, %d Entries stored)",
+		id, listenPeer, listenClient, len(members), tick, data, stored.HardState.Term, len(stored.Entries))
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("client API: %w", err)
 	}

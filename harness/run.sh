@@ -11,6 +11,8 @@
 #   pause-leader     freeze the Leader, then let it continue
 #   isolate-leader   cut the Leader off from every other Member, then heal
 #                    (docker only: it needs toxiproxy)
+#   kill-leader      kill -9 the Leader, then start it again from its disk
+#   restart-all      kill -9 every Member at once, then start them all again
 #
 # Environment:
 #   CLIENTS=8  DURATION=10s  FAULT_AT=3  FAULT_FOR=3   (seconds for the last two)
@@ -18,6 +20,7 @@
 #   READ_PCT=35  percentage of requests that are gets
 #   TAG=name   added to the output file name, to keep variants apart
 #   READS=index|log   how gets are answered (default index, A§6.2)
+#   NODATA=1   Members keep nothing on disk, as before Rung 3
 #
 # Output is also saved to harness/out/run-<backend>-<members>-<fault>.txt.
 set -euo pipefail
@@ -37,11 +40,14 @@ case "$BACKEND" in
   *) echo "backend must be local or docker" >&2; exit 2 ;;
 esac
 case "$FAULT" in
-  none | pause-leader) ;;
+  none | pause-leader | kill-leader | restart-all) ;;
   isolate-leader) [[ $BACKEND == docker ]] || { echo "isolate-leader needs the docker backend" >&2; exit 2; } ;;
   *) echo "unknown fault $FAULT" >&2; exit 2 ;;
 esac
 
+if [[ -n "${NODATA:-}" ]]; then
+  export NODATA DATA_DIR=
+fi
 if [[ -n "${READS:-}" ]]; then
   export READS KVNODE_FLAGS="${KVNODE_FLAGS:-} -reads $READS"
 fi
@@ -84,6 +90,11 @@ log="$OUT/run-$BACKEND-$N-$FAULT${TAG:+-$TAG}.txt"
     case "$FAULT" in
       pause-leader)   "$ctl" pause "$target";   sleep "$FAULT_FOR"; "$ctl" resume "$target" ;;
       isolate-leader) "$ctl" isolate "$target"; sleep "$FAULT_FOR"; "$ctl" heal ;;
+      kill-leader)    "$ctl" kill "$target";    sleep "$FAULT_FOR"; "$ctl" restart "$target" ;;
+      restart-all)
+        for i in $(seq 1 "$N"); do "$ctl" kill "$i"; done
+        sleep "$FAULT_FOR"
+        for i in $(seq 1 "$N"); do "$ctl" restart "$i"; done ;;
     esac
     set +e
     wait "$pid"
