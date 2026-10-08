@@ -167,26 +167,33 @@ func (m *MemFS) Crash(rng *rand.Rand, tear bool) {
 	}
 }
 
-// FlipBit inverts one bit, chosen by rng, in one durable file, and reports
-// which file. It returns "" if there is nothing to damage.
+// FlipBit inverts one bit, chosen by rng, and reports which file it was in.
+// Every stored byte is equally likely to be hit, as on a real disk, so a
+// large file is damaged more often than a small one. It returns "" if there
+// is nothing to damage.
 func (m *MemFS) FlipBit(rng *rand.Rand) string {
-	var candidates []string
-	for _, path := range m.paths() {
-		if len(m.durable[path].synced) > 0 {
-			candidates = append(candidates, path)
-		}
+	paths := m.paths()
+	total := 0
+	for _, path := range paths {
+		total += len(m.durable[path].synced)
 	}
-	if len(candidates) == 0 {
+	if total == 0 {
 		return ""
 	}
-	path := candidates[rng.IntN(len(candidates))]
-	f := m.durable[path]
-	at, bit := rng.IntN(len(f.synced)), byte(1)<<rng.IntN(8)
-	f.synced[at] ^= bit
-	if at < len(f.data) {
-		f.data[at] ^= bit
+	at, bit := rng.IntN(total), byte(1)<<rng.IntN(8)
+	for _, path := range paths {
+		f := m.durable[path]
+		if at >= len(f.synced) {
+			at -= len(f.synced)
+			continue
+		}
+		f.synced[at] ^= bit
+		if at < len(f.data) {
+			f.data[at] ^= bit
+		}
+		return path
 	}
-	return path
+	return ""
 }
 
 // Durable returns an independent filesystem holding only what would survive

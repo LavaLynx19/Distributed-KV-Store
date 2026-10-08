@@ -3,9 +3,11 @@
 //
 // Layout of a data directory:
 //
-//	state            Term and vote, 16 bytes
+//	state.a state.b  Term and vote, 16 bytes, twice: either copy is enough
 //	snapshot         Index, Term, then the state machine's data
 //	log/<first>.seg  Log segments, named by the Index of their first Entry
+//	damaged          present from when damage is found until the Member has
+//	                 recovered (A§6.8)
 //
 // state and snapshot are replaced whole: written to a temporary file, synced,
 // and renamed over the old one, and end with a CRC-32C of their contents.
@@ -70,6 +72,11 @@ type CorruptError struct {
 	Path   string
 	Offset int64
 	Detail string
+
+	// For a damaged Log: the segment it is in, and whether the damage is to
+	// the Log's structure, so that none of it can be kept.
+	segment  core.Index
+	wholeLog bool
 }
 
 func (e *CorruptError) Error() string {
@@ -127,6 +134,22 @@ func OpenFS(fs FS, dir string, segmentBytes int64) (*Store, core.Stored, error) 
 }
 
 // OpenWith is Open on any filesystem, with Options.
+//
+// If part of what the directory holds is damaged, OpenWith repairs the
+// directory by removing what it can't verify, and returns the rest with
+// Stored.Damaged set (A§6.8):
+//
+//   - A damaged Log record: that record and everything after it go.
+//   - A damaged Snapshot: it goes, and the whole Log with it, since the Log
+//     means nothing without the Snapshot it follows.
+//
+// Before removing anything it leaves a durable mark, so that a crash during
+// the repair, or a restart after it, still reports the damage. The mark
+// stays until a Persist with Recovered set removes it.
+//
+// The Term and vote are kept in two copies, and either one is enough. If
+// both are damaged OpenWith returns a *CorruptError and no Store: a Member
+// that can't say how it voted must not start (Decision Log).
 func OpenWith(fs FS, dir string, opts Options) (*Store, core.Stored, error) {
 	if opts.SegmentBytes == 0 {
 		opts.SegmentBytes = DefaultSegmentBytes
@@ -136,28 +159,36 @@ func OpenWith(fs FS, dir string, opts Options) (*Store, core.Stored, error) {
 	}
 	s := &Store{fs: fs, dir: dir, segmentBytes: opts.SegmentBytes, checked: !opts.Unchecked, first: 1}
 	var stored core.Stored
+	var err error
 
-	raw, err := s.readWhole("state")
-	if err != nil {
+	if stored.HardState, err = s.readState(); err != nil {
 		return nil, core.Stored{}, err
 	}
-	if raw != nil {
-		if len(raw) != 16 {
-			return nil, core.Stored{}, &CorruptError{Path: filepath.Join(dir, "state"), Detail: "wrong size"}
-		}
-		stored.HardState = core.HardState{
-			Term:     core.Term(binary.BigEndian.Uint64(raw[:8])),
-			VotedFor: core.NodeID(binary.BigEndian.Uint64(raw[8:])),
+	if s.checked {
+		if _, err := fs.ReadFile(filepath.Join(dir, damageMark)); err == nil {
+			stored.Damaged = true
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, core.Stored{}, fmt.Errorf("storage: %w", err)
 		}
 	}
 
-	if raw, err = s.readWhole("snapshot"); err != nil {
-		return nil, core.Stored{}, err
-	}
-	if raw != nil {
-		if len(raw) < 16 {
-			return nil, core.Stored{}, &CorruptError{Path: filepath.Join(dir, "snapshot"), Detail: "too short"}
+	raw, err := s.readWhole("snapshot")
+	var corrupt *CorruptError
+	switch {
+	case errors.As(err, &corrupt) || (err == nil && raw != nil && len(raw) < 16):
+		if err := s.markDamaged(&stored); err != nil {
+			return nil, core.Stored{}, err
 		}
+		if err := s.fs.Remove(filepath.Join(dir, "snapshot")); err != nil {
+			return nil, core.Stored{}, fmt.Errorf("storage: %w", err)
+		}
+		if err := s.dropThrough(0, true); err != nil {
+			return nil, core.Stored{}, err
+		}
+		s.first = 1
+	case err != nil:
+		return nil, core.Stored{}, err
+	case raw != nil:
 		stored.Snapshot = &core.Snapshot{
 			Index: core.Index(binary.BigEndian.Uint64(raw[:8])),
 			Term:  core.Term(binary.BigEndian.Uint64(raw[8:16])),
@@ -167,12 +198,151 @@ func OpenWith(fs FS, dir string, opts Options) (*Store, core.Stored, error) {
 		s.snapshotTerm = stored.Snapshot.Term
 	}
 
-	entries, err := s.load()
+	stored.Entries, err = s.load()
+	if errors.As(err, &corrupt) && s.checked {
+		// Cut the Log just before the damage and read it again.
+		if err := s.markDamaged(&stored); err != nil {
+			return nil, core.Stored{}, err
+		}
+		if err := s.cutLog(corrupt); err != nil {
+			return nil, core.Stored{}, err
+		}
+		stored.Entries, err = s.load()
+	}
 	if err != nil {
 		return nil, core.Stored{}, err
 	}
-	stored.Entries = entries
+	if err := s.Sync(); err != nil {
+		return nil, core.Stored{}, err
+	}
 	return s, stored, nil
+}
+
+// damageMark is the file whose presence says the directory was found
+// damaged and the Member hasn't recovered yet.
+const damageMark = "damaged"
+
+// markDamaged records, durably, that damage was found. It must be on disk
+// before anything is removed: otherwise a crash during the repair would
+// leave a directory that looks whole and is missing data.
+func (s *Store) markDamaged(stored *core.Stored) error {
+	if stored.Damaged {
+		return nil
+	}
+	stored.Damaged = true
+	if err := s.replaceFile(damageMark, nil); err != nil {
+		return err
+	}
+	return s.Sync()
+}
+
+// cutLog removes the damaged record at c and everything after it: later
+// segments first, then the rest of the segment holding it.
+func (s *Store) cutLog(c *CorruptError) error {
+	if err := s.closeActive(); err != nil {
+		return err
+	}
+	firsts, err := s.segments()
+	if err != nil {
+		return err
+	}
+	for i := len(firsts) - 1; i >= 0 && firsts[i] > c.segment; i-- {
+		if err := s.fs.Remove(s.segmentPath(firsts[i])); err != nil {
+			return fmt.Errorf("storage: %w", err)
+		}
+	}
+	if c.wholeLog {
+		for _, first := range firsts {
+			if first <= c.segment {
+				if err := s.fs.Remove(s.segmentPath(first)); err != nil {
+					return fmt.Errorf("storage: %w", err)
+				}
+			}
+		}
+	} else if err := s.fs.Truncate(s.segmentPath(c.segment), c.Offset); err != nil {
+		return fmt.Errorf("storage: %w", err)
+	}
+	s.positions = nil
+	s.dirtyDir = true
+	return nil
+}
+
+// The Term and vote are stored twice, in files replaced one after the other,
+// so that damage to one leaves the other (A§5.4).
+var stateCopies = [2]string{"state.a", "state.b"}
+
+func decodeState(raw []byte) (core.HardState, bool) {
+	if len(raw) != 16 {
+		return core.HardState{}, false
+	}
+	return core.HardState{
+		Term:     core.Term(binary.BigEndian.Uint64(raw[:8])),
+		VotedFor: core.NodeID(binary.BigEndian.Uint64(raw[8:])),
+	}, true
+}
+
+func encodeState(h core.HardState) []byte {
+	raw := make([]byte, 16)
+	binary.BigEndian.PutUint64(raw[:8], uint64(h.Term))
+	binary.BigEndian.PutUint64(raw[8:], uint64(h.VotedFor))
+	return raw
+}
+
+// readState returns the Term and vote. With checksums it reads both copies,
+// takes the newer of those that verify, and rewrites a copy that is damaged
+// or behind. It fails only if a copy exists and none verifies.
+func (s *Store) readState() (core.HardState, error) {
+	if !s.checked {
+		raw, err := s.readWhole("state")
+		if err != nil || raw == nil {
+			return core.HardState{}, err
+		}
+		h, _ := decodeState(raw)
+		return h, nil
+	}
+	var best core.HardState
+	var found, bad int
+	var good [2]bool
+	var states [2]core.HardState
+	for i, name := range stateCopies {
+		raw, err := s.readWhole(name)
+		var corrupt *CorruptError
+		switch {
+		case errors.As(err, &corrupt):
+			bad++
+			continue
+		case err != nil:
+			return core.HardState{}, err
+		case raw == nil:
+			continue
+		}
+		h, ok := decodeState(raw)
+		if !ok {
+			bad++
+			continue
+		}
+		good[i], states[i] = true, h
+		// A vote is only ever added within a Term, so the copy with the
+		// higher Term, or with a vote where the other has none, is newer.
+		if found == 0 || h.Term > best.Term || (h.Term == best.Term && best.VotedFor == 0) {
+			best = h
+		}
+		found++
+	}
+	if found == 0 {
+		if bad > 0 {
+			return core.HardState{}, &CorruptError{Path: filepath.Join(s.dir, "state.*"), Detail: "no copy of the Term and vote can be verified"}
+		}
+		return core.HardState{}, nil
+	}
+	for i, name := range stateCopies {
+		if !good[i] || states[i] != best {
+			if err := s.replaceFile(name, encodeState(best)); err != nil {
+				return core.HardState{}, err
+			}
+		}
+	}
+	return best, nil
 }
 
 // readWhole returns the contents of a file that is replaced whole, with its
@@ -243,7 +413,7 @@ func (s *Store) load() ([]core.Entry, error) {
 			if errors.Is(err, errChecksum) || (errors.Is(err, errShort) && s.checked && i < len(firsts)-1) {
 				// Damage, or an incomplete record that isn't the last
 				// thing in the Log, which no crash can produce.
-				return nil, &CorruptError{Path: s.segmentPath(first), Offset: offset, Detail: err.Error()}
+				return nil, &CorruptError{Path: s.segmentPath(first), Offset: offset, Detail: err.Error(), segment: first}
 			}
 			if errors.Is(err, errShort) && i == len(firsts)-1 {
 				// A crash cut the last write short. Nothing after it can
@@ -254,15 +424,19 @@ func (s *Store) load() ([]core.Entry, error) {
 				break
 			}
 			if err != nil {
-				return nil, fmt.Errorf("storage: segment %016x at offset %d: %w", uint64(first), offset, err)
+				return nil, &CorruptError{Path: s.segmentPath(first), Offset: offset, Detail: err.Error(), segment: first}
 			}
 			if next != 0 && e.Index != next {
-				return nil, fmt.Errorf("storage: segment %016x holds Entry %d where %d was expected", uint64(first), e.Index, next)
+				return nil, &CorruptError{Path: s.segmentPath(first), Offset: offset, segment: first,
+					Detail: fmt.Sprintf("holds Entry %d where %d was expected", e.Index, next)}
 			}
 			next = e.Index + 1
 			if e.Index >= s.first {
 				if len(entries) == 0 && e.Index != s.first {
-					return nil, fmt.Errorf("storage: the Log starts at Entry %d but the Snapshot ends at %d", e.Index, s.first-1)
+					// Records that verify but don't follow the Snapshot:
+					// files are missing, and nothing here can be placed.
+					return nil, &CorruptError{Path: s.segmentPath(first), Offset: offset, segment: first, wholeLog: true,
+						Detail: fmt.Sprintf("the Log starts at Entry %d but the Snapshot ends at %d", e.Index, s.first-1)}
 				}
 				entries = append(entries, e)
 				s.positions = append(s.positions, position{segment: first, offset: offset})
@@ -332,11 +506,14 @@ func (s *Store) Save(p *core.Persist) error {
 // can share one Sync.
 func (s *Store) Write(p *core.Persist) error {
 	if p.HardState != nil {
-		var raw [16]byte
-		binary.BigEndian.PutUint64(raw[:8], uint64(p.HardState.Term))
-		binary.BigEndian.PutUint64(raw[8:], uint64(p.HardState.VotedFor))
-		if err := s.replaceFile("state", raw[:]); err != nil {
-			return err
+		names := stateCopies[:]
+		if !s.checked {
+			names = []string{"state"}
+		}
+		for _, name := range names {
+			if err := s.replaceFile(name, encodeState(*p.HardState)); err != nil {
+				return err
+			}
 		}
 	}
 	if p.Snapshot != nil {
@@ -359,6 +536,13 @@ func (s *Store) Write(p *core.Persist) error {
 		if err := s.append(e); err != nil {
 			return err
 		}
+	}
+	if p.Recovered {
+		err := s.fs.Remove(filepath.Join(s.dir, damageMark))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("storage: %w", err)
+		}
+		s.dirtyDir = true
 	}
 	return nil
 }

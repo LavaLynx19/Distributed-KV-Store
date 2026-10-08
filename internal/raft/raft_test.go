@@ -746,3 +746,96 @@ func TestInstallKeepsAcknowledgedEntriesAfterTheSnapshot(t *testing.T) {
 		t.Fatalf("a Log that doesn't match the Snapshot must go: last %d, reset %v", other.lastIndex(), out.Persist.ResetLog)
 	}
 }
+
+// damagedNode is a Member of three that restarted after its storage found
+// damage: it is in Term 2 and holds only the first three Entries.
+func damagedNode() *Node {
+	ids := []core.NodeID{1, 2, 3}
+	return New(Config{ID: 3, Members: ids, ElectionTicks: 10, HeartbeatTicks: 1, Rand: new(counter),
+		Stored: core.Stored{HardState: core.HardState{Term: 2}, Entries: entries(1, 1, 2), Damaged: true}})
+}
+
+// A Member that found damage on its disk may have acknowledged Entries it no
+// longer holds. Until it has caught up it neither votes nor stands.
+func TestRecoveringMemberStaysOutOfElections(t *testing.T) {
+	n := damagedNode()
+	for range 100 {
+		if out := n.Step(core.Tick{}); n.role != core.Follower || len(out.Messages) != 0 {
+			t.Fatal("a recovering Member stood for election")
+		}
+	}
+	v := reply[VoteReply](t, recv(n, 2, RequestVote{Term: 3, LastIndex: 99, LastTerm: 2}))
+	if v.Granted {
+		t.Fatal("a recovering Member granted a vote")
+	}
+	if n.term != 3 {
+		t.Fatalf("it should still learn the new Term, has %d", n.term)
+	}
+}
+
+// It tells the Leader its Log went backwards, and the Leader believes it.
+func TestLeaderAcceptsThatARecoveringFollowerLostEntries(t *testing.T) {
+	follower := damagedNode()
+	r := reply[AppendReply](t, recv(follower, 1, Append{Term: 2, PrevIndex: 9, PrevTerm: 2, LeaderLast: 9}))
+	if r.Success || r.Match != 3 || !r.Reset {
+		t.Fatalf("reply %+v, want failure at 3 with Reset", r)
+	}
+
+	leader := newNode(1, 3)
+	elect(t, leader, 2)
+	for i := range 8 {
+		leader.Step(core.Propose{Ref: uint64(i), Payload: []byte("x")})
+	}
+	recv(leader, 3, AppendReply{Term: 1, Success: true, Match: 9}) // follower 3 once confirmed everything
+	if leader.match[3] != 9 {
+		t.Fatalf("setup: match %d", leader.match[3])
+	}
+	a := reply[Append](t, recv(leader, 3, AppendReply{Term: 1, Match: 3, Reset: true}))
+	if leader.match[3] != 3 || a.PrevIndex != 3 || len(a.Entries) != 6 {
+		t.Fatalf("after Reset: match %d, resend from %d with %d Entries; want 3, 3, 6", leader.match[3], a.PrevIndex, len(a.Entries))
+	}
+	if leader.commit != 9 {
+		t.Fatalf("what was Committed stays Committed, but commit is now %d", leader.commit)
+	}
+	// Without Reset the same reply is taken for a stale one and ignored.
+	recv(leader, 3, AppendReply{Term: 1, Success: true, Match: 9})
+	a = reply[Append](t, recv(leader, 3, AppendReply{Term: 1, Match: 3}))
+	if leader.match[3] != 9 || a.PrevIndex != 9 {
+		t.Fatalf("a failure without Reset lowered match to %d", leader.match[3])
+	}
+}
+
+// Once it matches the Leader's whole Log it holds everything Committed, and
+// takes part again. The storage is told, so the mark doesn't outlive it.
+func TestRecoveringMemberResumesWhenCaughtUp(t *testing.T) {
+	n := damagedNode()
+	// Some of what it lacks, but the Leader has more.
+	out := recv(n, 1, Append{Term: 2, PrevIndex: 3, PrevTerm: 2, Entries: []core.Entry{{Index: 4, Term: 2}}, LeaderLast: 6})
+	if r := reply[AppendReply](t, out); !r.Success || !r.Reset || !n.recovering {
+		t.Fatalf("part way: reply %+v, recovering %v", r, n.recovering)
+	}
+	if out.Persist.Recovered {
+		t.Fatal("declared recovered before reaching the end of the Leader's Log")
+	}
+	// The rest.
+	out = recv(n, 1, Append{Term: 2, PrevIndex: 4, PrevTerm: 2, Entries: []core.Entry{{Index: 5, Term: 2}, {Index: 6, Term: 2}}, LeaderLast: 6})
+	if n.recovering || out.Persist == nil || !out.Persist.Recovered {
+		t.Fatalf("caught up: recovering %v, persist %+v", n.recovering, out.Persist)
+	}
+	// It votes and stands again.
+	if v := reply[VoteReply](t, recv(n, 2, RequestVote{Term: 3, LastIndex: 6, LastTerm: 2})); !v.Granted {
+		t.Fatal("a recovered Member should vote")
+	}
+	if r := reply[AppendReply](t, recv(n, 2, Append{Term: 3, PrevIndex: 6, PrevTerm: 2, LeaderLast: 6})); r.Reset {
+		t.Fatal("a recovered Member still flags its replies")
+	}
+}
+
+// With the exposure-only switch a damaged Member votes at once.
+func TestRepairWithoutAbstainingVotes(t *testing.T) {
+	n := damagedNode()
+	n.cfg.RepairWithoutAbstaining = true
+	if v := reply[VoteReply](t, recv(n, 2, RequestVote{Term: 3, LastIndex: 3, LastTerm: 2})); !v.Granted {
+		t.Fatal("expected the unsafe vote")
+	}
+}

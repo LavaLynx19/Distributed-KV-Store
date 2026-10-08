@@ -73,13 +73,26 @@ type Report struct {
 	// Unreadable lists Members that could not restart because they could
 	// not read their own disk, with the reason.
 	Unreadable []string
+	// Stalled is set when, at the end, too few Members are fit to vote for
+	// a Leader to be elected: the rest found damage on their disks and are
+	// recovering, or can't start at all. A stalled Group has stopped on
+	// purpose (A§6.8). It has kept its safety but not its availability, so
+	// its Members aren't expected to have converged.
+	Stalled bool
 
 	verdict check.Verdict
 }
 
-// Passed is true when the run kept every Rung 1 guarantee.
+// Safe is true when nothing false was ever said or done: the History is
+// Linearizable, no Term had two Leaders, and no core tripped its own check.
+func (r Report) Safe() bool {
+	return r.Linearizable && !r.TimedOut && r.TwoLeaders == "" && r.Panic == ""
+}
+
+// Passed is true when the run kept every guarantee: it was Safe, every
+// Member could start, and they all ended with the same data.
 func (r Report) Passed() bool {
-	return r.Linearizable && !r.TimedOut && len(r.Diverged) == 0 && r.TwoLeaders == "" && r.Panic == "" && len(r.Unreadable) == 0
+	return r.Safe() && len(r.Diverged) == 0 && len(r.Unreadable) == 0
 }
 
 // Visualize writes the checked History as an HTML timeline.
@@ -101,6 +114,9 @@ func (r Report) String() string {
 	}
 	if len(r.Unreadable) > 0 {
 		s += fmt.Sprintf(" unreadable: %v", r.Unreadable)
+	}
+	if r.Stalled {
+		s += " stalled"
 	}
 	return s
 }
@@ -158,13 +174,18 @@ func Run(store Store, sc Scenario, members int, seed uint64) Report {
 	rep.verdict = h.Linearizable(20 * time.Second)
 	rep.Linearizable, rep.TimedOut = rep.verdict.Linearizable, rep.verdict.TimedOut
 	items := map[core.NodeID][]fsm.Item{}
+	fit := 0
 	for _, id := range s.IDs() {
 		if err := s.StartError(id); err != nil {
 			rep.Unreadable = append(rep.Unreadable, fmt.Sprintf("node %d: %v", id, err))
 			continue // it holds no state to compare
 		}
 		items[id] = s.Machine(id).(*fsm.Machine).Items()
+		if !s.Status(id).Recovering {
+			fit++
+		}
 	}
+	rep.Stalled = fit < members/2+1
 	rep.Diverged = check.Diverged(items)
 	rep.Signals = h.Signals
 	rep.Recovery = h.Signals.RecoveryAfter(faultsEnd)

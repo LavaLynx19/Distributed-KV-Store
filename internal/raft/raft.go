@@ -38,6 +38,9 @@ type Append struct {
 	// ReadRound numbers the Leader's rounds of leadership confirmation
 	// (read.go). The follower echoes it.
 	ReadRound uint64
+	// LeaderLast is the last Index in the Leader's Log when this was sent.
+	// A recovering follower uses it to tell when it has caught up.
+	LeaderLast core.Index
 }
 
 // AppendReply answers an Append. On success, Match is the last Index the
@@ -48,6 +51,9 @@ type AppendReply struct {
 	Success   bool
 	Match     core.Index
 	ReadRound uint64
+	// Reset is set by a recovering follower: Match is all it holds now,
+	// even if it confirmed more before.
+	Reset bool
 }
 
 // InstallSnapshot carries the Leader's Snapshot to a follower that needs
@@ -97,6 +103,10 @@ type Config struct {
 	// Stored is the Member's durable state from before a restart. The zero
 	// value is a Member starting for the first time.
 	Stored core.Stored
+	// RepairWithoutAbstaining lets a Member that found damage on its disk
+	// vote and stand for election before it has recovered. It is unsafe, and
+	// exists so that Rung 4's exposure of that stays reproducible.
+	RepairWithoutAbstaining bool
 	// NoSnapshotTransfer stops a Leader sending its Snapshot to a follower
 	// that needs Entries the Log no longer holds. It exists so that Rung 3's
 	// exposure of a Member that can't catch up stays reproducible.
@@ -119,6 +129,13 @@ type Node struct {
 	votedFor core.NodeID
 	role     core.Role
 	leader   core.NodeID
+
+	// recovering is set when the Member's storage found damage and removed
+	// what it couldn't verify (core.Stored.Damaged). The Member may have
+	// acknowledged Entries it no longer holds. Until it has caught up with a
+	// Leader's whole Log it takes no part in elections: its vote could help
+	// elect a Leader that lacks a Committed Entry (A§6.8).
+	recovering bool
 
 	log raftLog
 	// snapshot is the latest Snapshot, kept to send to Members that need
@@ -165,6 +182,7 @@ func New(cfg Config) *Node {
 		n.commit, n.applied = snap.Index, snap.Index
 	}
 	n.log.entries = slices.Clone(cfg.Stored.Entries)
+	n.recovering = cfg.Stored.Damaged
 	n.cfg.Stored = core.Stored{} // not needed again; don't hold the Log twice
 	n.resetElection()
 	return n
@@ -192,8 +210,11 @@ func (n *Node) appendEntry(out *core.Output, e core.Entry) {
 }
 
 func (n *Node) Status() core.Status {
-	return core.Status{ID: n.id, Role: n.role, Term: n.term, Leader: n.leader, Commit: n.commit}
+	return core.Status{ID: n.id, Role: n.role, Term: n.term, Leader: n.leader, Commit: n.commit, Recovering: n.abstaining()}
 }
+
+// abstaining reports whether the Member must stay out of elections.
+func (n *Node) abstaining() bool { return n.recovering && !n.cfg.RepairWithoutAbstaining }
 
 func (n *Node) majority() int                 { return len(n.members)/2 + 1 }
 func (n *Node) lastIndex() core.Index         { return n.log.last() }
@@ -231,6 +252,9 @@ func (n *Node) Step(ev core.Event) core.Output {
 func (n *Node) tick(out *core.Output) {
 	n.now++
 	if n.role != core.LeaderRole {
+		if n.abstaining() {
+			return // no elections for a Member that is recovering
+		}
 		if n.elapsed++; n.elapsed >= n.timeout {
 			n.startElection(out)
 		}

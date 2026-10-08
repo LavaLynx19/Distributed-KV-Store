@@ -49,7 +49,7 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P4.1 Simulation disk Faults: torn write, bit flip → §P4
 - [x] P4.2 Expose: a corrupted record replayed as valid; Members diverge → §P4
 - [x] P4.3 Checksums on Log records, vote file and Snapshots → §P4
-- [ ] P4.4 Recovery policy: what a damaged Member may keep, and repair from the others (decide, then Decision Log) → §P4
+- [x] P4.4 Recovery policy: what a damaged Member may keep, and repair from the others (decide, then Decision Log) → §P4
 - [ ] P4.5 Rung 4 suite; `retros/rung-4.md` → §P4
 
 ### Phase 5 — Rung 5: time (§P5)

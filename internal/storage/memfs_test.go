@@ -2,6 +2,7 @@ package storage
 
 import (
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"reflect"
 	"testing"
@@ -158,11 +159,15 @@ func TestMemFSMatchesStoredApply(t *testing.T) {
 	}
 }
 
-// Flip every bit of every file, one at a time. Whatever the Store then
-// returns must be true: either an error, or the original state, or the
-// original state with Entries missing from the end. It must never return an
-// Entry, a Term, a vote or a Snapshot that wasn't written.
-func TestEveryBitFlipIsDetectedOrHarmless(t *testing.T) {
+// Flip every bit of every file, one at a time, and open the directory. What
+// comes back must be true and must own up to anything missing:
+//   - the Term and vote are always the ones written, since there are two
+//     copies;
+//   - the Snapshot is the one written, or absent;
+//   - the Entries are the ones written, possibly with some missing from the
+//     end, and never one that wasn't written;
+//   - if anything is missing, Damaged is set.
+func TestEveryBitFlipIsRepairedAndOwnedUpTo(t *testing.T) {
 	fs := NewMemFS()
 	const small = 128
 	s, _, err := OpenFS(fs, "data", small)
@@ -173,11 +178,11 @@ func TestEveryBitFlipIsDetectedOrHarmless(t *testing.T) {
 	save(t, s, core.Persist{Snapshot: &core.Snapshot{Index: 4, Term: 3, Data: []byte("state at four")}})
 	save(t, s, core.Persist{Entries: es(13, 20, 3)})
 	_, want, err := OpenFS(fs.Durable(), "data", small)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || want.Damaged {
+		t.Fatalf("setup: %v, damaged %v", err, want.Damaged)
 	}
 
-	flips, detected, shortened := 0, 0, 0
+	flips, harmless, logCut, snapshotLost := 0, 0, 0, 0
 	for _, path := range fs.paths() {
 		for at := range fs.durable[path].synced {
 			for bit := range 8 {
@@ -185,26 +190,108 @@ func TestEveryBitFlipIsDetectedOrHarmless(t *testing.T) {
 				damaged.durable[path].synced[at] ^= 1 << bit
 				damaged.durable[path].data[at] ^= 1 << bit
 				flips++
-				_, got, err := OpenFS(damaged, "data", small)
+				where := fmt.Sprintf("bit %d of byte %d in %s", bit, at, path)
+
+				reopened, got, err := OpenFS(damaged, "data", small)
 				if err != nil {
-					detected++
-					continue
+					t.Fatalf("%s: one flipped bit made the directory unopenable: %v", where, err)
 				}
-				if got.HardState != want.HardState || !reflect.DeepEqual(got.Snapshot, want.Snapshot) {
-					t.Fatalf("flipping bit %d of byte %d in %s changed the Term, vote or Snapshot without an error", bit, at, path)
+				if got.HardState != want.HardState {
+					t.Fatalf("%s: Term and vote came back as %+v", where, got.HardState)
 				}
-				if len(got.Entries) > len(want.Entries) || !reflect.DeepEqual(got.Entries, want.Entries[:len(got.Entries)]) {
-					t.Fatalf("flipping bit %d of byte %d in %s returned an Entry that was never written", bit, at, path)
+				complete := reflect.DeepEqual(got.Snapshot, want.Snapshot) && reflect.DeepEqual(got.Entries, want.Entries)
+				switch {
+				case complete:
+					harmless++
+				case got.Snapshot == nil:
+					snapshotLost++
+					if len(got.Entries) != 0 {
+						t.Fatalf("%s: the Snapshot is gone but %d Entries remain", where, len(got.Entries))
+					}
+				default:
+					logCut++
+					if !reflect.DeepEqual(got.Snapshot, want.Snapshot) || len(got.Entries) >= len(want.Entries) ||
+						(len(got.Entries) > 0 && !reflect.DeepEqual(got.Entries, want.Entries[:len(got.Entries)])) {
+						t.Fatalf("%s: returned something that was never written", where)
+					}
 				}
-				if len(got.Entries) < len(want.Entries) {
-					shortened++
+				if complete == got.Damaged {
+					t.Fatalf("%s: complete=%v but Damaged=%v", where, complete, got.Damaged)
+				}
+
+				// The repaired directory is usable, and stays marked until
+				// the core says it has recovered.
+				last := core.Index(0)
+				if got.Snapshot != nil {
+					last = got.Snapshot.Index
+				}
+				last += core.Index(len(got.Entries))
+				save(t, reopened, core.Persist{Entries: es(last+1, last+1, 9)})
+				_, again, err := OpenFS(damaged.Durable(), "data", small)
+				if err != nil || again.Damaged != got.Damaged || len(again.Entries) != len(got.Entries)+1 {
+					t.Fatalf("%s: after repair and one more write: %v, damaged %v, %d Entries", where, err, again.Damaged, len(again.Entries))
+				}
+				if got.Damaged {
+					save(t, reopened, core.Persist{Recovered: true})
+					if _, cleared, _ := OpenFS(damaged.Durable(), "data", small); cleared.Damaged {
+						t.Fatalf("%s: still marked damaged after Recovered", where)
+					}
 				}
 			}
 		}
 	}
-	t.Logf("%d single-bit flips: %d reported as damage, %d taken for a write cut short (Entries dropped from the end)", flips, detected, shortened)
-	if detected == 0 || detected+shortened != flips {
-		t.Fatalf("%d flips went unnoticed", flips-detected-shortened)
+	t.Logf("%d single-bit flips: %d harmless (a spare copy of the Term and vote), %d cut the Log, %d lost the Snapshot", flips, harmless, logCut, snapshotLost)
+	if harmless == 0 || logCut == 0 || snapshotLost == 0 {
+		t.Fatal("expected all three outcomes")
+	}
+}
+
+// Both copies of the Term and vote damaged: the directory must not open.
+func TestBothStateCopiesDamagedRefusesToOpen(t *testing.T) {
+	fs := NewMemFS()
+	s, _, err := OpenFS(fs, "data", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	save(t, s, core.Persist{HardState: &core.HardState{Term: 3, VotedFor: 2}, Entries: es(1, 3, 3)})
+	for _, name := range stateCopies {
+		f := fs.durable["data/"+name]
+		f.synced[0] ^= 1
+		f.data[0] ^= 1
+	}
+	var corrupt *CorruptError
+	if _, _, err := OpenFS(fs.Durable(), "data", 0); !errors.As(err, &corrupt) {
+		t.Fatalf("want a CorruptError, got %v", err)
+	}
+}
+
+// A crash between replacing the two copies leaves them different. The newer
+// one wins: the higher Term, or the one that has a vote.
+func TestNewerStateCopyWins(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		old, new core.HardState
+	}{
+		{"higher Term", core.HardState{Term: 3, VotedFor: 2}, core.HardState{Term: 4}},
+		{"vote added", core.HardState{Term: 4}, core.HardState{Term: 4, VotedFor: 1}},
+	} {
+		fs := NewMemFS()
+		s, _, err := OpenFS(fs, "data", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		save(t, s, core.Persist{HardState: &tt.old})
+		// Only the first copy gets the new value before the "crash".
+		if err := s.replaceFile(stateCopies[0], encodeState(tt.new)); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		_, stored, err := OpenFS(fs.Durable(), "data", 0)
+		if err != nil || stored.HardState != tt.new || stored.Damaged {
+			t.Fatalf("%s: got %+v, damaged %v, %v; want %+v", tt.name, stored.HardState, stored.Damaged, err, tt.new)
+		}
 	}
 }
 
@@ -231,8 +318,8 @@ func TestUncheckedFormatBelievesDamage(t *testing.T) {
 	g := checked.durable["data/log/0000000000000001.seg"]
 	g.synced[len(g.synced)-2] ^= 1
 	g.data[len(g.data)-2] ^= 1
-	var corrupt *CorruptError
-	if _, _, err := OpenFS(checked.Durable(), "data", 0); !errors.As(err, &corrupt) {
-		t.Fatalf("the checked format should report the damage, got %v", err)
+	_, got, err := OpenFS(checked.Durable(), "data", 0)
+	if err != nil || !got.Damaged || len(got.Entries) != 0 {
+		t.Fatalf("the checked format should drop the damaged Entry and say so, got %+v, %v", got, err)
 	}
 }
