@@ -21,7 +21,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -41,6 +40,7 @@ type position struct {
 
 // Store is one Member's data directory. It is not safe for concurrent use.
 type Store struct {
+	fs           FS
 	dir          string
 	segmentBytes int64
 
@@ -49,7 +49,7 @@ type Store struct {
 	first     core.Index // Index of positions[0]
 	positions []position // one per stored Entry still in use
 
-	active     *os.File // the last segment, open for appending
+	active     File // the last segment, open for appending
 	activeName core.Index
 	activeSize int64
 	out        *bufio.Writer
@@ -58,19 +58,25 @@ type Store struct {
 	dirtyDir  bool // files were created, renamed or removed
 }
 
-// Open reads a data directory, creating it if needed, and returns what it
-// holds. segmentBytes of 0 means DefaultSegmentBytes.
+// Open reads a data directory on the operating system's filesystem, creating
+// it if needed, and returns what it holds. segmentBytes of 0 means
+// DefaultSegmentBytes.
 func Open(dir string, segmentBytes int64) (*Store, core.Stored, error) {
+	return OpenFS(OSFS{}, dir, segmentBytes)
+}
+
+// OpenFS is Open on any filesystem.
+func OpenFS(fs FS, dir string, segmentBytes int64) (*Store, core.Stored, error) {
 	if segmentBytes == 0 {
 		segmentBytes = DefaultSegmentBytes
 	}
-	if err := os.MkdirAll(filepath.Join(dir, "log"), 0o755); err != nil {
+	if err := fs.MkdirAll(filepath.Join(dir, "log")); err != nil {
 		return nil, core.Stored{}, fmt.Errorf("storage: %w", err)
 	}
-	s := &Store{dir: dir, segmentBytes: segmentBytes, first: 1}
+	s := &Store{fs: fs, dir: dir, segmentBytes: segmentBytes, first: 1}
 	var stored core.Stored
 
-	if raw, err := os.ReadFile(filepath.Join(dir, "state")); err == nil && len(raw) == 16 {
+	if raw, err := fs.ReadFile(filepath.Join(dir, "state")); err == nil && len(raw) == 16 {
 		stored.HardState = core.HardState{
 			Term:     core.Term(binary.BigEndian.Uint64(raw[:8])),
 			VotedFor: core.NodeID(binary.BigEndian.Uint64(raw[8:])),
@@ -79,7 +85,7 @@ func Open(dir string, segmentBytes int64) (*Store, core.Stored, error) {
 		return nil, core.Stored{}, fmt.Errorf("storage: %w", err)
 	}
 
-	if raw, err := os.ReadFile(filepath.Join(dir, "snapshot")); err == nil && len(raw) >= 16 {
+	if raw, err := fs.ReadFile(filepath.Join(dir, "snapshot")); err == nil && len(raw) >= 16 {
 		stored.Snapshot = &core.Snapshot{
 			Index: core.Index(binary.BigEndian.Uint64(raw[:8])),
 			Term:  core.Term(binary.BigEndian.Uint64(raw[8:16])),
@@ -101,15 +107,15 @@ func Open(dir string, segmentBytes int64) (*Store, core.Stored, error) {
 
 // segments lists the first Index of every segment file, in order.
 func (s *Store) segments() ([]core.Index, error) {
-	names, err := os.ReadDir(filepath.Join(s.dir, "log"))
+	names, err := s.fs.ReadDir(filepath.Join(s.dir, "log"))
 	if err != nil {
 		return nil, fmt.Errorf("storage: %w", err)
 	}
 	var firsts []core.Index
-	for _, n := range names {
+	for _, name := range names {
 		var first uint64
-		if strings.HasSuffix(n.Name(), ".seg") {
-			if _, err := fmt.Sscanf(n.Name(), "%016x.seg", &first); err == nil {
+		if strings.HasSuffix(name, ".seg") {
+			if _, err := fmt.Sscanf(name, "%016x.seg", &first); err == nil {
 				firsts = append(firsts, core.Index(first))
 			}
 		}
@@ -133,38 +139,30 @@ func (s *Store) load() ([]core.Entry, error) {
 	var entries []core.Entry
 	next := core.Index(0) // the Index the next record must have; 0 before the first
 	for i, first := range firsts {
-		f, err := os.Open(s.segmentPath(first))
+		raw, err := s.fs.ReadFile(s.segmentPath(first))
 		if err != nil {
 			return nil, fmt.Errorf("storage: %w", err)
 		}
-		r := bufio.NewReader(f)
 		var offset int64
-		for {
-			e, size, err := readRecord(r)
-			if err == io.EOF {
-				break
-			}
-			if errors.Is(err, io.ErrUnexpectedEOF) && i == len(firsts)-1 {
+		for offset < int64(len(raw)) {
+			e, size, err := readRecord(raw[offset:])
+			if errors.Is(err, errShort) && i == len(firsts)-1 {
 				// A crash cut the last write short. Nothing after it can
 				// have been acknowledged, so it is dropped.
-				if err := os.Truncate(s.segmentPath(first), offset); err != nil {
-					f.Close()
+				if err := s.fs.Truncate(s.segmentPath(first), offset); err != nil {
 					return nil, fmt.Errorf("storage: %w", err)
 				}
 				break
 			}
 			if err != nil {
-				f.Close()
 				return nil, fmt.Errorf("storage: segment %016x at offset %d: %w", uint64(first), offset, err)
 			}
 			if next != 0 && e.Index != next {
-				f.Close()
 				return nil, fmt.Errorf("storage: segment %016x holds Entry %d where %d was expected", uint64(first), e.Index, next)
 			}
 			next = e.Index + 1
 			if e.Index >= s.first {
 				if len(entries) == 0 && e.Index != s.first {
-					f.Close()
 					return nil, fmt.Errorf("storage: the Log starts at Entry %d but the Snapshot ends at %d", e.Index, s.first-1)
 				}
 				entries = append(entries, e)
@@ -172,7 +170,6 @@ func (s *Store) load() ([]core.Entry, error) {
 			}
 			offset += size
 		}
-		f.Close()
 		if i == len(firsts)-1 {
 			if err := s.openActive(first, offset); err != nil {
 				return nil, err
@@ -194,12 +191,8 @@ func (s *Store) load() ([]core.Entry, error) {
 }
 
 func (s *Store) openActive(first core.Index, size int64) error {
-	f, err := os.OpenFile(s.segmentPath(first), os.O_WRONLY|os.O_CREATE, 0o644)
+	f, err := s.fs.Append(s.segmentPath(first), size)
 	if err != nil {
-		return fmt.Errorf("storage: %w", err)
-	}
-	if _, err := f.Seek(size, io.SeekStart); err != nil {
-		f.Close()
 		return fmt.Errorf("storage: %w", err)
 	}
 	s.active, s.activeName, s.activeSize = f, first, size
@@ -271,12 +264,23 @@ func (s *Store) Write(p *core.Persist) error {
 	return nil
 }
 
-// Sync forces everything written so far to disk.
-func (s *Store) Sync() error {
+// Flush hands everything written so far to the filesystem without forcing it
+// to disk. Nothing needs it for correctness: Sync flushes first. It marks
+// the moment a write is on its way but not yet durable, which is when a
+// crash can tear it, and the Simulation uses it for that.
+func (s *Store) Flush() error {
 	if s.out != nil {
 		if err := s.out.Flush(); err != nil {
 			return fmt.Errorf("storage: %w", err)
 		}
+	}
+	return nil
+}
+
+// Sync forces everything written so far to disk.
+func (s *Store) Sync() error {
+	if err := s.Flush(); err != nil {
+		return err
 	}
 	if s.dirtyFile {
 		if err := s.active.Sync(); err != nil {
@@ -286,8 +290,8 @@ func (s *Store) Sync() error {
 	}
 	if s.dirtyDir {
 		for _, d := range []string{s.dir, filepath.Join(s.dir, "log")} {
-			if err := syncDir(d); err != nil {
-				return err
+			if err := s.fs.SyncDir(d); err != nil {
+				return fmt.Errorf("storage: %w", err)
 			}
 		}
 		s.dirtyDir = false
@@ -303,23 +307,11 @@ func (s *Store) Close() error {
 	return s.closeActive()
 }
 
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return fmt.Errorf("storage: %w", err)
-	}
-	defer d.Close()
-	if err := d.Sync(); err != nil {
-		return fmt.Errorf("storage: %w", err)
-	}
-	return nil
-}
-
 // replaceFile swaps in new contents for a whole file, so a crash leaves
 // either the old contents or the new, never a mixture.
 func (s *Store) replaceFile(name string, data []byte) error {
 	tmp := filepath.Join(s.dir, name+".tmp")
-	f, err := os.Create(tmp)
+	f, err := s.fs.Create(tmp)
 	if err != nil {
 		return fmt.Errorf("storage: %w", err)
 	}
@@ -334,7 +326,7 @@ func (s *Store) replaceFile(name string, data []byte) error {
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("storage: %w", err)
 	}
-	if err := os.Rename(tmp, filepath.Join(s.dir, name)); err != nil {
+	if err := s.fs.Rename(tmp, filepath.Join(s.dir, name)); err != nil {
 		return fmt.Errorf("storage: %w", err)
 	}
 	s.dirtyDir = true
@@ -385,11 +377,11 @@ func (s *Store) truncateFrom(index core.Index) error {
 		return err
 	}
 	for i := len(firsts) - 1; i >= 0 && firsts[i] > at.segment; i-- {
-		if err := os.Remove(s.segmentPath(firsts[i])); err != nil {
+		if err := s.fs.Remove(s.segmentPath(firsts[i])); err != nil {
 			return fmt.Errorf("storage: %w", err)
 		}
 	}
-	if err := os.Truncate(s.segmentPath(at.segment), at.offset); err != nil {
+	if err := s.fs.Truncate(s.segmentPath(at.segment), at.offset); err != nil {
 		return fmt.Errorf("storage: %w", err)
 	}
 	s.positions = s.positions[:index-s.first]
@@ -414,7 +406,7 @@ func (s *Store) dropThrough(index core.Index, all bool) error {
 			return err
 		}
 		for _, first := range firsts {
-			if err := os.Remove(s.segmentPath(first)); err != nil {
+			if err := s.fs.Remove(s.segmentPath(first)); err != nil {
 				return fmt.Errorf("storage: %w", err)
 			}
 		}
@@ -434,7 +426,7 @@ func (s *Store) dropThrough(index core.Index, all bool) error {
 	}
 	for _, first := range firsts {
 		if first < keep {
-			if err := os.Remove(s.segmentPath(first)); err != nil {
+			if err := s.fs.Remove(s.segmentPath(first)); err != nil {
 				return fmt.Errorf("storage: %w", err)
 			}
 			s.dirtyDir = true
@@ -456,31 +448,31 @@ func encodeRecord(e core.Entry) []byte {
 	return append(record, body...)
 }
 
-// readRecord returns the next Entry and the bytes it took. It returns io.EOF
-// at a clean end and io.ErrUnexpectedEOF if the record is cut short.
-func readRecord(r *bufio.Reader) (core.Entry, int64, error) {
-	var head [4]byte
-	if _, err := io.ReadFull(r, head[:]); err != nil {
-		return core.Entry{}, 0, err // io.EOF if nothing was read
+// errShort means a record is incomplete: the file ends before it does.
+var errShort = errors.New("record cut short")
+
+// readRecord decodes the record at the start of b and reports how many bytes
+// it took. It returns errShort if b ends part way through the record.
+func readRecord(b []byte) (core.Entry, int64, error) {
+	if len(b) < 4 {
+		return core.Entry{}, 0, errShort
 	}
-	body := make([]byte, binary.BigEndian.Uint32(head[:]))
-	if _, err := io.ReadFull(r, body); err != nil {
-		if err == io.EOF {
-			err = io.ErrUnexpectedEOF
-		}
-		return core.Entry{}, 0, err
+	n := int(binary.BigEndian.Uint32(b))
+	if len(b)-4 < n {
+		return core.Entry{}, 0, errShort
 	}
-	index, n := binary.Uvarint(body)
-	if n <= 0 {
+	body := b[4 : 4+n]
+	index, i := binary.Uvarint(body)
+	if i <= 0 {
 		return core.Entry{}, 0, errors.New("unreadable record")
 	}
-	term, m := binary.Uvarint(body[n:])
-	if m <= 0 || n+m >= len(body) {
+	term, j := binary.Uvarint(body[i:])
+	if j <= 0 || i+j >= len(body) {
 		return core.Entry{}, 0, errors.New("unreadable record")
 	}
-	e := core.Entry{Index: core.Index(index), Term: core.Term(term), Kind: core.EntryKind(body[n+m])}
-	if payload := body[n+m+1:]; len(payload) > 0 {
-		e.Payload = payload
+	e := core.Entry{Index: core.Index(index), Term: core.Term(term), Kind: core.EntryKind(body[i+j])}
+	if payload := body[i+j+1:]; len(payload) > 0 {
+		e.Payload = slices.Clone(payload)
 	}
-	return e, int64(4 + len(body)), nil
+	return e, int64(4 + n), nil
 }

@@ -21,7 +21,7 @@ var naiveStore = rungtest.Store{
 
 func scenario(t *testing.T, name string) rungtest.Scenario {
 	t.Helper()
-	for _, set := range [][]rungtest.Scenario{rungtest.Rung1, rungtest.Rung2, rungtest.Rung3} {
+	for _, set := range [][]rungtest.Scenario{rungtest.Rung1, rungtest.Rung2, rungtest.Rung3, rungtest.Rung4} {
 		for _, sc := range set {
 			if sc.Name == name {
 				return sc
