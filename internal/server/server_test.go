@@ -29,6 +29,11 @@ type member struct {
 // front, a 5ms tick.
 func cluster(t *testing.T, n int) map[core.NodeID]*member {
 	t.Helper()
+	return clusterReading(t, n, raft.ReadsByIndex)
+}
+
+func clusterReading(t *testing.T, n int, reads raft.ReadMode) map[core.NodeID]*member {
+	t.Helper()
 	transport.Register(raft.MessageBodies()...)
 
 	listeners := map[core.NodeID]net.Listener{}
@@ -51,11 +56,11 @@ func cluster(t *testing.T, n int) map[core.NodeID]*member {
 		var node *server.Node
 		tr := transport.New(id, listeners[id], peers, func(m core.Message) { node.Deliver(m) })
 		c := raft.New(raft.Config{ID: id, Members: ids, ElectionTicks: 10, HeartbeatTicks: 1,
-			Rand: rand.New(rand.NewPCG(uint64(id), 99))})
+			Rand: rand.New(rand.NewPCG(uint64(id), 99)), Reads: reads})
 		node = server.NewNode(c, fsm.New(), tr.Send, 5*time.Millisecond)
 		ctx, cancel := context.WithCancel(context.Background())
 		go node.Run(ctx)
-		api := &server.API{Node: node, Clients: clients, Timeout: 2 * time.Second}
+		api := &server.API{Node: node, Clients: clients, Timeout: 2 * time.Second, ReadsBypassLog: reads != raft.ReadsThroughLog}
 		m := &member{api: httptest.NewServer(api.Handler()), cancel: cancel, tr: tr}
 		members[id] = m
 		clients[id] = m.api.URL
@@ -219,5 +224,34 @@ func TestSessionMakesARetrySafe(t *testing.T) {
 	}
 	if a := call(t, "PUT", leader+"/v1/kv/b", `{"value":"x"}`, "Session-Id", sid); a.code != 400 {
 		t.Fatalf("Session-Id without Request-Seq: %+v", a)
+	}
+}
+
+// The client API behaves the same whether gets go through the Log (Rung 1)
+// or the read index.
+func TestClientAPIWithReadsThroughLog(t *testing.T) {
+	members := clusterReading(t, 3, raft.ReadsThroughLog)
+	leader := leaderURL(t, members)
+	if a := call(t, "PUT", leader+"/v1/kv/a", `{"value":"1"}`); a.code != 200 {
+		t.Fatalf("put: %+v", a)
+	}
+	if a := call(t, "GET", leader+"/v1/kv/a", ""); a.code != 200 || a.body["value"] != "1" {
+		t.Fatalf("get: %+v", a)
+	}
+}
+
+func TestReadIndexFollowerRedirectsGets(t *testing.T) {
+	members := cluster(t, 3)
+	leader := leaderURL(t, members)
+	if a := call(t, "PUT", leader+"/v1/kv/a", `{"value":"1"}`); a.code != 200 {
+		t.Fatalf("put: %+v", a)
+	}
+	for _, m := range members {
+		if m.api.URL == leader {
+			continue
+		}
+		if a := call(t, "GET", m.api.URL+"/v1/kv/a", ""); a.code != 421 || a.body["leader"] != leader {
+			t.Fatalf("a follower answered a get with %+v, want 421 and a hint", a)
+		}
 	}
 }

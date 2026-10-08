@@ -35,15 +35,19 @@ type Append struct {
 	PrevTerm  core.Term
 	Entries   []core.Entry
 	Commit    core.Index
+	// ReadRound numbers the Leader's rounds of leadership confirmation
+	// (read.go). The follower echoes it.
+	ReadRound uint64
 }
 
 // AppendReply answers an Append. On success, Match is the last Index the
 // follower now shares with the Leader. On failure it is a hint: the Leader
 // should try again from Match+1.
 type AppendReply struct {
-	Term    core.Term
-	Success bool
-	Match   core.Index
+	Term      core.Term
+	Success   bool
+	Match     core.Index
+	ReadRound uint64
 }
 
 // MessageBodies lists the types this core puts in a Message, for the
@@ -63,6 +67,10 @@ const (
 	// This is Rung 2's naive shortcut, wrong on purpose: a Leader that has
 	// been replaced without knowing it hands out Stale reads.
 	ReadsFromMemory
+	// ReadsByIndex: Raft's read index (read.go). The Leader answers from
+	// memory only once it has Committed an Entry of its own Term and a
+	// Majority has confirmed, after the read arrived, that it still leads.
+	ReadsByIndex
 )
 
 // Config sets up one Member.
@@ -110,6 +118,12 @@ type Node struct {
 	heard     map[core.NodeID]int        // tick of each follower's last reply
 	heartbeat int                        // ticks since the last heartbeat
 	pending   map[core.Index]uint64      // proposals awaiting commit, by Index
+
+	// Read index state (read.go).
+	readRound  uint64                 // the latest confirmation round sent
+	roundOpen  bool                   // that round isn't confirmed yet
+	roundAcked map[core.NodeID]uint64 // highest round each follower has echoed
+	reads      []pendingRead
 }
 
 // New builds a Member, which starts as a follower in Term 0.
@@ -156,6 +170,7 @@ func (n *Node) Step(ev core.Event) core.Output {
 		n.read(&out, ev)
 	}
 	n.deliverCommitted(&out)
+	n.releaseReads(&out)
 	return out
 }
 
@@ -209,6 +224,7 @@ func (n *Node) send(out *core.Output, to core.NodeID, body any) {
 func (n *Node) becomeFollower(out *core.Output, term core.Term, leader core.NodeID) {
 	if n.role == core.LeaderRole {
 		n.failPending(out)
+		n.failReads(out)
 	}
 	if term > n.term {
 		n.term = term
@@ -304,6 +320,8 @@ func (n *Node) read(out *core.Output, r core.Read) {
 	switch {
 	case n.cfg.Reads == ReadsThroughLog:
 		panic("raft: core.Read sent to a Member configured for reads through the Log")
+	case n.role == core.LeaderRole && n.cfg.Reads == ReadsByIndex:
+		n.queueRead(out, r)
 	case n.role == core.LeaderRole:
 		out.Reads = append(out.Reads, core.Result{Ref: r.Ref, Reason: core.OK})
 	case n.role == core.Follower && n.leader != 0:

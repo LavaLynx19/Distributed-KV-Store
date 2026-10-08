@@ -10,9 +10,11 @@ import (
 	"distributed-kv-store/internal/core"
 )
 
-// Machine is the state machine Committed Entries are applied to.
+// Machine is the state machine Committed Entries are applied to. Read
+// answers a query from its current state without an Entry.
 type Machine interface {
 	Apply(core.Entry) []byte
+	Read(query []byte) []byte
 }
 
 // Reply is the outcome of one proposal.
@@ -25,6 +27,9 @@ type Reply struct {
 type proposal struct {
 	payload []byte
 	done    chan Reply
+	// read marks a query that bypasses the Log (A§6.2): the core says when
+	// it may be answered, and payload is then run against the state machine.
+	read bool
 }
 
 // Node runs one Member.
@@ -67,6 +72,7 @@ func (n *Node) Run(ctx context.Context) {
 	ticker := time.NewTicker(n.tick)
 	defer ticker.Stop()
 	pending := map[uint64]chan Reply{}
+	queries := map[uint64][]byte{}
 	var nextRef uint64
 
 	step := func(ev core.Event) {
@@ -80,6 +86,19 @@ func (n *Node) Run(ctx context.Context) {
 				delete(pending, r.Ref)
 				done <- Reply{Reason: r.Reason, Response: responses[r.Index], Leader: r.Leader}
 			}
+		}
+		for _, r := range out.Reads {
+			done, ok := pending[r.Ref]
+			if !ok {
+				continue
+			}
+			reply := Reply{Reason: r.Reason, Leader: r.Leader}
+			if r.Reason == core.OK {
+				reply.Response = n.machine.Read(queries[r.Ref])
+			}
+			delete(pending, r.Ref)
+			delete(queries, r.Ref)
+			done <- reply
 		}
 		for _, msg := range out.Messages {
 			n.send(msg)
@@ -100,7 +119,12 @@ func (n *Node) Run(ctx context.Context) {
 		case p := <-n.proposals:
 			nextRef++
 			pending[nextRef] = p.done
-			step(core.Propose{Ref: nextRef, Payload: p.payload})
+			if p.read {
+				queries[nextRef] = p.payload
+				step(core.Read{Ref: nextRef})
+			} else {
+				step(core.Propose{Ref: nextRef, Payload: p.payload})
+			}
 		case reply := <-n.statusReq:
 			reply <- n.core.Status()
 		case fn := <-n.inspect:
@@ -112,9 +136,21 @@ func (n *Node) Run(ctx context.Context) {
 // Propose submits a command and waits for its outcome. If ctx ends first the
 // outcome is Unknown: the command may still take effect.
 func (n *Node) Propose(ctx context.Context, payload []byte) Reply {
+	return n.submit(ctx, proposal{payload: payload})
+}
+
+// Read answers a query from this Member's state machine once the core says
+// it is safe, without putting it in the Log (A§6.2). If ctx ends first the
+// Reply is Unknown, which for a read just means "ask again".
+func (n *Node) Read(ctx context.Context, query []byte) Reply {
+	return n.submit(ctx, proposal{payload: query, read: true})
+}
+
+func (n *Node) submit(ctx context.Context, p proposal) Reply {
 	done := make(chan Reply, 1) // buffered: the loop never blocks on a client that gave up
+	p.done = done
 	select {
-	case n.proposals <- proposal{payload: payload, done: done}:
+	case n.proposals <- p:
 	case <-ctx.Done():
 		return Reply{Reason: core.Unknown}
 	}

@@ -343,3 +343,122 @@ func TestReadsFromMemory(t *testing.T) {
 		t.Fatalf("as Leader: %+v, want OK", out.Reads)
 	}
 }
+
+func newReadIndexLeader(t *testing.T) *Node {
+	t.Helper()
+	n := newNode(1, 3)
+	n.cfg.Reads = ReadsByIndex
+	elect(t, n, 2)
+	return n
+}
+
+// rounds lists the ReadRound of each Append in out, per destination.
+func rounds(out core.Output) map[core.NodeID]uint64 {
+	got := map[core.NodeID]uint64{}
+	for _, m := range out.Messages {
+		if a, ok := m.Body.(Append); ok {
+			got[m.To] = a.ReadRound
+		}
+	}
+	return got
+}
+
+// A new Leader may hold Committed Entries it hasn't applied. It must not
+// answer a read until an Entry of its own Term is Committed.
+func TestReadIndexWaitsForOwnTermCommit(t *testing.T) {
+	n := newReadIndexLeader(t) // Log: no-op@1, not yet Committed
+
+	out := n.Step(core.Read{Ref: 1})
+	if len(out.Reads) != 0 {
+		t.Fatalf("answered before anything of this Term was Committed: %+v", out.Reads)
+	}
+	// Leadership is confirmed, but the no-op still isn't Committed.
+	out = recv(n, 2, AppendReply{Term: 1, Match: 0, ReadRound: 1})
+	if len(out.Reads) != 0 {
+		t.Fatalf("answered on a confirmed round alone: %+v", out.Reads)
+	}
+	// The no-op commits: now both conditions hold.
+	out = recv(n, 2, AppendReply{Term: 1, Success: true, Match: 1, ReadRound: 1})
+	if len(out.Reads) != 1 || out.Reads[0] != (core.Result{Ref: 1, Reason: core.OK}) {
+		t.Fatalf("after the own-Term commit: %+v, want OK", out.Reads)
+	}
+	if len(out.Committed) != 1 {
+		t.Fatalf("the Entries the read depends on must be handed over in the same Output, got %+v", out.Committed)
+	}
+}
+
+// A Leader answers only after a Majority echoes a round sent after the read
+// arrived. Echoes of earlier rounds prove nothing.
+func TestReadIndexNeedsAFreshRound(t *testing.T) {
+	n := newReadIndexLeader(t)
+	recv(n, 2, AppendReply{Term: 1, Success: true, Match: 1}) // no-op Committed
+
+	out := n.Step(core.Read{Ref: 1})
+	if got := rounds(out); got[2] != 1 || got[3] != 1 {
+		t.Fatalf("a read should start round 1 to both followers, got %v", got)
+	}
+	if len(out.Reads) != 0 {
+		t.Fatal("answered before any echo")
+	}
+	if out = recv(n, 3, AppendReply{Term: 1, Success: true, Match: 0, ReadRound: 0}); len(out.Reads) != 0 {
+		t.Fatal("an echo of an earlier round released the read")
+	}
+	out = recv(n, 3, AppendReply{Term: 1, Success: true, Match: 0, ReadRound: 1})
+	if len(out.Reads) != 1 || out.Reads[0].Reason != core.OK {
+		t.Fatalf("after a Majority echoed round 1: %+v, want OK", out.Reads)
+	}
+}
+
+// Reads that arrive while a round is out share the next one.
+func TestReadIndexBatchesReads(t *testing.T) {
+	n := newReadIndexLeader(t)
+	recv(n, 2, AppendReply{Term: 1, Success: true, Match: 1})
+
+	n.Step(core.Read{Ref: 1}) // starts round 1
+	for ref := uint64(2); ref <= 5; ref++ {
+		if out := n.Step(core.Read{Ref: ref}); len(out.Messages) != 0 {
+			t.Fatalf("read %d started another round while one was out", ref)
+		}
+	}
+	out := recv(n, 2, AppendReply{Term: 1, Success: true, Match: 1, ReadRound: 1})
+	if len(out.Reads) != 1 || out.Reads[0].Ref != 1 {
+		t.Fatalf("round 1 should release only the read that preceded it, got %+v", out.Reads)
+	}
+	if got := rounds(out); got[2] != 2 || got[3] != 2 {
+		t.Fatalf("the waiting reads should start round 2 at once, got %v", got)
+	}
+	out = recv(n, 3, AppendReply{Term: 1, Success: true, Match: 1, ReadRound: 2})
+	if len(out.Reads) != 4 {
+		t.Fatalf("round 2 should release the other four reads, got %+v", out.Reads)
+	}
+}
+
+// A Leader that has been replaced gathers no echoes and never answers. When
+// it finds out, it turns its waiting reads away.
+func TestReadIndexReplacedLeaderNeverAnswers(t *testing.T) {
+	n := newReadIndexLeader(t)
+	recv(n, 2, AppendReply{Term: 1, Success: true, Match: 1})
+
+	if out := n.Step(core.Read{Ref: 1}); len(out.Reads) != 0 {
+		t.Fatal("answered with no echo")
+	}
+	// The others have moved on: a follower answers from a newer Term.
+	out := recv(n, 2, AppendReply{Term: 2})
+	if n.role == core.LeaderRole {
+		t.Fatal("still Leader after seeing a newer Term")
+	}
+	if len(out.Reads) != 1 || out.Reads[0].Reason != core.NoMajority {
+		t.Fatalf("the waiting read should be turned away, got %+v", out.Reads)
+	}
+}
+
+func TestReadIndexSingleMember(t *testing.T) {
+	n := newNode(1, 1)
+	n.cfg.Reads = ReadsByIndex
+	for n.role != core.LeaderRole {
+		n.Step(core.Tick{})
+	}
+	if out := n.Step(core.Read{Ref: 1}); len(out.Reads) != 1 || out.Reads[0].Reason != core.OK {
+		t.Fatalf("a Group of one confirms itself, got %+v", out.Reads)
+	}
+}

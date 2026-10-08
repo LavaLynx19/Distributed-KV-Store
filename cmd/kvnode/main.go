@@ -40,14 +40,24 @@ func main() {
 	electionTicks := flag.Int("election-ticks", 10, "ticks of silence before an election (randomized up to 2×)")
 	heartbeatTicks := flag.Int("heartbeat-ticks", 1, "ticks between a Leader's heartbeats")
 	timeout := flag.Duration("request-timeout", 5*time.Second, "how long a client request waits to commit")
+	reads := flag.String("reads", "index", "how gets are answered: index (read index, A§6.2) or log (as Log Entries)")
 	flag.Parse()
 
-	if err := run(core.NodeID(*id), *peersFlag, *clientsFlag, *listenPeer, *listenClient, *tick, *electionTicks, *heartbeatTicks, *timeout); err != nil {
+	var mode raft.ReadMode
+	switch *reads {
+	case "index":
+		mode = raft.ReadsByIndex
+	case "log":
+		mode = raft.ReadsThroughLog
+	default:
+		log.Fatalf("kvnode: -reads must be index or log, not %q", *reads)
+	}
+	if err := run(core.NodeID(*id), *peersFlag, *clientsFlag, *listenPeer, *listenClient, *tick, *electionTicks, *heartbeatTicks, *timeout, mode); err != nil {
 		log.Fatalf("kvnode: %v", err)
 	}
 }
 
-func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string, tick time.Duration, electionTicks, heartbeatTicks int, timeout time.Duration) error {
+func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string, tick time.Duration, electionTicks, heartbeatTicks int, timeout time.Duration, reads raft.ReadMode) error {
 	peers, err := parseAddrs(peersFlag)
 	if err != nil {
 		return fmt.Errorf("-peers: %w", err)
@@ -83,7 +93,8 @@ func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string
 	c := raft.New(raft.Config{
 		ID: id, Members: members,
 		ElectionTicks: electionTicks, HeartbeatTicks: heartbeatTicks,
-		Rand: rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), uint64(id))),
+		Rand:  rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), uint64(id))),
+		Reads: reads,
 	})
 	node = server.NewNode(c, fsm.New(), tr.Send, tick)
 
@@ -96,7 +107,7 @@ func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string
 	for m, addr := range clients {
 		hints[m] = "http://" + addr
 	}
-	api := &server.API{Node: node, Clients: hints, Timeout: timeout}
+	api := &server.API{Node: node, Clients: hints, Timeout: timeout, ReadsBypassLog: reads != raft.ReadsThroughLog}
 	srv := &http.Server{Addr: listenClient, Handler: api.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()

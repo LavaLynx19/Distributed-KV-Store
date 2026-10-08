@@ -21,6 +21,9 @@ type API struct {
 	Clients map[core.NodeID]string
 	// Timeout bounds how long a request waits for its command to commit.
 	Timeout time.Duration
+	// ReadsBypassLog answers gets through the core's read path (A§6.2). The
+	// core must be configured to match.
+	ReadsBypassLog bool
 }
 
 type putRequest struct {
@@ -126,7 +129,12 @@ func identify(r *http.Request, cmd *fsm.Command) bool {
 func (a *API) propose(w http.ResponseWriter, r *http.Request, cmd fsm.Command) (fsm.Response, bool) {
 	ctx, cancel := context.WithTimeout(r.Context(), a.Timeout)
 	defer cancel()
-	reply := a.Node.Propose(ctx, cmd.Encode())
+	var reply Reply
+	if a.ReadsBypassLog && cmd.Op == fsm.OpGet {
+		reply = a.Node.Read(ctx, cmd.Encode())
+	} else {
+		reply = a.Node.Propose(ctx, cmd.Encode())
+	}
 
 	switch reply.Reason {
 	case core.NotLeader:

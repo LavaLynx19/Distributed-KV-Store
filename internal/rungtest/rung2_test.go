@@ -31,6 +31,15 @@ var withSessions = rungtest.Store{
 	Workload: with(func(w *sim.Workload) { w.Retry, w.Sessions = true, true }),
 }
 
+// rung2Store is where Rung 2 ends: reads by read index, and retrying clients
+// in Sessions.
+var rung2Store = rungtest.Store{
+	NewNode: newRaft(raft.ReadsByIndex),
+	Workload: with(func(w *sim.Workload) {
+		w.ReadsBypassLog, w.Retry, w.Sessions = true, true, true
+	}),
+}
+
 func with(change func(*sim.Workload)) sim.Workload {
 	w := sim.DefaultWorkload
 	change(&w)
@@ -121,6 +130,25 @@ func TestSessionsMakeRetriesSafe(t *testing.T) {
 	}{{"crash-leader", 4}, {"isolate-leader", 1}, {"leader-deaf", 1}} {
 		if r := rungtest.Run(withSessions, scenario(t, tt.scenario), 3, tt.seed); !r.Passed() {
 			t.Errorf("a seed that exposed retries still fails: %v", r)
+		}
+	}
+}
+
+// Rung 2's promise (README): no Stale read and exactly-once effect, under
+// one-way Partitions and delayed, reordered or duplicated messages, as well
+// as everything Rung 1 survives.
+func TestRung2(t *testing.T) {
+	suite(t, rung2Store)
+	for _, tt := range []struct {
+		scenario string
+		members  int
+		seed     uint64
+	}{
+		{"crash-leader", 3, 14}, {"isolate-leader", 3, 78}, {"leader-deaf", 5, 13}, // Stale reads
+		{"crash-leader", 3, 4}, {"isolate-leader", 3, 1}, {"leader-deaf", 3, 1}, // double apply
+	} {
+		if r := rungtest.Run(rung2Store, scenario(t, tt.scenario), tt.members, tt.seed); !r.Passed() {
+			t.Errorf("a seed that exposed a shortcut still fails: %v", r)
 		}
 	}
 }
