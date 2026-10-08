@@ -21,9 +21,11 @@ var naiveStore = rungtest.Store{
 
 func scenario(t *testing.T, name string) rungtest.Scenario {
 	t.Helper()
-	for _, sc := range rungtest.Rung1 {
-		if sc.Name == name {
-			return sc
+	for _, set := range [][]rungtest.Scenario{rungtest.Rung1, rungtest.Rung2} {
+		for _, sc := range set {
+			if sc.Name == name {
+				return sc
+			}
 		}
 	}
 	t.Fatalf("no scenario %q", name)
