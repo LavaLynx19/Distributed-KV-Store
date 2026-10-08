@@ -24,6 +24,13 @@ var (
 	}
 )
 
+// withSessions is the fix for retries: the same retrying clients, each in a
+// Session.
+var withSessions = rungtest.Store{
+	NewNode:  newRaft(raft.ReadsThroughLog),
+	Workload: with(func(w *sim.Workload) { w.Retry, w.Sessions = true, true }),
+}
+
 func with(change func(*sim.Workload)) sim.Workload {
 	w := sim.DefaultWorkload
 	change(&w)
@@ -74,6 +81,46 @@ func TestShortcutsAreExposed(t *testing.T) {
 		}
 		if len(r.Diverged) != 0 || r.TwoLeaders != "" {
 			t.Errorf("%s, %s seed %d: Members should still agree, with one Leader per Term: %v", tt.name, tt.scenario, tt.seed, r)
+		}
+	}
+}
+
+func allScenarios() []rungtest.Scenario {
+	return append(append([]rungtest.Scenario{}, rungtest.Rung1...), rungtest.Rung2...)
+}
+
+// suite runs store through every Rung 1 and Rung 2 scenario on 3 and 5
+// Members and requires every verdict, and recovery after repair.
+func suite(t *testing.T, store rungtest.Store) {
+	t.Helper()
+	seeds := uint64(200)
+	if testing.Short() {
+		seeds = 20
+	}
+	for _, sc := range allScenarios() {
+		for _, members := range []int{3, 5} {
+			for seed := uint64(1); seed <= seeds; seed++ {
+				r := rungtest.Run(store, sc, members, seed)
+				if !r.Passed() {
+					t.Errorf("%v\n  diverged: %v", r, r.Diverged)
+				}
+				if r.Recovery < 0 {
+					t.Errorf("%v\n  no write succeeded after the Faults were repaired", r)
+				}
+			}
+		}
+	}
+}
+
+// With Sessions, clients may retry: a repeated request takes effect once.
+func TestSessionsMakeRetriesSafe(t *testing.T) {
+	suite(t, withSessions)
+	for _, tt := range []struct {
+		scenario string
+		seed     uint64
+	}{{"crash-leader", 4}, {"isolate-leader", 1}, {"leader-deaf", 1}} {
+		if r := rungtest.Run(withSessions, scenario(t, tt.scenario), 3, tt.seed); !r.Passed() {
+			t.Errorf("a seed that exposed retries still fails: %v", r)
 		}
 	}
 }

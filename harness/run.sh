@@ -14,6 +14,7 @@
 #
 # Environment:
 #   CLIENTS=8  DURATION=10s  FAULT_AT=3  FAULT_FOR=3   (seconds for the last two)
+#   RETRY=1    clients open a Session and retry unanswered requests (A§6.3)
 #
 # Output is also saved to harness/out/run-<backend>-<members>-<fault>.txt.
 set -euo pipefail
@@ -54,13 +55,14 @@ leader() {
 
 log="$OUT/run-$BACKEND-$N-$FAULT.txt"
 {
-  echo "== $BACKEND, $N Members, fault $FAULT, $CLIENTS clients for $DURATION"
+  echo "== $BACKEND, $N Members, fault $FAULT, $CLIENTS clients for $DURATION${RETRY:+, retrying in Sessions}"
   "$ctl" "${start[@]}" | tail -1
   trap '"$ctl" "$stop" >/dev/null 2>&1 || true' EXIT
   for _ in $(seq 1 100); do [[ -n "$(leader)" ]] && break; sleep 0.1; done
   [[ -n "$(leader)" ]] || { echo "no Leader after 10s" >&2; exit 1; }
 
   bench=("$ROOT/bin/kvbench" -nodes "$(IFS=,; echo "${nodes[*]}")" -clients "$CLIENTS" -duration "$DURATION")
+  [[ -n "${RETRY:-}" ]] && bench+=(-retry)
   if [[ $FAULT == none ]]; then
     "${bench[@]}"
     status=$?

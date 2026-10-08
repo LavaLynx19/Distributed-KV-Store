@@ -69,11 +69,14 @@ type answer struct {
 	body map[string]any
 }
 
-func call(t *testing.T, method, url, body string) answer {
+func call(t *testing.T, method, url, body string, headers ...string) answer {
 	t.Helper()
 	req, err := http.NewRequest(method, url, bytes.NewBufferString(body))
 	if err != nil {
 		t.Fatal(err)
+	}
+	for i := 0; i+1 < len(headers); i += 2 {
+		req.Header.Set(headers[i], headers[i+1])
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -186,5 +189,35 @@ func TestSurvivesLeaderLoss(t *testing.T) {
 	next := leaderURL(t, members)
 	if a := call(t, "GET", next+"/v1/kv/a", ""); a.code != 200 || a.body["value"] != "kept" {
 		t.Fatalf("after losing the Leader: %+v, want the Acknowledged write", a)
+	}
+}
+
+func TestSessionMakesARetrySafe(t *testing.T) {
+	members := cluster(t, 3)
+	leader := leaderURL(t, members)
+
+	open := call(t, "POST", leader+"/v1/sessions", "")
+	if open.code != 200 || open.body["session"] == nil {
+		t.Fatalf("open session: %+v", open)
+	}
+	sid := fmt.Sprint(int(open.body["session"].(float64)))
+
+	// The same request twice: create "a" only if it doesn't exist.
+	body := `{"value":"once","if_version":0}`
+	first := call(t, "PUT", leader+"/v1/kv/a", body, "Session-Id", sid, "Request-Seq", "1")
+	retry := call(t, "PUT", leader+"/v1/kv/a", body, "Session-Id", sid, "Request-Seq", "1")
+	if first.code != 200 || retry.code != 200 || first.body["version"] != retry.body["version"] {
+		t.Fatalf("first %+v, retry %+v: the retry should get the first answer", first, retry)
+	}
+	// Without a Session the repeat is a new request, and fails.
+	if a := call(t, "PUT", leader+"/v1/kv/a", body); a.code != 409 {
+		t.Fatalf("repeat without a Session: %+v, want 409", a)
+	}
+
+	if a := call(t, "PUT", leader+"/v1/kv/b", `{"value":"x"}`, "Session-Id", "424242", "Request-Seq", "1"); a.code != 410 || a.body["reason"] != "session_expired" {
+		t.Fatalf("unknown Session: %+v", a)
+	}
+	if a := call(t, "PUT", leader+"/v1/kv/b", `{"value":"x"}`, "Session-Id", sid); a.code != 400 {
+		t.Fatalf("Session-Id without Request-Seq: %+v", a)
 	}
 }

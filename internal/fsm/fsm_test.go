@@ -89,7 +89,7 @@ func TestNoopAndGarbage(t *testing.T) {
 	if got := m.Apply(core.Entry{Index: 1, Kind: core.EntryNoop}); got != nil {
 		t.Errorf("a no-op returned %v", got)
 	}
-	for _, payload := range [][]byte{nil, {0}, {99, 0, 0, 0, 0}, put("a", "1").Encode()[:4], append(put("a", "1").Encode(), 0)} {
+	for _, payload := range [][]byte{nil, {0}, {99, 0, 0, 0, 0, 0, 0}, put("a", "1").Encode()[:6], append(put("a", "1").Encode(), 0)} {
 		r, err := DecodeResponse(m.Apply(core.Entry{Index: 2, Kind: core.EntryCommand, Payload: payload}))
 		if err != nil || r.Status != StatusInvalid {
 			t.Errorf("payload %v: got %+v, %v; want StatusInvalid", payload, r, err)
@@ -104,6 +104,7 @@ func TestCommandRoundTrip(t *testing.T) {
 	for _, c := range []Command{
 		get("k"), put("k", "v"), put("", ""), del("k"), cas("key with spaces", "v", 1<<40),
 		{Op: OpDelete, Key: "k", Conditional: true},
+		{Op: OpOpenSession}, {Op: OpPut, Key: "k", Value: []byte("v"), Session: 7, Seq: 1 << 33},
 	} {
 		got, err := DecodeCommand(c.Encode())
 		if err != nil || !reflect.DeepEqual(got, c) {
@@ -141,5 +142,64 @@ func TestReadBypassesTheLog(t *testing.T) {
 	}
 	if got := m.Items(); len(got) != 1 || string(got[0].Value) != "1" {
 		t.Fatalf("Read changed the state: %+v", got)
+	}
+}
+
+func inSession(c Command, session, seq uint64) Command {
+	c.Session, c.Seq = session, seq
+	return c
+}
+
+func TestSessionAppliesARetryOnce(t *testing.T) {
+	m := New()
+	rs := run(t, m, Command{Op: OpOpenSession})
+	if rs[0].Status != StatusOK || rs[0].Session != 1 {
+		t.Fatalf("open session: %+v, want OK with id 1 (its Entry's Index)", rs[0])
+	}
+	sid := rs[0].Session
+
+	// Entries 2 and 3 are the same request: the second is a retry.
+	first := m.Apply(core.Entry{Index: 2, Kind: core.EntryCommand, Payload: inSession(cas("a", "1", 0), sid, 1).Encode()})
+	retry := m.Apply(core.Entry{Index: 3, Kind: core.EntryCommand, Payload: inSession(cas("a", "1", 0), sid, 1).Encode()})
+	r1, _ := DecodeResponse(first)
+	r2, _ := DecodeResponse(retry)
+	if r1.Status != StatusOK || r1.Version != 2 {
+		t.Fatalf("first attempt: %+v", r1)
+	}
+	if !reflect.DeepEqual(r1, r2) {
+		t.Fatalf("the retry was answered %+v, not as the first attempt %+v", r2, r1)
+	}
+	if got := m.Items(); len(got) != 1 || got[0].Version != 2 {
+		t.Fatalf("the retry changed the state: %+v", got)
+	}
+
+	// The next request in the Session is applied as usual.
+	r3, _ := DecodeResponse(m.Apply(core.Entry{Index: 4, Kind: core.EntryCommand, Payload: inSession(put("a", "2"), sid, 2).Encode()}))
+	if r3.Status != StatusOK || r3.Version != 4 {
+		t.Fatalf("next request: %+v", r3)
+	}
+	// A copy of a request the Session has moved past is refused.
+	r4, _ := DecodeResponse(m.Apply(core.Entry{Index: 5, Kind: core.EntryCommand, Payload: inSession(put("a", "old"), sid, 1).Encode()}))
+	if r4.Status != StatusInvalid {
+		t.Fatalf("stale Seq: %+v, want StatusInvalid", r4)
+	}
+	if got := m.Items(); string(got[0].Value) != "2" {
+		t.Fatalf("a stale copy was applied: %+v", got)
+	}
+}
+
+func TestUnknownSession(t *testing.T) {
+	m := New()
+	r, _ := DecodeResponse(m.Apply(core.Entry{Index: 1, Kind: core.EntryCommand, Payload: inSession(put("a", "1"), 99, 1).Encode()}))
+	if r.Status != StatusSessionExpired || len(m.Items()) != 0 {
+		t.Fatalf("unknown Session: %+v with %d keys, want StatusSessionExpired and no change", r, len(m.Items()))
+	}
+}
+
+// Without a Session, every copy is applied: that is Rung 2's double apply.
+func TestNoSessionAppliesEveryCopy(t *testing.T) {
+	rs := run(t, New(), cas("a", "1", 0), cas("a", "1", 0))
+	if rs[0].Status != StatusOK || rs[1].Status != StatusVersionMismatch {
+		t.Fatalf("got %+v", rs)
 	}
 }

@@ -30,6 +30,9 @@ type Workload struct {
 	// four Timeouts have passed. The History records one request, from the
 	// first attempt to the final answer.
 	Retry bool
+	// Sessions makes each client open a Session first and number its
+	// requests within it, so the store can recognise a retry (A§6.3).
+	Sessions bool
 }
 
 // DefaultWorkload is enough contention to make ordering mistakes visible.
@@ -41,6 +44,9 @@ type client struct {
 	leader core.NodeID       // where this client currently sends requests
 	seen   map[string]uint64 // last version this client observed per key
 	count  int
+	// session and seq identify this client's requests when Sessions is on.
+	session uint64
+	seq     uint64
 }
 
 // Start launches the clients. They stop issuing requests at time until.
@@ -48,8 +54,59 @@ func (w Workload) Start(s *Sim, h *check.History, until int64) {
 	ids := s.IDs()
 	for i := range w.Clients {
 		c := &client{id: i, home: ids[i%len(ids)], leader: ids[s.Rand().IntN(len(ids))], seen: map[string]uint64{}}
-		s.After(1+s.Rand().Int64N(w.Think), func() { w.next(s, h, c, until) })
+		start := func() { w.next(s, h, c, until) }
+		if w.Sessions {
+			start = func() { w.openSession(s, c, func() { w.next(s, h, c, until) }) }
+		}
+		s.After(1+s.Rand().Int64N(w.Think), start)
 	}
+}
+
+// openSession keeps trying until some Leader has registered a Session for
+// the client, then calls then.
+func (w Workload) openSession(s *Sim, c *client, then func()) {
+	ids := s.IDs()
+	done := false
+	var attempt func()
+	attempt = func() {
+		if done {
+			return
+		}
+		target := c.leader
+		over := false
+		move := func(to core.NodeID) {
+			if over {
+				return
+			}
+			over = true
+			if c.leader = to; to == 0 {
+				c.leader = ids[s.Rand().IntN(len(ids))]
+			}
+			s.After(10+s.Rand().Int64N(20), attempt)
+		}
+		if !s.Reachable(c.home, target) {
+			move(0)
+			return
+		}
+		s.After(w.Timeout, func() { move(0) })
+		s.Propose(target, fsm.Command{Op: fsm.OpOpenSession}.Encode(), func(r Reply) {
+			if over || !s.Reachable(target, c.home) {
+				return
+			}
+			if r.Refused || r.Reason != core.OK {
+				move(r.Leader)
+				return
+			}
+			resp, err := fsm.DecodeResponse(r.Response)
+			if err != nil || resp.Session == 0 {
+				panic(fmt.Sprintf("sim: bad answer to OpOpenSession: %+v, %v", resp, err))
+			}
+			over, done = true, true
+			c.session = resp.Session
+			then()
+		})
+	}
+	attempt()
 }
 
 // dispatch sends cmd to a Member by the path the Workload is configured for.
@@ -127,9 +184,20 @@ func (w Workload) next(s *Sim, h *check.History, c *client, until int64) {
 	})
 }
 
-// pick chooses the client's next request: mostly reads and writes, with
-// compare-and-sets against the version the client last saw.
+// pick chooses the client's next request and, if the client has a Session,
+// gives it the next request number.
 func (w Workload) pick(s *Sim, c *client) fsm.Command {
+	cmd := w.choose(s, c)
+	if c.session != 0 {
+		c.seq++
+		cmd.Session, cmd.Seq = c.session, c.seq
+	}
+	return cmd
+}
+
+// choose picks mostly reads and writes, with compare-and-sets against the
+// version the client last saw.
+func (w Workload) choose(s *Sim, c *client) fsm.Command {
 	key := fmt.Sprintf("k%d", s.Rand().IntN(w.Keys))
 	c.count++
 	value := []byte(fmt.Sprintf("c%d-%d", c.id, c.count))

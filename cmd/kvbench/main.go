@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -44,6 +45,7 @@ type config struct {
 	settle   time.Duration
 	checkFor time.Duration
 	seed     uint64
+	retry    bool
 }
 
 func main() {
@@ -57,6 +59,7 @@ func main() {
 	flag.DurationVar(&cfg.settle, "settle", 15*time.Second, "how long to wait after the load for Members to converge")
 	flag.DurationVar(&cfg.checkFor, "check", time.Minute, "time limit for the linearizability check (0 skips it)")
 	flag.Uint64Var(&cfg.seed, "seed", 1, "seed for the clients' choices")
+	flag.BoolVar(&cfg.retry, "retry", false, "open a Session per client and retry requests that get no definite answer (A§6.3)")
 	flag.Parse()
 	for _, n := range strings.Split(*nodes, ",") {
 		if n = strings.TrimSpace(n); n != "" {
@@ -112,6 +115,9 @@ func run(cfg config) bool {
 				rng:    rand.New(rand.NewPCG(cfg.seed, uint64(i))),
 				target: cfg.nodes[i%len(cfg.nodes)],
 				seen:   map[string]uint64{},
+			}
+			if cfg.retry && !c.openSession(ctx) {
+				return
 			}
 			for ctx.Err() == nil {
 				c.request()
@@ -197,14 +203,54 @@ type client struct {
 	target string            // the Member this client currently talks to
 	seen   map[string]uint64 // last version observed per key
 	count  int
+	// session and seq identify this client's requests when -retry is on.
+	session uint64
+	seq     uint64
 }
 
-// request sends one command and records how it ended. Like the Simulation's
-// clients, it never retries (A§6.3).
+// openSession keeps asking until a Leader registers a Session, or ctx ends.
+func (c *client) openSession(ctx context.Context) bool {
+	for ctx.Err() == nil {
+		resp, err := c.http.Post(c.target+"/v1/sessions", "application/json", nil)
+		if err == nil {
+			var a answer
+			raw, _ := io.ReadAll(resp.Body) // a failed read leaves a.Session 0, which retries
+			resp.Body.Close()
+			_ = json.Unmarshal(raw, &a)
+			if resp.StatusCode == http.StatusOK && a.Session != 0 {
+				c.session = a.Session
+				return true
+			}
+			if a.Leader != "" && slices.Contains(c.cfg.nodes, a.Leader) {
+				c.target = a.Leader
+				continue
+			}
+		}
+		c.elsewhere()
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
+// request sends one command and records how it ended. Without -retry it is
+// sent once, like Rung 1's clients. With -retry it is sent again, under the
+// same request number, until it gets a definite answer or four timeouts
+// have passed; the History records one request either way.
 func (c *client) request() {
 	cmd := c.pick()
+	if c.session != 0 {
+		c.seq++
+		cmd.Session, cmd.Seq = c.session, c.seq
+	}
 	id, began := c.rec.begin(c.id, cmd)
 	result, resp := c.send(cmd)
+	for giveUp := began.Add(4 * c.cfg.timeout); c.cfg.retry && result != check.Answered && time.Now().Before(giveUp); {
+		time.Sleep(2 * time.Millisecond)
+		result, resp = c.send(cmd)
+	}
+	if c.cfg.retry && result == check.Rejected {
+		result = check.Lost // an earlier attempt may have gone through
+	}
 	c.rec.end(id, began, result, resp)
 	if result == check.Answered {
 		switch resp.Status {
@@ -237,6 +283,7 @@ func (c *client) pick() fsm.Command {
 type answer struct {
 	Value   string `json:"value"`
 	Version uint64 `json:"version"`
+	Session uint64 `json:"session"`
 	Reason  string `json:"reason"`
 	Leader  string `json:"leader"`
 }
@@ -264,6 +311,11 @@ func (c *client) send(cmd fsm.Command) (check.Result, fsm.Response) {
 	}
 	if err != nil {
 		log.Fatalf("kvbench: building request: %v", err)
+	}
+
+	if cmd.Session != 0 {
+		req.Header.Set("Session-Id", strconv.FormatUint(cmd.Session, 10))
+		req.Header.Set("Request-Seq", strconv.FormatUint(cmd.Seq, 10))
 	}
 
 	resp, err := c.http.Do(req)

@@ -216,7 +216,7 @@ A key written with a time-to-live stores a deadline: the Entry's stamp plus the 
 | `POST /v1/txn` | Transaction: conditions and writes |
 | `GET /v1/status` | This Member's role, Term, Leader hint, commit index |
 
-Writes carry `Session-Id` and `Request-Seq` headers.
+Requests carry `Session-Id` and `Request-Seq` headers so that a retry takes effect once (§6.3). A request without them is applied every time it arrives.
 
 ### 7.2 Errors
 | HTTP | `reason` | Meaning | Client should |

@@ -12,8 +12,8 @@ import (
 	"distributed-kv-store/internal/fsm"
 )
 
-// API serves the client contract of A§7.1. Rung 1 covers single keys and
-// status; Sessions, scans, transactions and admin arrive with their Rungs.
+// API serves the client contract of A§7.1: single keys, Sessions and status
+// so far. Scans, transactions and admin arrive with their Rungs.
 type API struct {
 	Node *Node
 	// Clients maps each Member to its client-facing address, for the hint in
@@ -41,6 +41,10 @@ type errorResponse struct {
 	Version *uint64 `json:"version,omitempty"`
 }
 
+type sessionResponse struct {
+	Session uint64 `json:"session"`
+}
+
 type statusResponse struct {
 	ID     core.NodeID `json:"id"`
 	Role   string      `json:"role"`
@@ -57,6 +61,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/kv/{key}", a.get)
 	mux.HandleFunc("PUT /v1/kv/{key}", a.put)
 	mux.HandleFunc("DELETE /v1/kv/{key}", a.delete)
+	mux.HandleFunc("POST /v1/sessions", a.openSession)
 	mux.HandleFunc("GET /v1/status", a.status)
 	mux.HandleFunc("GET /v1/debug/items", a.debugItems)
 	return mux
@@ -96,8 +101,29 @@ func (a *API) delete(w http.ResponseWriter, r *http.Request) {
 	a.run(w, r, cmd)
 }
 
-// run proposes cmd and turns the outcome into the answer A§7.2 prescribes.
-func (a *API) run(w http.ResponseWriter, r *http.Request, cmd fsm.Command) {
+func (a *API) openSession(w http.ResponseWriter, r *http.Request) {
+	if resp, ok := a.propose(w, r, fsm.Command{Op: fsm.OpOpenSession}); ok {
+		writeJSON(w, http.StatusOK, sessionResponse{Session: resp.Session})
+	}
+}
+
+// identify reads the Session-Id and Request-Seq headers into cmd (A§6.3).
+// Both or neither must be present. Without them the request is applied each
+// time it arrives.
+func identify(r *http.Request, cmd *fsm.Command) bool {
+	id, seq := r.Header.Get("Session-Id"), r.Header.Get("Request-Seq")
+	if id == "" && seq == "" {
+		return true
+	}
+	var err1, err2 error
+	cmd.Session, err1 = strconv.ParseUint(id, 10, 64)
+	cmd.Seq, err2 = strconv.ParseUint(seq, 10, 64)
+	return err1 == nil && err2 == nil && cmd.Session != 0 && cmd.Seq != 0
+}
+
+// propose submits cmd and handles every outcome that isn't the state
+// machine's own answer. It reports false if it has already written one.
+func (a *API) propose(w http.ResponseWriter, r *http.Request, cmd fsm.Command) (fsm.Response, bool) {
 	ctx, cancel := context.WithTimeout(r.Context(), a.Timeout)
 	defer cancel()
 	reply := a.Node.Propose(ctx, cmd.Encode())
@@ -105,18 +131,30 @@ func (a *API) run(w http.ResponseWriter, r *http.Request, cmd fsm.Command) {
 	switch reply.Reason {
 	case core.NotLeader:
 		writeError(w, http.StatusMisdirectedRequest, errorResponse{Reason: "not_leader", Leader: a.Clients[reply.Leader]})
-		return
+		return fsm.Response{}, false
 	case core.NoMajority:
 		writeError(w, http.StatusServiceUnavailable, errorResponse{Reason: "no_majority"})
-		return
+		return fsm.Response{}, false
 	case core.Unknown:
 		writeError(w, http.StatusGatewayTimeout, errorResponse{Reason: "timeout", Message: "outcome unknown"})
-		return
+		return fsm.Response{}, false
 	}
-
 	resp, err := fsm.DecodeResponse(reply.Response)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, errorResponse{Reason: "internal", Message: err.Error()})
+		return fsm.Response{}, false
+	}
+	return resp, true
+}
+
+// run proposes cmd and turns the outcome into the answer A§7.2 prescribes.
+func (a *API) run(w http.ResponseWriter, r *http.Request, cmd fsm.Command) {
+	if !identify(r, &cmd) {
+		writeError(w, http.StatusBadRequest, errorResponse{Reason: "invalid", Message: "Session-Id and Request-Seq must both be positive integers"})
+		return
+	}
+	resp, ok := a.propose(w, r, cmd)
+	if !ok {
 		return
 	}
 	switch resp.Status {
@@ -131,6 +169,8 @@ func (a *API) run(w http.ResponseWriter, r *http.Request, cmd fsm.Command) {
 		writeError(w, http.StatusNotFound, errorResponse{Reason: "not_found"})
 	case fsm.StatusVersionMismatch:
 		writeError(w, http.StatusConflict, errorResponse{Reason: "version_mismatch", Version: &resp.Version})
+	case fsm.StatusSessionExpired:
+		writeError(w, http.StatusGone, errorResponse{Reason: "session_expired"})
 	default:
 		writeError(w, http.StatusBadRequest, errorResponse{Reason: "invalid"})
 	}
