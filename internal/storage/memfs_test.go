@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"math/rand/v2"
 	"reflect"
 	"testing"
@@ -33,7 +34,8 @@ func TestMemFSCrashKeepsOnlyWhatWasSynced(t *testing.T) {
 }
 
 // With tearing on, an unsynced write can partly survive. Whatever survives,
-// everything synced before it is intact, and no synced Entry is lost.
+// the Store opens without complaint, everything synced before is intact, and
+// anything it returns beyond that is a whole Entry that really was written.
 func TestMemFSTornWritesNeverTouchSyncedData(t *testing.T) {
 	rng := rand.New(rand.NewPCG(7, 7))
 	sawPartial := false
@@ -61,10 +63,11 @@ func TestMemFSTornWritesNeverTouchSyncedData(t *testing.T) {
 		}
 		_, stored, err := OpenFS(fs, "data", 0)
 		if err != nil {
-			continue // without checksums a torn record can be unreadable: Rung 4's subject
+			t.Fatalf("a torn write was reported as damage: %v", err)
 		}
-		if len(stored.Entries) < 3 || !reflect.DeepEqual(stored.Entries[:3], es(1, 3, 1)) {
-			t.Fatalf("synced Entries were damaged: %+v", stored.Entries)
+		all := es(1, 8, 1)
+		if len(stored.Entries) < 3 || len(stored.Entries) > 8 || !reflect.DeepEqual(stored.Entries, all[:len(stored.Entries)]) {
+			t.Fatalf("after a torn write the Store returned %+v", stored.Entries)
 		}
 	}
 	if !sawPartial {
@@ -152,5 +155,84 @@ func TestMemFSMatchesStoredApply(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// Flip every bit of every file, one at a time. Whatever the Store then
+// returns must be true: either an error, or the original state, or the
+// original state with Entries missing from the end. It must never return an
+// Entry, a Term, a vote or a Snapshot that wasn't written.
+func TestEveryBitFlipIsDetectedOrHarmless(t *testing.T) {
+	fs := NewMemFS()
+	const small = 128
+	s, _, err := OpenFS(fs, "data", small)
+	if err != nil {
+		t.Fatal(err)
+	}
+	save(t, s, core.Persist{HardState: &core.HardState{Term: 3, VotedFor: 2}, Entries: es(1, 12, 3)})
+	save(t, s, core.Persist{Snapshot: &core.Snapshot{Index: 4, Term: 3, Data: []byte("state at four")}})
+	save(t, s, core.Persist{Entries: es(13, 20, 3)})
+	_, want, err := OpenFS(fs.Durable(), "data", small)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	flips, detected, shortened := 0, 0, 0
+	for _, path := range fs.paths() {
+		for at := range fs.durable[path].synced {
+			for bit := range 8 {
+				damaged := fs.Durable()
+				damaged.durable[path].synced[at] ^= 1 << bit
+				damaged.durable[path].data[at] ^= 1 << bit
+				flips++
+				_, got, err := OpenFS(damaged, "data", small)
+				if err != nil {
+					detected++
+					continue
+				}
+				if got.HardState != want.HardState || !reflect.DeepEqual(got.Snapshot, want.Snapshot) {
+					t.Fatalf("flipping bit %d of byte %d in %s changed the Term, vote or Snapshot without an error", bit, at, path)
+				}
+				if len(got.Entries) > len(want.Entries) || !reflect.DeepEqual(got.Entries, want.Entries[:len(got.Entries)]) {
+					t.Fatalf("flipping bit %d of byte %d in %s returned an Entry that was never written", bit, at, path)
+				}
+				if len(got.Entries) < len(want.Entries) {
+					shortened++
+				}
+			}
+		}
+	}
+	t.Logf("%d single-bit flips: %d reported as damage, %d taken for a write cut short (Entries dropped from the end)", flips, detected, shortened)
+	if detected == 0 || detected+shortened != flips {
+		t.Fatalf("%d flips went unnoticed", flips-detected-shortened)
+	}
+}
+
+// The unchecked format believes a flipped bit. This is what Rung 4 exposed.
+func TestUncheckedFormatBelievesDamage(t *testing.T) {
+	fs := NewMemFS()
+	s, _, err := OpenWith(fs, "data", Options{Unchecked: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := core.Entry{Index: 1, Term: 1, Kind: core.EntryCommand, Payload: []byte("k0")}
+	save(t, s, core.Persist{Entries: []core.Entry{e}})
+	f := fs.durable["data/log/0000000000000001.seg"]
+	f.synced[len(f.synced)-2] ^= 1 // 'k' becomes 'j'
+	f.data[len(f.data)-2] ^= 1
+	_, stored, err := OpenWith(fs.Durable(), "data", Options{Unchecked: true})
+	if err != nil || len(stored.Entries) != 1 || string(stored.Entries[0].Payload) != "j0" {
+		t.Fatalf("expected the damaged Entry to be read back as j0, got %+v, %v", stored.Entries, err)
+	}
+	// The checked format refuses the same damage.
+	checked := NewMemFS()
+	s2, _, _ := OpenFS(checked, "data", 0)
+	save(t, s2, core.Persist{Entries: []core.Entry{e}})
+	g := checked.durable["data/log/0000000000000001.seg"]
+	g.synced[len(g.synced)-2] ^= 1
+	g.data[len(g.data)-2] ^= 1
+	var corrupt *CorruptError
+	if _, _, err := OpenFS(checked.Durable(), "data", 0); !errors.As(err, &corrupt) {
+		t.Fatalf("the checked format should report the damage, got %v", err)
 	}
 }

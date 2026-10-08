@@ -60,6 +60,9 @@ type Config struct {
 	// might: part of it may survive, and part of that may be zeros (Rung 4).
 	// It only matters with Restart set.
 	TearWrites bool
+	// UncheckedDisk makes Members store their files without checksums, as
+	// in Rung 3, so that Rung 4's exposure of that stays reproducible.
+	UncheckedDisk bool
 	// SnapshotEvery makes each Member take a Snapshot of its state machine
 	// whenever it has applied this many Entries since the last one, and hand
 	// it to the core (A§6.4). Zero means never.
@@ -163,7 +166,7 @@ func New(cfg Config) *Sim {
 			queries: map[uint64][]byte{},
 			fs:      storage.NewMemFS(),
 		}
-		m.store, _, _ = storage.OpenFS(m.fs, dataDir, 0) // an empty MemFS can't fail to open
+		m.store, _, _ = s.openDisk(m.fs) // an empty MemFS can't fail to open
 		s.members[id] = m
 		// Members tick out of phase with each other.
 		s.schedule(s.rng.Int64N(cfg.TickEvery), func() { s.tick(m) })
@@ -287,7 +290,7 @@ func (s *Sim) Restart(id core.NodeID) {
 		m.up = true
 		return
 	}
-	store, stored, err := storage.OpenFS(m.fs, dataDir, 0)
+	store, stored, err := s.openDisk(m.fs)
 	if err == nil && stored.Snapshot != nil {
 		machine := s.cfg.NewMachine()
 		if err = machine.Restore(stored.Snapshot.Data); err == nil {
@@ -309,6 +312,10 @@ func (s *Sim) Restart(id core.NodeID) {
 	m.core = s.cfg.Restart(id, slices.Clone(s.ids), rng, stored)
 }
 
+func (s *Sim) openDisk(fs *storage.MemFS) (*storage.Store, core.Stored, error) {
+	return storage.OpenWith(fs, dataDir, storage.Options{Unchecked: s.cfg.UncheckedDisk})
+}
+
 // StartError is why a Member's last restart failed, or nil. A Member that
 // can't read its own disk stays down.
 func (s *Sim) StartError(id core.NodeID) error { return s.members[id].startErr }
@@ -316,7 +323,7 @@ func (s *Sim) StartError(id core.NodeID) error { return s.members[id].startErr }
 // Disk is what a Member would find on its disk if it crashed now and
 // restarted. It panics if the disk can't be read.
 func (s *Sim) Disk(id core.NodeID) core.Stored {
-	_, stored, err := storage.OpenFS(s.members[id].fs.Durable(), dataDir, 0)
+	_, stored, err := s.openDisk(s.members[id].fs.Durable())
 	if err != nil {
 		panic(fmt.Sprintf("sim: node %d's disk is unreadable: %v", id, err))
 	}

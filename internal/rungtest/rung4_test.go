@@ -9,12 +9,16 @@ import (
 
 // trusting is the Rung 3 store on a disk that lies: its files have no
 // checksums, so it believes whatever it reads back.
-var trusting = rung3Store
+var trusting = func() rungtest.Store {
+	s := rung3Store
+	s.UncheckedDisk = true
+	return s
+}()
 
 // trustingTorn is the same store when a crash can leave part of a write in
 // progress on disk.
 var trustingTorn = func() rungtest.Store {
-	s := rung3Store
+	s := trusting
 	s.TearWrites = true
 	return s
 }()

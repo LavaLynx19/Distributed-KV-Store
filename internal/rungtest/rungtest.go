@@ -34,6 +34,8 @@ type Store struct {
 	// TearWrites makes a crash leave part of a write in progress on disk,
 	// possibly with zeros in it (sim.Config).
 	TearWrites bool
+	// UncheckedDisk stores files without checksums, as in Rung 3.
+	UncheckedDisk bool
 }
 
 // Scenario injects Faults into a running Simulation between times from and
@@ -124,6 +126,7 @@ func Run(store Store, sc Scenario, members int, seed uint64) Report {
 		DiskDelay:     store.DiskDelay,
 		SnapshotEvery: store.SnapshotEvery,
 		TearWrites:    store.TearWrites,
+		UncheckedDisk: store.UncheckedDisk,
 	})
 	h := &check.History{}
 	rep := Report{Scenario: sc.Name, Seed: seed, Members: members, History: h}

@@ -8,12 +8,34 @@
 //	log/<first>.seg  Log segments, named by the Index of their first Entry
 //
 // state and snapshot are replaced whole: written to a temporary file, synced,
-// and renamed over the old one. A segment is a run of records, each a 4-byte
-// length followed by one encoded Entry. A crash can leave the last record of
-// the last segment incomplete; Open drops it.
+// and renamed over the old one, and end with a CRC-32C of their contents.
 //
-// Records carry no checksum (Decision Log: "No checksums on disk until
-// Rung 4"). A record that is complete but damaged is read back as if valid.
+// A segment is a run of records. Each record is (A§5.4):
+//
+//	length    4 bytes   size of the body
+//	checksum  4 bytes   CRC-32C of the length
+//	checksum  4 bytes   CRC-32C of the body
+//	body                one encoded Entry
+//	end mark  1 byte    0xA5
+//
+// Open verifies everything. It tells two cases apart:
+//
+//   - A record that was never completely written: the file ends inside it,
+//     or zeros sit where its end should be, with nothing after. Only the last
+//     write before a crash can look like this. It was never synced, so
+//     nothing in it was acknowledged, and it is dropped.
+//   - A record that was complete and no longer matches its checksums. This
+//     is damage, and Open reports it as a *CorruptError without returning
+//     the record as data.
+//
+// The length has its own checksum because a damaged length would otherwise
+// make a record seem to run past the end of the file, and so pass for the
+// first case. The end mark is non-zero because a file can grow before its
+// data arrives, leaving zeros that a crash then makes permanent.
+//
+// Options.Unchecked selects the format Rung 3 used, with no checksums, in
+// which a complete but damaged record is read back as if valid. It exists so
+// that Rung 4's exposure of that stays reproducible.
 package storage
 
 import (
@@ -21,6 +43,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"slices"
@@ -31,6 +54,38 @@ import (
 
 // DefaultSegmentBytes is the size at which a new segment is started.
 const DefaultSegmentBytes = 4 << 20
+
+// Options adjust how a data directory is opened.
+type Options struct {
+	// SegmentBytes is the size at which a new segment is started. Zero means
+	// DefaultSegmentBytes.
+	SegmentBytes int64
+	// Unchecked reads and writes the Rung 3 format, with no checksums.
+	Unchecked bool
+}
+
+// CorruptError reports stored data that doesn't match its checksum, or that
+// can't be what the Store wrote.
+type CorruptError struct {
+	Path   string
+	Offset int64
+	Detail string
+}
+
+func (e *CorruptError) Error() string {
+	return fmt.Sprintf("storage: %s is damaged at byte %d: %s", e.Path, e.Offset, e.Detail)
+}
+
+var castagnoli = crc32.MakeTable(crc32.Castagnoli)
+
+// sum is the CRC-32C of the parts, as if they were one run of bytes.
+func sum(parts ...[]byte) uint32 {
+	var c uint32
+	for _, p := range parts {
+		c = crc32.Update(c, castagnoli, p)
+	}
+	return c
+}
 
 // position is where an Entry's record starts.
 type position struct {
@@ -43,6 +98,7 @@ type Store struct {
 	fs           FS
 	dir          string
 	segmentBytes int64
+	checked      bool
 
 	snapshotTerm core.Term // Term the Snapshot ends on, read at Open
 
@@ -62,30 +118,46 @@ type Store struct {
 // it if needed, and returns what it holds. segmentBytes of 0 means
 // DefaultSegmentBytes.
 func Open(dir string, segmentBytes int64) (*Store, core.Stored, error) {
-	return OpenFS(OSFS{}, dir, segmentBytes)
+	return OpenWith(OSFS{}, dir, Options{SegmentBytes: segmentBytes})
 }
 
 // OpenFS is Open on any filesystem.
 func OpenFS(fs FS, dir string, segmentBytes int64) (*Store, core.Stored, error) {
-	if segmentBytes == 0 {
-		segmentBytes = DefaultSegmentBytes
+	return OpenWith(fs, dir, Options{SegmentBytes: segmentBytes})
+}
+
+// OpenWith is Open on any filesystem, with Options.
+func OpenWith(fs FS, dir string, opts Options) (*Store, core.Stored, error) {
+	if opts.SegmentBytes == 0 {
+		opts.SegmentBytes = DefaultSegmentBytes
 	}
 	if err := fs.MkdirAll(filepath.Join(dir, "log")); err != nil {
 		return nil, core.Stored{}, fmt.Errorf("storage: %w", err)
 	}
-	s := &Store{fs: fs, dir: dir, segmentBytes: segmentBytes, first: 1}
+	s := &Store{fs: fs, dir: dir, segmentBytes: opts.SegmentBytes, checked: !opts.Unchecked, first: 1}
 	var stored core.Stored
 
-	if raw, err := fs.ReadFile(filepath.Join(dir, "state")); err == nil && len(raw) == 16 {
+	raw, err := s.readWhole("state")
+	if err != nil {
+		return nil, core.Stored{}, err
+	}
+	if raw != nil {
+		if len(raw) != 16 {
+			return nil, core.Stored{}, &CorruptError{Path: filepath.Join(dir, "state"), Detail: "wrong size"}
+		}
 		stored.HardState = core.HardState{
 			Term:     core.Term(binary.BigEndian.Uint64(raw[:8])),
 			VotedFor: core.NodeID(binary.BigEndian.Uint64(raw[8:])),
 		}
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, core.Stored{}, fmt.Errorf("storage: %w", err)
 	}
 
-	if raw, err := fs.ReadFile(filepath.Join(dir, "snapshot")); err == nil && len(raw) >= 16 {
+	if raw, err = s.readWhole("snapshot"); err != nil {
+		return nil, core.Stored{}, err
+	}
+	if raw != nil {
+		if len(raw) < 16 {
+			return nil, core.Stored{}, &CorruptError{Path: filepath.Join(dir, "snapshot"), Detail: "too short"}
+		}
 		stored.Snapshot = &core.Snapshot{
 			Index: core.Index(binary.BigEndian.Uint64(raw[:8])),
 			Term:  core.Term(binary.BigEndian.Uint64(raw[8:16])),
@@ -93,8 +165,6 @@ func OpenFS(fs FS, dir string, segmentBytes int64) (*Store, core.Stored, error) 
 		}
 		s.first = stored.Snapshot.Index + 1
 		s.snapshotTerm = stored.Snapshot.Term
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, core.Stored{}, fmt.Errorf("storage: %w", err)
 	}
 
 	entries, err := s.load()
@@ -103,6 +173,30 @@ func OpenFS(fs FS, dir string, segmentBytes int64) (*Store, core.Stored, error) 
 	}
 	stored.Entries = entries
 	return s, stored, nil
+}
+
+// readWhole returns the contents of a file that is replaced whole, with its
+// checksum verified and removed, or nil if the file doesn't exist.
+func (s *Store) readWhole(name string) ([]byte, error) {
+	path := filepath.Join(s.dir, name)
+	raw, err := s.fs.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("storage: %w", err)
+	}
+	if !s.checked {
+		return raw, nil
+	}
+	if len(raw) < 4 {
+		return nil, &CorruptError{Path: path, Detail: "too short to hold a checksum"}
+	}
+	body, want := raw[:len(raw)-4], binary.BigEndian.Uint32(raw[len(raw)-4:])
+	if sum(body) != want {
+		return nil, &CorruptError{Path: path, Detail: "checksum mismatch"}
+	}
+	return body, nil
 }
 
 // segments lists the first Index of every segment file, in order.
@@ -145,7 +239,12 @@ func (s *Store) load() ([]core.Entry, error) {
 		}
 		var offset int64
 		for offset < int64(len(raw)) {
-			e, size, err := readRecord(raw[offset:])
+			e, size, err := readRecord(raw[offset:], s.checked)
+			if errors.Is(err, errChecksum) || (errors.Is(err, errShort) && s.checked && i < len(firsts)-1) {
+				// Damage, or an incomplete record that isn't the last
+				// thing in the Log, which no crash can produce.
+				return nil, &CorruptError{Path: s.segmentPath(first), Offset: offset, Detail: err.Error()}
+			}
 			if errors.Is(err, errShort) && i == len(firsts)-1 {
 				// A crash cut the last write short. Nothing after it can
 				// have been acknowledged, so it is dropped.
@@ -315,6 +414,9 @@ func (s *Store) replaceFile(name string, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("storage: %w", err)
 	}
+	if s.checked {
+		data = binary.BigEndian.AppendUint32(slices.Clone(data), sum(data))
+	}
 	if _, err := f.Write(data); err != nil {
 		f.Close()
 		return fmt.Errorf("storage: %w", err)
@@ -348,7 +450,7 @@ func (s *Store) append(e core.Entry) error {
 		}
 		s.dirtyDir = true
 	}
-	record := encodeRecord(e)
+	record := encodeRecord(e, s.checked)
 	if _, err := s.out.Write(record); err != nil {
 		return fmt.Errorf("storage: %w", err)
 	}
@@ -435,44 +537,106 @@ func (s *Store) dropThrough(index core.Index, all bool) error {
 	return nil
 }
 
-// encodeRecord lays an Entry out as: a 4-byte length, then Index and Term as
-// unsigned varints, the kind, and the payload.
-func encodeRecord(e core.Entry) []byte {
+// endMark closes every checked record. It is non-zero on purpose.
+const endMark = 0xA5
+
+// encodeRecord lays an Entry out as a record. The body is Index and Term as
+// unsigned varints, the kind, and the payload. A checked record wraps it as
+// the package comment describes; an unchecked one is just length and body.
+func encodeRecord(e core.Entry, checked bool) []byte {
 	body := make([]byte, 0, 2*binary.MaxVarintLen64+1+len(e.Payload))
 	body = binary.AppendUvarint(body, uint64(e.Index))
 	body = binary.AppendUvarint(body, uint64(e.Term))
 	body = append(body, byte(e.Kind))
 	body = append(body, e.Payload...)
-	record := make([]byte, 4, 4+len(body))
+	record := make([]byte, 4, 13+len(body))
 	binary.BigEndian.PutUint32(record, uint32(len(body)))
-	return append(record, body...)
+	if !checked {
+		return append(record, body...)
+	}
+	record = binary.BigEndian.AppendUint32(record, sum(record[:4]))
+	record = binary.BigEndian.AppendUint32(record, sum(body))
+	record = append(record, body...)
+	return append(record, endMark)
 }
 
-// errShort means a record is incomplete: the file ends before it does.
-var errShort = errors.New("record cut short")
+var (
+	// errShort means a record was never completely written: the file ends
+	// inside it, or it trails off into zeros.
+	errShort = errors.New("record cut short")
+	// errChecksum means a record is all there but doesn't match its checksum.
+	errChecksum = errors.New("checksum mismatch")
+)
 
-// readRecord decodes the record at the start of b and reports how many bytes
-// it took. It returns errShort if b ends part way through the record.
-func readRecord(b []byte) (core.Entry, int64, error) {
-	if len(b) < 4 {
+func allZero(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// readRecord decodes the record at the start of b, which runs to the end of
+// its segment, and reports how many bytes the record took. It returns
+// errShort for a record that was never completely written, and errChecksum
+// for one that was complete and is now damaged.
+func readRecord(b []byte, checked bool) (core.Entry, int64, error) {
+	if !checked {
+		if len(b) < 4 || len(b)-4 < int(binary.BigEndian.Uint32(b)) {
+			return core.Entry{}, 0, errShort
+		}
+		n := int(binary.BigEndian.Uint32(b))
+		e, err := decodeBody(b[4 : 4+n])
+		return e, int64(4 + n), err
+	}
+
+	const head = 12
+	if len(b) < head {
+		// Fewer bytes than a header. The record before this one checked
+		// out, so this is where a record starts, and no complete record is
+		// this small: it was never finished.
 		return core.Entry{}, 0, errShort
+	}
+	if sum(b[:4]) != binary.BigEndian.Uint32(b[4:8]) {
+		// The length can't be trusted, so neither can where the record
+		// ends. If nothing but zeros follows the first few bytes, the write
+		// stopped inside the header. A complete record always has non-zero
+		// bytes further on, its end mark at the least.
+		if allZero(b[8:]) {
+			return core.Entry{}, 0, errShort
+		}
+		return core.Entry{}, 0, errChecksum
 	}
 	n := int(binary.BigEndian.Uint32(b))
-	if len(b)-4 < n {
-		return core.Entry{}, 0, errShort
+	if len(b)-head < n+1 {
+		return core.Entry{}, 0, errShort // the length is sound and the file ends first
 	}
-	body := b[4 : 4+n]
+	body, mark := b[head:head+n], b[head+n]
+	if sum(body) != binary.BigEndian.Uint32(b[8:12]) || mark != endMark {
+		// A record whose end never arrived has zeros there, and nothing
+		// after it. One that was complete has its end mark.
+		if mark == 0 && allZero(b[head+n:]) {
+			return core.Entry{}, 0, errShort
+		}
+		return core.Entry{}, 0, errChecksum
+	}
+	e, err := decodeBody(body)
+	return e, int64(head + n + 1), err
+}
+
+func decodeBody(body []byte) (core.Entry, error) {
 	index, i := binary.Uvarint(body)
 	if i <= 0 {
-		return core.Entry{}, 0, errors.New("unreadable record")
+		return core.Entry{}, errors.New("unreadable record")
 	}
 	term, j := binary.Uvarint(body[i:])
 	if j <= 0 || i+j >= len(body) {
-		return core.Entry{}, 0, errors.New("unreadable record")
+		return core.Entry{}, errors.New("unreadable record")
 	}
 	e := core.Entry{Index: core.Index(index), Term: core.Term(term), Kind: core.EntryKind(body[i+j])}
 	if payload := body[i+j+1:]; len(payload) > 0 {
 		e.Payload = slices.Clone(payload)
 	}
-	return e, int64(4 + n), nil
+	return e, nil
 }
