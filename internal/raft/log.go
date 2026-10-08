@@ -44,5 +44,13 @@ func (l *raftLog) append(e core.Entry) {
 	l.entries = append(l.entries, e)
 }
 
+// compactTo drops the Entries up to and including i, which a Snapshot now
+// stands in for.
+func (l *raftLog) compactTo(i core.Index) {
+	term := l.term(i)
+	l.entries = slices.Clone(l.entries[i-l.base:])
+	l.base, l.baseTerm = i, term
+}
+
 // truncateFrom drops the Entry at i and everything after it.
 func (l *raftLog) truncateFrom(i core.Index) { l.entries = l.entries[:i-l.base-1] }

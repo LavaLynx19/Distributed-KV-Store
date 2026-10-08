@@ -12,10 +12,13 @@ import (
 )
 
 // Machine is the state machine Committed Entries are applied to. Read
-// answers a query from its current state without an Entry.
+// answers a query from its current state without an Entry. Capture returns a
+// function that encodes the state as it was when Capture was called; that
+// function may run on another goroutine while the Machine carries on.
 type Machine interface {
 	Apply(core.Entry) []byte
 	Read(query []byte) []byte
+	Capture() func() []byte
 }
 
 // Reply is the outcome of one proposal.
@@ -49,6 +52,14 @@ type Node struct {
 	// Storage, if set before Run, receives every Persist. Without it the
 	// Member keeps nothing across a restart.
 	Storage Storage
+	// SnapshotEvery, if set before Run, takes a Snapshot of the state machine
+	// whenever this many Entries have been applied since the last one, so
+	// the core can trim its Log (A§6.4). Zero means never.
+	SnapshotEvery int
+	// Restored is the Index of the Snapshot the state machine was restored
+	// from before Run, or 0.
+	Restored  core.Index
+	snapshots chan core.Snapshotted
 
 	inbox     chan core.Message
 	proposals chan proposal
@@ -65,6 +76,7 @@ func NewNode(c core.Node, m Machine, send func(core.Message), tick time.Duration
 		proposals: make(chan proposal, maxBatch),
 		statusReq: make(chan chan core.Status),
 		inspect:   make(chan func(Machine)),
+		snapshots: make(chan core.Snapshotted, 1),
 	}
 }
 
@@ -95,6 +107,8 @@ func (n *Node) Run(ctx context.Context) {
 	queries := map[uint64][]byte{}
 	var nextRef uint64
 	var outs []core.Output
+	applied, snapshotAt := n.Restored, n.Restored
+	encoding := false // a Snapshot is being encoded on another goroutine
 
 	admit := func(p proposal) {
 		nextRef++
@@ -111,6 +125,7 @@ func (n *Node) Run(ctx context.Context) {
 		responses := make(map[core.Index][]byte, len(out.Committed))
 		for _, e := range out.Committed {
 			responses[e.Index] = n.machine.Apply(e)
+			applied = e.Index
 		}
 		for _, r := range out.Results {
 			if done, ok := pending[r.Ref]; ok {
@@ -158,6 +173,15 @@ func (n *Node) Run(ctx context.Context) {
 			act(out)
 		}
 		outs = outs[:0]
+
+		// Capturing is instant: it keeps the tree's roots. Encoding is the
+		// slow part, and happens off this goroutine while the core carries
+		// on (A§6.4).
+		if n.SnapshotEvery > 0 && !encoding && int(applied-snapshotAt) >= n.SnapshotEvery {
+			encoding = true
+			index, capture := applied, n.machine.Capture()
+			go func() { n.snapshots <- core.Snapshotted{Index: index, Data: capture()} }()
+		}
 	}
 
 	for {
@@ -177,6 +201,10 @@ func (n *Node) Run(ctx context.Context) {
 			reply <- n.core.Status()
 		case fn := <-n.inspect:
 			fn(n.machine)
+		case snap := <-n.snapshots:
+			encoding = false
+			snapshotAt = snap.Index
+			outs = append(outs, n.core.Step(snap))
 		}
 	drain:
 		for len(outs) > 0 && len(outs) < maxBatch {

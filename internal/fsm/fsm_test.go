@@ -203,3 +203,43 @@ func TestNoSessionAppliesEveryCopy(t *testing.T) {
 		t.Fatalf("got %+v", rs)
 	}
 }
+
+func TestCaptureAndRestore(t *testing.T) {
+	m := New()
+	run(t, m, Command{Op: OpOpenSession}, inSession(put("b", "2"), 1, 1), put("a", "1"), put("empty", ""), del("a"), put("c", "3"))
+	capture := m.Capture()
+
+	// The Machine moves on; the capture must not.
+	m.Apply(core.Entry{Index: 7, Kind: core.EntryCommand, Payload: put("b", "changed").Encode()})
+	m.Apply(core.Entry{Index: 8, Kind: core.EntryCommand, Payload: inSession(put("d", "4"), 1, 2).Encode()})
+
+	restored := New()
+	if err := restored.Restore(capture()); err != nil {
+		t.Fatal(err)
+	}
+	want := []Item{{Key: "b", Value: []byte("2"), Version: 2}, {Key: "c", Value: []byte("3"), Version: 6}, {Key: "empty", Version: 4}}
+	if got := restored.Items(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("restored keys = %+v\nwant %+v", got, want)
+	}
+	// Sessions come back too: a retry of request 1 is still recognised.
+	retry, _ := DecodeResponse(restored.Apply(core.Entry{Index: 9, Kind: core.EntryCommand, Payload: inSession(put("b", "again"), 1, 1).Encode()}))
+	if retry.Status != StatusOK || retry.Version != 2 {
+		t.Fatalf("after Restore a retry was answered %+v, want the saved answer (ok, version 2)", retry)
+	}
+	if got := restored.Items(); string(got[0].Value) != "2" {
+		t.Fatalf("after Restore a retry was applied again: %+v", got[0])
+	}
+
+	// Two Machines with the same state encode it identically.
+	other := New()
+	run(t, other, Command{Op: OpOpenSession}, inSession(put("b", "2"), 1, 1), put("a", "1"), put("empty", ""), del("a"), put("c", "3"))
+	if !reflect.DeepEqual(other.Capture()(), capture()) {
+		t.Fatal("the same state encoded differently")
+	}
+
+	for _, bad := range [][]byte{nil, {5}, capture()[:10], append(capture(), 0)} {
+		if err := New().Restore(bad); err == nil {
+			t.Errorf("Restore accepted %d malformed bytes", len(bad))
+		}
+	}
+}

@@ -28,12 +28,19 @@ type durable struct {
 	peers   map[core.NodeID]string
 	clients map[core.NodeID]string
 	stops   map[core.NodeID]func()
+	// snapshotEvery is passed to each Member started from now on.
+	snapshotEvery int
 }
 
 func newDurable(t *testing.T, n int) *durable {
 	t.Helper()
+	return newDurableSnapshotting(t, n, 0)
+}
+
+func newDurableSnapshotting(t *testing.T, n, snapshotEvery int) *durable {
+	t.Helper()
 	transport.Register(raft.MessageBodies()...)
-	d := &durable{t: t, dir: t.TempDir(), peers: map[core.NodeID]string{}, clients: map[core.NodeID]string{}, stops: map[core.NodeID]func(){}}
+	d := &durable{t: t, dir: t.TempDir(), snapshotEvery: snapshotEvery, peers: map[core.NodeID]string{}, clients: map[core.NodeID]string{}, stops: map[core.NodeID]func(){}}
 	for i := 1; i <= n; i++ {
 		id := core.NodeID(i)
 		d.ids = append(d.ids, id)
@@ -72,8 +79,16 @@ func (d *durable) start(id core.NodeID) {
 	tr := transport.New(id, ln, d.peers, func(m core.Message) { node.Deliver(m) })
 	c := raft.New(raft.Config{ID: id, Members: d.ids, ElectionTicks: 10, HeartbeatTicks: 1,
 		Rand: rand.New(rand.NewPCG(uint64(id), uint64(time.Now().UnixNano()))), Reads: raft.ReadsByIndex, Stored: stored})
-	node = server.NewNode(c, fsm.New(), tr.Send, 5*time.Millisecond)
+	machine := fsm.New()
+	node = server.NewNode(c, machine, tr.Send, 5*time.Millisecond)
 	node.Storage = store
+	node.SnapshotEvery = d.snapshotEvery
+	if snap := stored.Snapshot; snap != nil {
+		if err := machine.Restore(snap.Data); err != nil {
+			d.t.Fatal(err)
+		}
+		node.Restored = snap.Index
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { node.Run(ctx); close(done) }()
@@ -197,5 +212,42 @@ func TestRestartedMemberCatchesUp(t *testing.T) {
 			t.Fatal("the restarted Member didn't catch up within 5s")
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// With Snapshots trimming the Log, a full restart rebuilds each Member from
+// its Snapshot plus the Entries after it.
+func TestFullRestartFromSnapshots(t *testing.T) {
+	d := newDurableSnapshotting(t, 3, 25)
+	leader := d.leader()
+	for i := range 120 {
+		key := "k" + strconv.Itoa(i%30)
+		if a := call(t, "PUT", leader+"/v1/kv/"+key, `{"value":"v`+strconv.Itoa(i)+`"}`); a.code != 200 {
+			t.Fatalf("put %d: %+v", i, a)
+		}
+	}
+	for _, id := range d.ids {
+		d.stop(id)
+	}
+	// Every Member took Snapshots, and its Log no longer starts at Entry 1.
+	for _, id := range d.ids {
+		store, stored, err := storage.Open(filepath.Join(d.dir, "node"+strconv.Itoa(int(id))), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store.Close()
+		if stored.Snapshot == nil || stored.Snapshot.Index < 100 || len(stored.Entries) > 40 {
+			t.Fatalf("node %d: Snapshot %+v with %d Entries after it; want a Snapshot past Entry 100 and a short Log", id, stored.Snapshot != nil, len(stored.Entries))
+		}
+	}
+	for _, id := range d.ids {
+		d.start(id)
+	}
+	leader = d.leader()
+	for i := 90; i < 120; i++ {
+		key := "k" + strconv.Itoa(i%30)
+		if a := call(t, "GET", leader+"/v1/kv/"+key, ""); a.code != 200 || a.body["value"] != "v"+strconv.Itoa(i) {
+			t.Fatalf("after restarting from Snapshots, %s: %+v", key, a)
+		}
 	}
 }

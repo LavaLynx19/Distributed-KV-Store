@@ -137,8 +137,8 @@ type Message struct {
 	Body any
 }
 
-// Event is one input to a core. The events are Tick, Receive, Propose and
-// Read.
+// Event is one input to a core. The events are Tick, Receive, Propose, Read
+// and Snapshotted.
 type Event interface{ event() }
 
 // Tick tells the core that one unit of time has passed. Timeouts are counted
@@ -163,10 +163,20 @@ type Read struct {
 	Ref uint64
 }
 
-func (Tick) event()    {}
-func (Receive) event() {}
-func (Propose) event() {}
-func (Read) event()    {}
+// Snapshotted hands the core a Snapshot the shell has taken of the state
+// machine: its contents after applying the Entry at Index, which the core
+// handed over as Committed earlier. The core may then drop its Log up to
+// Index (A§6.4).
+type Snapshotted struct {
+	Index Index
+	Data  []byte
+}
+
+func (Tick) event()        {}
+func (Receive) event()     {}
+func (Propose) event()     {}
+func (Read) event()        {}
+func (Snapshotted) event() {}
 
 // Reason says why a proposal did not commit.
 type Reason uint8

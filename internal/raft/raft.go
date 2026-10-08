@@ -88,6 +88,10 @@ type Config struct {
 	// Stored is the Member's durable state from before a restart. The zero
 	// value is a Member starting for the first time.
 	Stored core.Stored
+	// NoSnapshotTransfer stops a Leader sending its Snapshot to a follower
+	// that needs Entries the Log no longer holds. It exists so that Rung 3's
+	// exposure of a Member that can't catch up stays reproducible.
+	NoSnapshotTransfer bool
 	// Volatile makes the Member store nothing, as before Rung 3. It exists so
 	// that Rung 3's exposure of a store with no disk stays reproducible.
 	Volatile bool
@@ -107,9 +111,12 @@ type Node struct {
 	role     core.Role
 	leader   core.NodeID
 
-	log     raftLog
-	commit  core.Index
-	applied core.Index // last Index handed to the shell in Output.Committed
+	log raftLog
+	// snapshot is the latest Snapshot, kept to send to Members that need
+	// Entries the Log no longer holds. Nil until one is taken or installed.
+	snapshot *core.Snapshot
+	commit   core.Index
+	applied  core.Index // last Index handed to the shell in Output.Committed
 
 	now     int // ticks since start
 	elapsed int // ticks since a Leader was heard from, or the election began
@@ -143,6 +150,7 @@ func New(cfg Config) *Node {
 	n := &Node{id: cfg.ID, members: members, cfg: cfg, pending: map[core.Index]uint64{}}
 	n.term, n.votedFor = cfg.Stored.HardState.Term, cfg.Stored.HardState.VotedFor
 	if snap := cfg.Stored.Snapshot; snap != nil {
+		n.snapshot = snap
 		n.log.base, n.log.baseTerm = snap.Index, snap.Term
 		n.commit, n.applied = snap.Index, snap.Index
 	}
@@ -199,6 +207,8 @@ func (n *Node) Step(ev core.Event) core.Output {
 		n.propose(&out, ev)
 	case core.Read:
 		n.read(&out, ev)
+	case core.Snapshotted:
+		n.snapshotted(&out, ev)
 	}
 	n.deliverCommitted(&out)
 	n.releaseReads(&out)
@@ -348,6 +358,18 @@ func (n *Node) propose(out *core.Output, p core.Propose) {
 		}
 	}
 	n.advanceCommit()
+}
+
+// snapshotted takes a Snapshot from the shell and drops the Log it covers
+// (A§6.4). The Snapshot is stored before the Entries are gone for good.
+func (n *Node) snapshotted(out *core.Output, s core.Snapshotted) {
+	if s.Index <= n.log.base || s.Index > n.applied {
+		return // older than what we have, or of Entries never handed over
+	}
+	snap := &core.Snapshot{Index: s.Index, Term: n.termAt(s.Index), Data: s.Data}
+	n.log.compactTo(s.Index)
+	n.snapshot = snap
+	persist(out).Snapshot = snap
 }
 
 // read rules on a read that bypasses the Log.

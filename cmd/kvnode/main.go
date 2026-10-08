@@ -42,6 +42,7 @@ func main() {
 	heartbeatTicks := flag.Int("heartbeat-ticks", 1, "ticks between a Leader's heartbeats")
 	timeout := flag.Duration("request-timeout", 5*time.Second, "how long a client request waits to commit")
 	data := flag.String("data", "", "directory for this Node's durable state; empty keeps nothing across a restart")
+	snapshotEvery := flag.Int("snapshot-every", 20000, "take a Snapshot and trim the Log after this many applied Entries (0 never)")
 	reads := flag.String("reads", "index", "how gets are answered: index (read index, A§6.2) or log (as Log Entries)")
 	flag.Parse()
 
@@ -54,12 +55,12 @@ func main() {
 	default:
 		log.Fatalf("kvnode: -reads must be index or log, not %q", *reads)
 	}
-	if err := run(core.NodeID(*id), *peersFlag, *clientsFlag, *listenPeer, *listenClient, *tick, *electionTicks, *heartbeatTicks, *timeout, mode, *data); err != nil {
+	if err := run(core.NodeID(*id), *peersFlag, *clientsFlag, *listenPeer, *listenClient, *tick, *electionTicks, *heartbeatTicks, *timeout, mode, *data, *snapshotEvery); err != nil {
 		log.Fatalf("kvnode: %v", err)
 	}
 }
 
-func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string, tick time.Duration, electionTicks, heartbeatTicks int, timeout time.Duration, reads raft.ReadMode, data string) error {
+func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string, tick time.Duration, electionTicks, heartbeatTicks int, timeout time.Duration, reads raft.ReadMode, data string, snapshotEvery int) error {
 	peers, err := parseAddrs(peersFlag)
 	if err != nil {
 		return fmt.Errorf("-peers: %w", err)
@@ -108,9 +109,17 @@ func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string
 		Reads:  reads,
 		Stored: stored,
 	})
-	node = server.NewNode(c, fsm.New(), tr.Send, tick)
+	machine := fsm.New()
+	node = server.NewNode(c, machine, tr.Send, tick)
+	node.SnapshotEvery = snapshotEvery
 	if store != nil {
 		node.Storage = store
+	}
+	if snap := stored.Snapshot; snap != nil {
+		if err := machine.Restore(snap.Data); err != nil {
+			return fmt.Errorf("restoring the Snapshot at Entry %d: %w", snap.Index, err)
+		}
+		node.Restored = snap.Index
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

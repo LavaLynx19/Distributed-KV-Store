@@ -550,3 +550,48 @@ func TestCandidateAndLeaderStoreBeforeSending(t *testing.T) {
 		t.Fatalf("a proposal must be stored with the Append that carries it, got %+v", out.Persist)
 	}
 }
+
+// A Snapshot lets the core drop the Log it covers. The Snapshot is stored in
+// the same Output, and everything after it still works.
+func TestSnapshotTrimsTheLog(t *testing.T) {
+	n := newNode(1, 3)
+	recv(n, 2, Append{Term: 1, Entries: entries(1, 1, 1, 1, 1), Commit: 4})
+
+	// A Snapshot of Entries the shell was never given is ignored.
+	if out := n.Step(core.Snapshotted{Index: 5, Data: []byte("x")}); out.Persist != nil || n.log.base != 0 {
+		t.Fatal("accepted a Snapshot beyond what was handed over as Committed")
+	}
+	out := n.Step(core.Snapshotted{Index: 3, Data: []byte("state at 3")})
+	if p := out.Persist; p == nil || p.Snapshot == nil || p.Snapshot.Index != 3 || p.Snapshot.Term != 1 || string(p.Snapshot.Data) != "state at 3" {
+		t.Fatalf("the Snapshot must be stored, got %+v", out.Persist)
+	}
+	if n.log.base != 3 || len(n.log.entries) != 2 || n.lastIndex() != 5 {
+		t.Fatalf("Log after the Snapshot: base %d, %d Entries, last %d; want 3, 2, 5", n.log.base, len(n.log.entries), n.lastIndex())
+	}
+	// An older Snapshot changes nothing.
+	if out := n.Step(core.Snapshotted{Index: 2}); out.Persist != nil {
+		t.Fatal("accepted a Snapshot older than the one held")
+	}
+
+	// Appends continue normally past the Snapshot.
+	r := reply[AppendReply](t, recv(n, 2, Append{Term: 1, PrevIndex: 5, PrevTerm: 1, Entries: []core.Entry{{Index: 6, Term: 1}}, Commit: 6}))
+	if !r.Success || r.Match != 6 {
+		t.Fatalf("append after the Snapshot: %+v", r)
+	}
+	// A late Append that starts inside the Snapshot is accepted for the part
+	// that isn't covered.
+	r = reply[AppendReply](t, recv(n, 2, Append{Term: 1, PrevIndex: 1, PrevTerm: 1, Entries: []core.Entry{{Index: 2, Term: 1}, {Index: 3, Term: 1}}}))
+	if !r.Success || r.Match != 3 {
+		t.Fatalf("an Append wholly inside the Snapshot: %+v, want success at the Snapshot's edge", r)
+	}
+	if n.lastIndex() != 6 {
+		t.Fatalf("a stale Append changed the Log: last %d", n.lastIndex())
+	}
+
+	// And the Member restarts from the Snapshot plus what follows it.
+	again := restarted(n, core.Output{Persist: &core.Persist{HardState: &core.HardState{Term: 1}, Entries: entries(1, 1, 1, 1, 1)}}, out,
+		core.Output{Persist: &core.Persist{Entries: []core.Entry{{Index: 6, Term: 1}}}})
+	if again.log.base != 3 || again.lastIndex() != 6 || again.commit != 3 || again.applied != 3 {
+		t.Fatalf("after restart: base %d, last %d, commit %d, applied %d; want 3, 6, 3, 3", again.log.base, again.lastIndex(), again.commit, again.applied)
+	}
+}

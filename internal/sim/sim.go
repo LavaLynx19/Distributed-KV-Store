@@ -6,6 +6,7 @@ package sim
 
 import (
 	"container/heap"
+	"fmt"
 	"hash/fnv"
 	"math/rand/v2"
 	"slices"
@@ -15,10 +16,14 @@ import (
 
 // Machine is the state machine a Member applies Committed Entries to. Apply
 // returns the response for the client that proposed the Entry. Read answers
-// a query from the current state without an Entry.
+// a query from the current state without an Entry. Capture returns a function
+// that encodes the state as it was when Capture was called, and Restore
+// replaces the state with an encoded one.
 type Machine interface {
 	Apply(core.Entry) []byte
 	Read(query []byte) []byte
+	Capture() func() []byte
+	Restore(data []byte) error
 }
 
 // Config describes one simulated Group.
@@ -39,6 +44,10 @@ type Config struct {
 	// DiskDelay is how long a write takes to become durable: DiskDelay[0] to
 	// DiskDelay[1] units. Zero means at once.
 	DiskDelay [2]int64
+	// SnapshotEvery makes each Member take a Snapshot of its state machine
+	// whenever it has applied this many Entries since the last one, and hand
+	// it to the core (A§6.4). Zero means never.
+	SnapshotEvery int
 
 	// Copy, if set, stands in for the network's encoding: every message is
 	// passed through it on the way, so Members never share memory.
@@ -79,6 +88,9 @@ type member struct {
 	inbox        []core.Event
 	life         int   // counts crashes, so a write from a past life is ignored
 	stalledUntil int64 // writes don't complete before this time
+
+	applied    core.Index // the last Entry applied to machine
+	snapshotAt core.Index // the Entry the last Snapshot was taken at
 }
 
 // Sim is one simulated Group. It is not safe for concurrent use: everything
@@ -244,6 +256,13 @@ func (s *Sim) Restart(id core.NodeID) {
 		rng := rand.New(rand.NewPCG(s.cfg.Seed, uint64(id)+uint64(m.life)<<32))
 		m.core = s.cfg.Restart(id, slices.Clone(s.ids), rng, m.disk.Clone())
 		m.machine = s.cfg.NewMachine()
+		m.applied, m.snapshotAt = 0, 0
+		if snap := m.disk.Snapshot; snap != nil {
+			if err := m.machine.Restore(snap.Data); err != nil {
+				panic(fmt.Sprintf("sim: node %d can't restore its Snapshot: %v", id, err))
+			}
+			m.applied, m.snapshotAt = snap.Index, snap.Index
+		}
 	}
 }
 
@@ -388,6 +407,7 @@ func (s *Sim) finish(m *member, out core.Output) {
 	responses := make(map[core.Index][]byte, len(out.Committed))
 	for _, e := range out.Committed {
 		responses[e.Index] = m.machine.Apply(e)
+		m.applied = e.Index
 	}
 	for _, r := range out.Results {
 		done, ok := m.pending[r.Ref]
@@ -412,6 +432,11 @@ func (s *Sim) finish(m *member, out core.Output) {
 	}
 	for _, msg := range out.Messages {
 		s.send(msg)
+	}
+	if n := s.cfg.SnapshotEvery; n > 0 && int(m.applied-m.snapshotAt) >= n {
+		m.snapshotAt = m.applied
+		s.mix('N', uint64(m.id), uint64(m.applied))
+		s.step(m, core.Snapshotted{Index: m.applied, Data: m.machine.Capture()()})
 	}
 }
 

@@ -48,6 +48,8 @@ type echo struct{ applied int }
 
 func (e *echo) Apply(en core.Entry) []byte { e.applied++; return en.Payload }
 func (e *echo) Read(query []byte) []byte   { return query }
+func (e *echo) Capture() func() []byte     { return func() []byte { return nil } }
+func (e *echo) Restore([]byte) error       { return nil }
 
 func newRelaySim(seed uint64, n int) (*Sim, map[core.NodeID]*relay) {
 	relays := map[core.NodeID]*relay{}

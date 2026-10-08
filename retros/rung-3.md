@@ -37,3 +37,28 @@ Nothing is ever removed from the Log. In Rung 2's 10-second real runs a Group wr
 ```
 go test -run 'TestForget' -v ./internal/rungtest/
 ```
+
+## Exposed, part two: a trimmed Log strands whoever fell behind (P3.6)
+
+Snapshots fix the endless Log: each Member captures its state machine every so many Entries and drops the Log up to that point. That creates a new failure, which the plan listed third. A Member that was away needs Entries the Leader no longer has.
+
+100 seeds per cell. The store takes a Snapshot every 20 Entries and has no way to send one to another Member (`raft.Config.NoSnapshotTransfer`).
+
+| Scenario | Members | Failed | Not Linearizable | Members diverged |
+|---|---|---|---|---|
+| No Faults; messy network only; every Member restarts at once | 3 / 5 | 0 / 0 | 0 / 0 | 0 / 0 |
+| Leader isolated | 3 / 5 | 99 / 100 | 0 / 0 | 99 / 100 |
+| Leader crashes and returns | 3 / 5 | 99 / 100 | 0 / 0 | 99 / 100 |
+| Leader deaf | 3 / 5 | 99 / 100 | 0 / 0 | 99 / 100 |
+| Members restart one at a time | 3 / 5 | 99 / 100 | 0 / 0 | 99 / 100 |
+| Random crashes and Partitions | 3 / 5 | 98 / 100 | 0 / 0 | 98 / 100 |
+| Everything at once | 3 / 5 | 74 / 86 | 0 / 0 | 74 / 86 |
+
+- **Not one History failed.** A Majority carries on without the stranded Member, and clients see nothing wrong. The store is one more failure away from losing its Majority, and nothing a client can observe says so.
+- Every Member restarting at once strands nobody, because nobody is ahead of anybody else.
+- This is the mirror image of Rung 2, where only the History caught the failures and the End-state comparison saw nothing.
+
+### Reproduce
+```
+go test -run 'TestTrimmedLogStrandsAMember' -v ./internal/rungtest/
+```

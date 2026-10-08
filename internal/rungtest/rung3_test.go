@@ -77,6 +77,46 @@ func TestForgettingIsExposed(t *testing.T) {
 	}
 }
 
+// stranding takes Snapshots and trims its Log, but a Leader has no way to
+// send a Snapshot to a Member that needs what was trimmed.
+var stranding = func() rungtest.Store {
+	s := rung3Store
+	s.SnapshotEvery = 20
+	build := func(id core.NodeID, members []core.NodeID, rng core.Rand, stored core.Stored) core.Node {
+		cfg := raftConfig(id, members, rng, raft.ReadsByIndex)
+		cfg.Stored, cfg.NoSnapshotTransfer = stored, true
+		return raft.New(cfg)
+	}
+	s.NewNode = func(id core.NodeID, members []core.NodeID, rng core.Rand) core.Node {
+		return build(id, members, rng, core.Stored{})
+	}
+	s.Restart = build
+	return s
+}()
+
+// Rung 3, "Exposed", part two: once the Log is trimmed, a Member that was
+// away can't be brought up to date. The History stays Linearizable, since a
+// Majority carries on without it. Only the End-state comparison notices.
+func TestTrimmedLogStrandsAMember(t *testing.T) {
+	for _, tt := range []struct {
+		scenario string
+		members  int
+	}{{"isolate-leader", 3}, {"crash-leader", 5}, {"rolling-crashes", 3}} {
+		r := rungtest.Run(stranding, scenario(t, tt.scenario), tt.members, 1)
+		t.Log(r)
+		if !r.Linearizable || r.Panic != "" || r.TwoLeaders != "" {
+			t.Errorf("%s: the History should still be fine: %v", tt.scenario, r)
+		}
+		if len(r.Diverged) == 0 {
+			t.Errorf("%s: expected a Member left behind with different data", tt.scenario)
+		}
+	}
+	// With nobody falling behind there is nothing to strand.
+	if r := rungtest.Run(stranding, scenario(t, "none"), 3, 1); !r.Passed() {
+		t.Errorf("no Faults: %v", r)
+	}
+}
+
 func everyScenario() []rungtest.Scenario {
 	return append(allScenarios(), rungtest.Rung3...)
 }

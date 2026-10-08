@@ -11,6 +11,12 @@ import (
 // if no confirmation has come back by then.
 func (n *Node) sendAppend(out *core.Output, m core.NodeID) {
 	prev := n.next[m] - 1
+	if prev < n.log.base {
+		// The follower needs Entries a Snapshot has replaced. Until P3.7
+		// there is nothing to send it but what follows the Snapshot, which
+		// it will refuse. NoSnapshotTransfer keeps that behaviour.
+		prev = n.log.base
+	}
 	end := min(n.lastIndex(), prev+maxBatch)
 	n.send(out, m, Append{
 		Term:      n.term,
@@ -41,6 +47,18 @@ func (n *Node) handleAppend(out *core.Output, from core.NodeID, m Append) {
 	n.leader = from
 	n.elapsed = 0
 
+	if m.PrevIndex < n.log.base {
+		// The Append starts inside this Member's Snapshot. Everything a
+		// Snapshot covers is Committed, so those Entries match by definition:
+		// skip them and check from the Snapshot's edge.
+		covered := n.log.base - m.PrevIndex
+		if covered >= core.Index(len(m.Entries)) {
+			n.send(out, from, AppendReply{Term: n.term, Success: true, Match: n.log.base, ReadRound: m.ReadRound})
+			return
+		}
+		m.Entries = m.Entries[covered:]
+		m.PrevIndex, m.PrevTerm = n.log.base, n.log.baseTerm
+	}
 	if m.PrevIndex > n.lastIndex() {
 		n.send(out, from, AppendReply{Term: n.term, Match: n.lastIndex(), ReadRound: m.ReadRound})
 		return

@@ -298,3 +298,75 @@ func lengthPrefixed(b []byte) (field, rest []byte, ok bool) {
 	}
 	return bytes.Clone(b[:n]), b[n:], true
 }
+
+// Capture returns a function that encodes the state as it is right now. The
+// function can be called later, or from another goroutine, while the Machine
+// goes on applying Entries: it holds the two tree roots, which never change
+// (A§6.4).
+func (m *Machine) Capture() func() []byte {
+	keys, sessions := m.keys, m.sessions
+	return func() []byte {
+		b := binary.AppendUvarint(nil, uint64(keys.Len()))
+		keys.Ascend("", "", func(k string, e entry) bool {
+			b = appendBytes(b, []byte(k))
+			b = binary.AppendUvarint(b, e.version)
+			b = appendBytes(b, e.value)
+			return true
+		})
+		b = binary.AppendUvarint(b, uint64(sessions.Len()))
+		sessions.Ascend("", "", func(k string, s session) bool {
+			b = append(b, k...) // always 8 bytes
+			b = binary.AppendUvarint(b, s.lastSeq)
+			b = appendBytes(b, s.lastResp)
+			return true
+		})
+		return b
+	}
+}
+
+// Restore replaces the Machine's state with a captured one.
+func (m *Machine) Restore(data []byte) error {
+	var keys tree.Tree[entry]
+	var sessions tree.Tree[session]
+	n, b, ok := uvarint(data)
+	for i := uint64(0); ok && i < n; i++ {
+		var k, v []byte
+		var version uint64
+		if k, b, ok = lengthPrefixed(b); !ok {
+			break
+		}
+		if version, b, ok = uvarint(b); !ok {
+			break
+		}
+		if v, b, ok = lengthPrefixed(b); ok {
+			keys = keys.Put(string(k), entry{value: v, version: version})
+		}
+	}
+	if ok {
+		n, b, ok = uvarint(b)
+	}
+	for i := uint64(0); ok && i < n; i++ {
+		if len(b) < 8 {
+			ok = false
+			break
+		}
+		id := string(b[:8])
+		var s session
+		if s.lastSeq, b, ok = uvarint(b[8:]); !ok {
+			break
+		}
+		if s.lastResp, b, ok = lengthPrefixed(b); ok {
+			sessions = sessions.Put(id, s)
+		}
+	}
+	if !ok || len(b) != 0 {
+		return errMalformed
+	}
+	m.keys, m.sessions = keys, sessions
+	return nil
+}
+
+func appendBytes(b, field []byte) []byte {
+	b = binary.AppendUvarint(b, uint64(len(field)))
+	return append(b, field...)
+}

@@ -28,6 +28,9 @@ type Store struct {
 	Restart func(id core.NodeID, members []core.NodeID, rng core.Rand, stored core.Stored) core.Node
 	// DiskDelay is how long a write takes to become durable (sim.Config).
 	DiskDelay [2]int64
+	// SnapshotEvery makes Members take a Snapshot every so many applied
+	// Entries (sim.Config). Zero means never.
+	SnapshotEvery int
 }
 
 // Scenario injects Faults into a running Simulation between times from and
@@ -103,13 +106,14 @@ const (
 // given to transport.Register.
 func Run(store Store, sc Scenario, members int, seed uint64) Report {
 	s := sim.New(sim.Config{
-		Seed:       seed,
-		Nodes:      members,
-		NewNode:    store.NewNode,
-		NewMachine: func() sim.Machine { return fsm.New() },
-		Copy:       transport.NewLoopback().Copy,
-		Restart:    store.Restart,
-		DiskDelay:  store.DiskDelay,
+		Seed:          seed,
+		Nodes:         members,
+		NewNode:       store.NewNode,
+		NewMachine:    func() sim.Machine { return fsm.New() },
+		Copy:          transport.NewLoopback().Copy,
+		Restart:       store.Restart,
+		DiskDelay:     store.DiskDelay,
+		SnapshotEvery: store.SnapshotEvery,
 	})
 	h := &check.History{}
 	rep := Report{Scenario: sc.Name, Seed: seed, Members: members, History: h}
