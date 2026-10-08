@@ -101,6 +101,9 @@ func Run(newNode NewNode, sc Scenario, members int, seed uint64) Report {
 	sc.Faults(s, warmup, faultsEnd)
 	s.At(faultsEnd, func() {
 		s.Heal()
+		s.SetDelay(1, 8)
+		s.SetDuplicate(0)
+		s.SetLoss(0)
 		for _, id := range s.IDs() {
 			s.Restart(id)
 		}
@@ -221,5 +224,70 @@ var Rung1 = []Scenario{
 			s.After(150+s.Rand().Int64N(300), step)
 		}
 		s.At(from, step)
+	}},
+}
+
+// messy makes the network slow, lossy and repetitive: delays wide enough to
+// reorder messages, one message in five delivered twice, one in ten lost.
+func messy(s *sim.Sim) {
+	s.SetDelay(1, 60)
+	s.SetDuplicate(0.2)
+	s.SetLoss(0.1)
+}
+
+// Rung2 adds the Faults Rung 2 must survive (README): one-way Partitions and
+// delayed, reordered and duplicated messages.
+var Rung2 = []Scenario{
+	// The Leader can hear everyone, but nobody hears the Leader.
+	{"leader-mute", func(s *sim.Sim, from, to int64) {
+		s.At(from, func() {
+			if l := leader(s); l != 0 {
+				s.Cut([]core.NodeID{l}, others(s, l))
+			}
+		})
+		s.At(from+(to-from)/2, s.Heal)
+	}},
+
+	// Everyone hears the Leader, but the Leader hears nobody.
+	{"leader-deaf", func(s *sim.Sim, from, to int64) {
+		s.At(from, func() {
+			if l := leader(s); l != 0 {
+				s.Cut(others(s, l), []core.NodeID{l})
+			}
+		})
+		s.At(from+(to-from)/2, s.Heal)
+	}},
+
+	// A messy network and nothing else.
+	{"messy", func(s *sim.Sim, from, to int64) {
+		s.At(from, func() { messy(s) })
+	}},
+
+	// A messy network, with crashes, restarts, Partitions and one-way cuts
+	// arriving at random.
+	{"messy-random", func(s *sim.Sim, from, to int64) {
+		var step func()
+		step = func() {
+			if s.Now() >= to {
+				return
+			}
+			ids := s.IDs()
+			s.Rand().Shuffle(len(ids), func(i, j int) { ids[i], ids[j] = ids[j], ids[i] })
+			cut := 1 + s.Rand().IntN(len(ids)-1)
+			switch s.Rand().IntN(7) {
+			case 0:
+				s.Crash(ids[0])
+			case 1:
+				s.Restart(ids[0])
+			case 2:
+				s.Partition(ids[:cut], ids[cut:])
+			case 3, 4:
+				s.Cut(ids[:cut], ids[cut:])
+			case 5, 6:
+				s.Heal()
+			}
+			s.After(150+s.Rand().Int64N(300), step)
+		}
+		s.At(from, func() { messy(s); step() })
 	}},
 }

@@ -72,6 +72,7 @@ type Sim struct {
 	ids     []core.NodeID
 	blocked map[[2]core.NodeID]bool // directed: [from, to]
 	loss    float64                 // chance that any one message is lost
+	dup     float64                 // chance that any one message arrives twice
 	nextRef uint64
 	digest  uint64
 }
@@ -222,6 +223,34 @@ func (s *Sim) Partition(sets ...[]core.NodeID) {
 // Partition separates them in that direction.
 func (s *Sim) Reachable(a, b core.NodeID) bool { return !s.blocked[[2]core.NodeID{a, b}] }
 
+// Cut blocks messages from each Member in from to each Member in to, in that
+// direction only: a one-way Partition. It adds to whatever is already cut.
+func (s *Sim) Cut(from, to []core.NodeID) {
+	for _, a := range from {
+		for _, b := range to {
+			if a != b {
+				s.blocked[[2]core.NodeID{a, b}] = true
+			}
+		}
+	}
+	s.mix('U', uint64(len(s.blocked)), 0)
+}
+
+// SetDelay changes how long messages take from now on: min..max units each,
+// chosen independently. A wide range reorders messages, since a later one
+// can overtake an earlier one.
+func (s *Sim) SetDelay(min, max int64) {
+	s.cfg.MinDelay, s.cfg.MaxDelay = min, max
+	s.mix('Y', uint64(min), uint64(max))
+}
+
+// SetDuplicate makes each message arrive a second time, after its own delay,
+// with probability p.
+func (s *Sim) SetDuplicate(p float64) {
+	s.dup = p
+	s.mix('2', uint64(p*1e6), 0)
+}
+
 // SetLoss makes each message independently lost with probability p.
 func (s *Sim) SetLoss(p float64) {
 	s.loss = p
@@ -271,8 +300,14 @@ func (s *Sim) send(msg core.Message) {
 	if s.cfg.Copy != nil {
 		msg = s.cfg.Copy(msg)
 	}
-	delay := s.cfg.MinDelay + s.rng.Int64N(s.cfg.MaxDelay-s.cfg.MinDelay+1)
-	s.schedule(delay, func() { s.deliver(msg) })
+	s.schedule(s.delay(), func() { s.deliver(msg) })
+	if s.dup > 0 && s.rng.Float64() < s.dup {
+		s.schedule(s.delay(), func() { s.deliver(msg) })
+	}
+}
+
+func (s *Sim) delay() int64 {
+	return s.cfg.MinDelay + s.rng.Int64N(s.cfg.MaxDelay-s.cfg.MinDelay+1)
 }
 
 // deliver hands a message over unless the link is cut or either end is down

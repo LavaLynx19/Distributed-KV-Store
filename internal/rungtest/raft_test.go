@@ -48,3 +48,26 @@ func TestRaftPassesTheNaiveSeeds(t *testing.T) {
 		}
 	}
 }
+
+// The Rung 1 store, with reads through the Log and clients that never retry,
+// already holds its guarantees under Rung 2's Faults. Rung 2 is about the
+// shortcuts that break them.
+func TestRaftUnderRung2Faults(t *testing.T) {
+	seeds := uint64(200)
+	if testing.Short() {
+		seeds = 20
+	}
+	for _, sc := range rungtest.Rung2 {
+		for _, members := range []int{3, 5} {
+			for seed := uint64(1); seed <= seeds; seed++ {
+				r := rungtest.Run(newRaft, sc, members, seed)
+				if !r.Passed() {
+					t.Errorf("%v\n  diverged: %v", r, r.Diverged)
+				}
+				if r.Recovery < 0 {
+					t.Errorf("%v\n  no write succeeded after the Faults were repaired", r)
+				}
+			}
+		}
+	}
+}

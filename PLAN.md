@@ -26,7 +26,7 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P1.13 `retros/rung-1.md`; set relative targets for later Rungs in README → §P1
 
 ### Phase 2 — Rung 2: Stale read and double apply (§P2)
-- [ ] P2.1 Simulation network Faults: delay, reorder, duplicate, one-way Partition → §P2
+- [x] P2.1 Simulation network Faults: delay, reorder, duplicate, one-way Partition → §P2
 - [ ] P2.2 Naive shortcuts: the Leader answers reads from memory; clients retry unanswered requests → §P2
 - [ ] P2.3 Expose: Stale read from a cut-off Leader; a retried compare-and-set applied twice → §P2
 - [ ] P2.4 Sessions: open, deduplicate on apply, saved responses (A§6.3) → §P2
