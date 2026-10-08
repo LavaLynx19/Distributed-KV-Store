@@ -122,6 +122,11 @@ func (w Workload) next(s *Sim, h *check.History, c *client, until int64) {
 	if s.Now() >= until {
 		return
 	}
+	if w.Sessions && c.session == 0 {
+		// The store no longer knows this client's Session: start a new one.
+		w.openSession(s, c, func() { w.next(s, h, c, until) })
+		return
+	}
 	if w.Retry {
 		w.nextRetrying(s, h, c, until)
 		return
@@ -277,6 +282,13 @@ func (w Workload) nextRetrying(s *Sim, h *check.History, c *client, until int64)
 				resp, err := fsm.DecodeResponse(r.Response)
 				if err != nil {
 					panic(fmt.Sprintf("sim: undecodable response: %v", err))
+				}
+				if resp.Status == fsm.StatusSessionExpired {
+					// This attempt changed nothing, but an earlier one may
+					// have, before the store lost the Session.
+					c.session, c.seq = 0, 0
+					finish(check.Lost, fsm.Response{})
+					return
 				}
 				c.observe(cmd, resp)
 				finish(check.Answered, resp)

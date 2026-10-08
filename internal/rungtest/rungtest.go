@@ -23,6 +23,11 @@ type NewNode func(id core.NodeID, members []core.NodeID, rng core.Rand) core.Nod
 type Store struct {
 	NewNode  NewNode
 	Workload sim.Workload
+	// Restart rebuilds a crashed Member's core from its disk. If nil, a
+	// crash is a freeze and the Member keeps its memory (Rungs 1–2).
+	Restart func(id core.NodeID, members []core.NodeID, rng core.Rand, stored core.Stored) core.Node
+	// DiskDelay is how long a write takes to become durable (sim.Config).
+	DiskDelay [2]int64
 }
 
 // Scenario injects Faults into a running Simulation between times from and
@@ -55,13 +60,15 @@ type Report struct {
 	// TwoLeaders is set when two running Members were Leader in the same
 	// Term at the same moment.
 	TwoLeaders string
+	// Panic is set when a core's own safety check stopped the run.
+	Panic string
 
 	verdict check.Verdict
 }
 
 // Passed is true when the run kept every Rung 1 guarantee.
 func (r Report) Passed() bool {
-	return r.Linearizable && !r.TimedOut && len(r.Diverged) == 0 && r.TwoLeaders == ""
+	return r.Linearizable && !r.TimedOut && len(r.Diverged) == 0 && r.TwoLeaders == "" && r.Panic == ""
 }
 
 // Visualize writes the checked History as an HTML timeline.
@@ -77,6 +84,9 @@ func (r Report) String() string {
 		r.Signals.Answered, r.Signals.Rejected, r.Signals.Lost, r.Recovery)
 	if r.TwoLeaders != "" {
 		s += " two-leaders: " + r.TwoLeaders
+	}
+	if r.Panic != "" {
+		s += " panic: " + r.Panic
 	}
 	return s
 }
@@ -98,6 +108,8 @@ func Run(store Store, sc Scenario, members int, seed uint64) Report {
 		NewNode:    store.NewNode,
 		NewMachine: func() sim.Machine { return fsm.New() },
 		Copy:       transport.NewLoopback().Copy,
+		Restart:    store.Restart,
+		DiskDelay:  store.DiskDelay,
 	})
 	h := &check.History{}
 	rep := Report{Scenario: sc.Name, Seed: seed, Members: members, History: h}
@@ -115,7 +127,16 @@ func Run(store Store, sc Scenario, members int, seed uint64) Report {
 		}
 	})
 	watchLeaders(s, &rep, faultsEnd+cooldown)
-	s.Run(faultsEnd + cooldown)
+	// A core panics when one of its own safety checks fails. That ends the
+	// run, and is recorded as a failure with the reason.
+	func() {
+		defer func() {
+			if p := recover(); p != nil {
+				rep.Panic = fmt.Sprint(p)
+			}
+		}()
+		s.Run(faultsEnd + cooldown)
+	}()
 
 	rep.verdict = h.Linearizable(20 * time.Second)
 	rep.Linearizable, rep.TimedOut = rep.verdict.Linearizable, rep.verdict.TimedOut
@@ -293,6 +314,93 @@ var Rung2 = []Scenario{
 				s.Heal()
 			}
 			s.After(150+s.Rand().Int64N(300), step)
+		}
+		s.At(from, func() { messy(s); step() })
+	}},
+}
+
+// Rung3 adds the Faults Rung 3 must survive (README): every Member restarting
+// at once, crashes while a write is on its way to disk, and a stalled disk.
+// They only bite when the Store sets Restart, so that a crash loses whatever
+// wasn't durable.
+var Rung3 = []Scenario{
+	// Every Member crashes at the same moment and they all come back.
+	{"full-restart", func(s *sim.Sim, from, to int64) {
+		for _, at := range []int64{from + (to-from)/4, from + (to-from)/2} {
+			s.At(at, func() {
+				for _, id := range s.IDs() {
+					s.Crash(id)
+				}
+			})
+			s.At(at+200, func() {
+				for _, id := range s.IDs() {
+					s.Restart(id)
+				}
+			})
+		}
+	}},
+
+	// Members crash one at a time, often with a write in progress, and
+	// restart a little later.
+	{"rolling-crashes", func(s *sim.Sim, from, to int64) {
+		var step func()
+		step = func() {
+			if s.Now() >= to {
+				return
+			}
+			ids := s.IDs()
+			id := ids[s.Rand().IntN(len(ids))]
+			s.Crash(id)
+			s.After(50+s.Rand().Int64N(250), func() { s.Restart(id) })
+			s.After(100+s.Rand().Int64N(200), step)
+		}
+		s.At(from, step)
+	}},
+
+	// Disks stall for a while, one Member at a time, the Leader included.
+	{"stalled-disk", func(s *sim.Sim, from, to int64) {
+		var step func()
+		step = func() {
+			if s.Now() >= to {
+				return
+			}
+			ids := s.IDs()
+			id := ids[s.Rand().IntN(len(ids))]
+			if l := leader(s); l != 0 && s.Rand().IntN(2) == 0 {
+				id = l
+			}
+			s.StallDisk(id, 100+s.Rand().Int64N(400))
+			s.After(200+s.Rand().Int64N(400), step)
+		}
+		s.At(from, step)
+	}},
+
+	// Everything at once: a messy network, crashes, restarts, Partitions,
+	// one-way cuts and stalled disks.
+	{"everything", func(s *sim.Sim, from, to int64) {
+		var step func()
+		step = func() {
+			if s.Now() >= to {
+				return
+			}
+			ids := s.IDs()
+			s.Rand().Shuffle(len(ids), func(i, j int) { ids[i], ids[j] = ids[j], ids[i] })
+			cut := 1 + s.Rand().IntN(len(ids)-1)
+			switch s.Rand().IntN(9) {
+			case 0, 1:
+				s.Crash(ids[0])
+			case 2, 3:
+				s.Restart(ids[0])
+			case 4:
+				s.Partition(ids[:cut], ids[cut:])
+			case 5:
+				s.Cut(ids[:cut], ids[cut:])
+			case 6:
+				s.StallDisk(ids[0], 100+s.Rand().Int64N(300))
+			case 7, 8:
+				s.Heal()
+			}
+			s.After(100+s.Rand().Int64N(250), step)
 		}
 		s.At(from, func() { messy(s); step() })
 	}},
