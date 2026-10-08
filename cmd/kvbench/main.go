@@ -46,6 +46,7 @@ type config struct {
 	checkFor time.Duration
 	seed     uint64
 	retry    bool
+	readPct  int
 }
 
 func main() {
@@ -59,6 +60,7 @@ func main() {
 	flag.DurationVar(&cfg.settle, "settle", 15*time.Second, "how long to wait after the load for Members to converge")
 	flag.DurationVar(&cfg.checkFor, "check", time.Minute, "time limit for the linearizability check (0 skips it)")
 	flag.Uint64Var(&cfg.seed, "seed", 1, "seed for the clients' choices")
+	flag.IntVar(&cfg.readPct, "read-pct", 35, "percentage of requests that are gets; the rest keep the default write mix")
 	flag.BoolVar(&cfg.retry, "retry", false, "open a Session per client and retry requests that get no definite answer (A§6.3)")
 	flag.Parse()
 	for _, n := range strings.Split(*nodes, ",") {
@@ -80,6 +82,8 @@ type recorder struct {
 	start     time.Time
 	history   check.History
 	latencies []time.Duration // of answered requests
+	reads     []time.Duration // of answered gets
+	writes    []time.Duration // of answered puts and deletes
 }
 
 func (r *recorder) begin(client int, cmd fsm.Command) (int, time.Time) {
@@ -89,13 +93,18 @@ func (r *recorder) begin(client int, cmd fsm.Command) (int, time.Time) {
 	return r.history.Begin(client, cmd, int64(now.Sub(r.start))), now
 }
 
-func (r *recorder) end(id int, began time.Time, result check.Result, resp fsm.Response) {
+func (r *recorder) end(id int, began time.Time, isRead bool, result check.Result, resp fsm.Response) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := time.Now()
 	r.history.End(id, result, resp, int64(now.Sub(r.start)))
 	if result == check.Answered {
 		r.latencies = append(r.latencies, now.Sub(began))
+		if isRead {
+			r.reads = append(r.reads, now.Sub(began))
+		} else {
+			r.writes = append(r.writes, now.Sub(began))
+		}
 	}
 }
 
@@ -131,11 +140,18 @@ func run(cfg config) bool {
 	total := sig.Answered + sig.Rejected + sig.Lost
 	fmt.Printf("requests:    %d in %.1fs (answered %d, rejected %d, lost %d)\n", total, elapsed.Seconds(), sig.Answered, sig.Rejected, sig.Lost)
 	fmt.Printf("throughput:  %.0f answered/s with %d clients\n", float64(sig.Answered)/elapsed.Seconds(), cfg.clients)
-	slices.Sort(rec.latencies)
-	if n := len(rec.latencies); n > 0 {
-		pct := func(p float64) time.Duration { return rec.latencies[min(n-1, int(p*float64(n)))] }
-		fmt.Printf("latency:     p50 %s  p95 %s  p99 %s  max %s\n", round(pct(0.50)), round(pct(0.95)), round(pct(0.99)), round(rec.latencies[n-1]))
+	report := func(label string, ds []time.Duration) {
+		slices.Sort(ds)
+		n := len(ds)
+		if n == 0 {
+			return
+		}
+		pct := func(p float64) time.Duration { return ds[min(n-1, int(p*float64(n)))] }
+		fmt.Printf("%-12s p50 %s  p95 %s  p99 %s  max %s  (%.0f/s)\n", label, round(pct(0.50)), round(pct(0.95)), round(pct(0.99)), round(ds[n-1]), float64(n)/elapsed.Seconds())
 	}
+	report("latency:", rec.latencies)
+	report("  reads:", rec.reads)
+	report("  writes:", rec.writes)
 	if cfg.mark > 0 {
 		if after := sig.RecoveryAfter(int64(cfg.mark)); after >= 0 {
 			fmt.Printf("recovery:    next write succeeded %s after the mark at %s\n", round(time.Duration(after)), cfg.mark)
@@ -251,7 +267,7 @@ func (c *client) request() {
 	if c.cfg.retry && result == check.Rejected {
 		result = check.Lost // an earlier attempt may have gone through
 	}
-	c.rec.end(id, began, result, resp)
+	c.rec.end(id, began, cmd.Op == fsm.OpGet, result, resp)
 	if result == check.Answered {
 		switch resp.Status {
 		case fsm.StatusOK, fsm.StatusVersionMismatch:
@@ -262,18 +278,20 @@ func (c *client) request() {
 	}
 }
 
-// pick mirrors sim.Workload: 35% gets, 30% puts, 25% compare-and-sets, 10%
-// deletes.
+// pick mirrors sim.Workload at the default -read-pct of 35: 35% gets, 30%
+// puts, 25% compare-and-sets, 10% deletes. Other values keep the writes in
+// the same 30:25:10 proportion.
 func (c *client) pick() fsm.Command {
 	key := fmt.Sprintf("k%d", c.rng.IntN(c.cfg.keys))
 	c.count++
 	value := []byte(fmt.Sprintf("c%d-%d", c.id, c.count))
-	switch roll := c.rng.IntN(100); {
-	case roll < 35:
+	if c.rng.IntN(100) < c.cfg.readPct {
 		return fsm.Command{Op: fsm.OpGet, Key: key}
-	case roll < 65:
+	}
+	switch roll := c.rng.IntN(65); {
+	case roll < 30:
 		return fsm.Command{Op: fsm.OpPut, Key: key, Value: value}
-	case roll < 90:
+	case roll < 55:
 		return fsm.Command{Op: fsm.OpPut, Key: key, Value: value, Conditional: true, IfVersion: c.seen[key]}
 	default:
 		return fsm.Command{Op: fsm.OpDelete, Key: key}

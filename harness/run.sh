@@ -15,6 +15,9 @@
 # Environment:
 #   CLIENTS=8  DURATION=10s  FAULT_AT=3  FAULT_FOR=3   (seconds for the last two)
 #   RETRY=1    clients open a Session and retry unanswered requests (A§6.3)
+#   READ_PCT=35  percentage of requests that are gets
+#   TAG=name   added to the output file name, to keep variants apart
+#   KVNODE_FLAGS="-reads log"   extra kvnode flags (local backend only)
 #
 # Output is also saved to harness/out/run-<backend>-<members>-<fault>.txt.
 set -euo pipefail
@@ -53,7 +56,7 @@ leader() {
   done
 }
 
-log="$OUT/run-$BACKEND-$N-$FAULT.txt"
+log="$OUT/run-$BACKEND-$N-$FAULT${TAG:+-$TAG}.txt"
 {
   echo "== $BACKEND, $N Members, fault $FAULT, $CLIENTS clients for $DURATION${RETRY:+, retrying in Sessions}"
   "$ctl" "${start[@]}" | tail -1
@@ -63,6 +66,7 @@ log="$OUT/run-$BACKEND-$N-$FAULT.txt"
 
   bench=("$ROOT/bin/kvbench" -nodes "$(IFS=,; echo "${nodes[*]}")" -clients "$CLIENTS" -duration "$DURATION")
   [[ -n "${RETRY:-}" ]] && bench+=(-retry)
+  [[ -n "${READ_PCT:-}" ]] && bench+=(-read-pct "$READ_PCT")
   if [[ $FAULT == none ]]; then
     "${bench[@]}"
     status=$?
