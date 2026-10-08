@@ -39,7 +39,7 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P3.2 Expose: full restart breaks safety; Log grows without bound; a returning Node can't catch up → §P3
 - [x] P3.3 Disk format: Log segments and vote file, no checksums (A§5.4) → §P3
 - [x] P3.4 Durable-before-send in both shells; real file storage with fsync → §P3
-- [ ] P3.5 Copy-on-write ordered tree replaces the v1 state → §P3
+- [x] P3.5 Copy-on-write ordered tree replaces the v1 state → §P3
 - [ ] P3.6 Snapshots: take, write, trim the Log (A§6.4) → §P3
 - [ ] P3.7 Catch-up by Snapshot then Log → §P3
 - [ ] P3.8 Rung 3 suite: full restart, crash mid-write, stalled disk; measure Snapshot cost, and read index against Log reads (target moved from Rung 2) → §P3

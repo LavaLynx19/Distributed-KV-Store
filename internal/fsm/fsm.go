@@ -7,9 +7,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"slices"
 
 	"distributed-kv-store/internal/core"
+	"distributed-kv-store/internal/tree"
 )
 
 // Op is what a Command does.
@@ -91,15 +91,21 @@ type session struct {
 	lastResp []byte
 }
 
-// Machine holds the keys and the Sessions. The zero value is not usable;
-// call New.
+// Machine holds the keys and the Sessions, each in a copy-on-write tree
+// (A§5.3), so the whole state can be captured at any moment by keeping the
+// two roots. Sessions are keyed by their id as 8 big-endian bytes, which
+// sorts them numerically.
 type Machine struct {
-	keys     map[string]entry
-	sessions map[uint64]*session
+	keys     tree.Tree[entry]
+	sessions tree.Tree[session]
 }
 
-func New() *Machine {
-	return &Machine{keys: map[string]entry{}, sessions: map[uint64]*session{}}
+func New() *Machine { return &Machine{} }
+
+func sessionKey(id uint64) string {
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], id)
+	return string(b[:])
 }
 
 // Apply executes a Committed Entry and returns its encoded Response. A no-op
@@ -116,14 +122,14 @@ func (m *Machine) Apply(e core.Entry) []byte {
 	if cmd.Op == OpOpenSession {
 		// The Entry's Index is unique and the same on every Member, which
 		// makes it a ready-made Session id.
-		m.sessions[index] = &session{}
+		m.sessions = m.sessions.Put(sessionKey(index), session{})
 		return Response{Status: StatusOK, Session: index}.Encode()
 	}
 	if cmd.Session == 0 {
 		return m.apply(cmd, index).Encode()
 	}
 
-	s, ok := m.sessions[cmd.Session]
+	s, ok := m.sessions.Get(sessionKey(cmd.Session))
 	switch {
 	case !ok:
 		return Response{Status: StatusSessionExpired}.Encode()
@@ -132,13 +138,13 @@ func (m *Machine) Apply(e core.Entry) []byte {
 	case cmd.Seq < s.lastSeq:
 		return Response{Status: StatusInvalid}.Encode()
 	}
-	s.lastSeq = cmd.Seq
-	s.lastResp = m.apply(cmd, index).Encode()
-	return s.lastResp
+	resp := m.apply(cmd, index).Encode()
+	m.sessions = m.sessions.Put(sessionKey(cmd.Session), session{lastSeq: cmd.Seq, lastResp: resp})
+	return resp
 }
 
 // Sessions is how many Sessions are open, for tests and End-state checks.
-func (m *Machine) Sessions() int { return len(m.sessions) }
+func (m *Machine) Sessions() int { return m.sessions.Len() }
 
 // Read answers an encoded get from the state as it stands, without an Entry.
 // Whether that answer is safe to give a client is the core's call (A§6.2).
@@ -153,7 +159,7 @@ func (m *Machine) Read(query []byte) []byte {
 // A key's version is the Index of the Entry that last wrote it. Versions
 // therefore never repeat, even when a key is deleted and created again.
 func (m *Machine) apply(cmd Command, index uint64) Response {
-	cur, exists := m.keys[cmd.Key]
+	cur, exists := m.keys.Get(cmd.Key)
 	switch cmd.Op {
 	case OpGet:
 		if !exists {
@@ -164,7 +170,7 @@ func (m *Machine) apply(cmd Command, index uint64) Response {
 		if cmd.Conditional && cur.version != cmd.IfVersion {
 			return Response{Status: StatusVersionMismatch, Version: cur.version}
 		}
-		m.keys[cmd.Key] = entry{value: bytes.Clone(cmd.Value), version: index}
+		m.keys = m.keys.Put(cmd.Key, entry{value: bytes.Clone(cmd.Value), version: index})
 		return Response{Status: StatusOK, Version: index}
 	case OpDelete:
 		if cmd.Conditional && cur.version != cmd.IfVersion {
@@ -173,7 +179,7 @@ func (m *Machine) apply(cmd Command, index uint64) Response {
 		if !exists {
 			return Response{Status: StatusNotFound}
 		}
-		delete(m.keys, cmd.Key)
+		m.keys = m.keys.Delete(cmd.Key)
 		return Response{Status: StatusOK}
 	}
 	return Response{Status: StatusInvalid}
@@ -181,22 +187,12 @@ func (m *Machine) apply(cmd Command, index uint64) Response {
 
 // Items lists every key in key order, for End-state comparison (A§8.2).
 func (m *Machine) Items() []Item {
-	items := make([]Item, 0, len(m.keys))
-	for k, e := range m.keys {
+	items := make([]Item, 0, m.keys.Len())
+	m.keys.Ascend("", "", func(k string, e entry) bool {
 		items = append(items, Item{Key: k, Value: e.value, Version: e.version})
-	}
-	slices.SortFunc(items, func(a, b Item) int { return cmpString(a.Key, b.Key) })
+		return true
+	})
 	return items
-}
-
-func cmpString(a, b string) int {
-	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return 1
-	}
-	return 0
 }
 
 var errMalformed = errors.New("fsm: malformed payload")
