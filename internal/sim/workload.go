@@ -42,6 +42,10 @@ type Workload struct {
 	// against the whole store at once, so keep such runs short.
 	ScanPercent int
 	TxnPercent  int
+	// ReadPercent of single-key requests are gets. Zero means 35. The
+	// writes keep their proportions: 30 puts to 25 compare-and-sets to 10
+	// deletes.
+	ReadPercent int
 }
 
 // DefaultWorkload is enough contention to make ordering mistakes visible.
@@ -224,9 +228,15 @@ func (w Workload) choose(s *Sim, c *client) fsm.Command {
 		}
 	}
 	var cmd fsm.Command
-	switch roll := s.Rand().IntN(100); {
-	case roll < 35:
+	reads := 35
+	if w.ReadPercent > 0 {
+		reads = w.ReadPercent
+	}
+	roll := s.Rand().IntN(100)
+	if roll < reads {
 		return fsm.Command{Op: fsm.OpGet, Key: key}
+	}
+	switch roll = 35 + (roll-reads)*65/(100-reads); {
 	case roll < 65:
 		cmd = fsm.Command{Op: fsm.OpPut, Key: key, Value: value}
 	case roll < 90:

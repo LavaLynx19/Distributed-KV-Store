@@ -650,6 +650,28 @@ var Rung5 = []Scenario{
 		s.At(from, step)
 		moveLeader(s, from, to)
 	}},
+
+	// The Leader's clock slows to a fifth of true speed, and then it is cut
+	// off from the others. It notices the silence five times later than it
+	// should, while the others elect a Leader on time.
+	{"slow-leader", func(s *sim.Sim, from, to int64) {
+		var step func()
+		step = func() {
+			if s.Now() >= to-600 {
+				return
+			}
+			if l := leader(s); l != 0 {
+				s.SetClockRate(l, 20)
+				s.Partition([]core.NodeID{l}, others(s, l))
+				s.After(450, func() {
+					s.Heal()
+					s.SetClockRate(l, 100)
+				})
+			}
+			s.After(700+s.Rand().Int64N(200), step)
+		}
+		s.At(from, step)
+	}},
 }
 
 // moveLeader pauses whichever Member leads, every so often, for long enough

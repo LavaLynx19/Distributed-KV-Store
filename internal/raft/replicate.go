@@ -89,6 +89,7 @@ func (n *Node) handleInstallSnapshot(out *core.Output, from core.NodeID, m Insta
 	}
 	n.leader = from
 	n.elapsed = 0
+	n.contact = n.now
 
 	if m.Snapshot.Index <= n.commit {
 		// Nothing new: everything it covers is already Committed here, and
@@ -135,6 +136,7 @@ func (n *Node) handleAppend(out *core.Output, from core.NodeID, m Append) {
 	}
 	n.leader = from
 	n.elapsed = 0
+	n.contact = n.now
 
 	if m.PrevIndex < n.log.base {
 		// The Append starts inside this Member's Snapshot. Everything a
@@ -142,18 +144,18 @@ func (n *Node) handleAppend(out *core.Output, from core.NodeID, m Append) {
 		// skip them and check from the Snapshot's edge.
 		covered := n.log.base - m.PrevIndex
 		if covered >= core.Index(len(m.Entries)) {
-			n.sendReply(out, from, AppendReply{Term: n.term, Success: true, Match: n.log.base, ReadRound: m.ReadRound})
+			n.sendReply(out, from, AppendReply{Term: n.term, Success: true, Match: n.log.base, ReadRound: m.ReadRound, Sent: m.Sent})
 			return
 		}
 		m.Entries = m.Entries[covered:]
 		m.PrevIndex, m.PrevTerm = n.log.base, n.log.baseTerm
 	}
 	if m.PrevIndex > n.lastIndex() {
-		n.sendReply(out, from, AppendReply{Term: n.term, Match: n.lastIndex(), ReadRound: m.ReadRound})
+		n.sendReply(out, from, AppendReply{Term: n.term, Match: n.lastIndex(), ReadRound: m.ReadRound, Sent: m.Sent})
 		return
 	}
 	if n.termAt(m.PrevIndex) != m.PrevTerm {
-		n.sendReply(out, from, AppendReply{Term: n.term, Match: m.PrevIndex - 1, ReadRound: m.ReadRound})
+		n.sendReply(out, from, AppendReply{Term: n.term, Match: m.PrevIndex - 1, ReadRound: m.ReadRound, Sent: m.Sent})
 		return
 	}
 
@@ -178,7 +180,7 @@ func (n *Node) handleAppend(out *core.Output, from core.NodeID, m Append) {
 	if c := min(m.Commit, confirmed); c > n.commit {
 		n.commit = c
 	}
-	n.sendReply(out, from, AppendReply{Term: n.term, Success: true, Match: confirmed, ReadRound: m.ReadRound})
+	n.sendReply(out, from, AppendReply{Term: n.term, Success: true, Match: confirmed, ReadRound: m.ReadRound, Sent: m.Sent})
 
 	// A recovering Member that now matches the Leader's whole Log holds
 	// everything that is Committed, and can be trusted to vote again (A§6.8).
@@ -193,6 +195,9 @@ func (n *Node) handleAppendReply(out *core.Output, from core.NodeID, m AppendRep
 		return
 	}
 	n.heard[from] = n.now
+	if at, ok := n.leaseFrom[from]; m.Sent != 0 && (!ok || m.Sent > at) {
+		n.leaseFrom[from] = m.Sent
+	}
 	if m.Reset {
 		// The follower found damage on its disk and holds less than it once
 		// confirmed. What it says it has now is all that can be counted on.

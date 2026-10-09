@@ -41,6 +41,9 @@ type Append struct {
 	// LeaderLast is the last Index in the Leader's Log when this was sent.
 	// A recovering follower uses it to tell when it has caught up.
 	LeaderLast core.Index
+	// Sent is the Leader's tick count when it sent this, with ReadsByLease.
+	// The follower echoes it, and the Leader's lease runs from there.
+	Sent int
 }
 
 // AppendReply answers an Append. On success, Match is the last Index the
@@ -54,6 +57,8 @@ type AppendReply struct {
 	// Reset is set by a recovering follower: Match is all it holds now,
 	// even if it confirmed more before.
 	Reset bool
+	// Sent echoes the Append's.
+	Sent int
 }
 
 // InstallSnapshot carries the Leader's Snapshot to a follower that needs
@@ -86,6 +91,12 @@ const (
 	// memory only once it has Committed an Entry of its own Term and a
 	// Majority has confirmed, after the read arrived, that it still leads.
 	ReadsByIndex
+	// ReadsByLease: the Leader answers from memory, without asking anyone,
+	// for LeaseTicks after a Majority last heard from it (lease.go). It is
+	// the fastest path and the only one that trusts clocks: Members whose
+	// ticks run at different speeds can give a Stale read. It is a measured
+	// variant, off by default (A§6.2, Decision Log).
+	ReadsByLease
 )
 
 // Config sets up one Member.
@@ -100,6 +111,9 @@ type Config struct {
 	HeartbeatTicks int
 	Rand           core.Rand
 	Reads          ReadMode
+	// LeaseTicks is how long a lease lasts, with ReadsByLease. Zero means
+	// ElectionTicks−2: one tick for each side's rounding.
+	LeaseTicks int
 	// Stored is the Member's durable state from before a restart. The zero
 	// value is a Member starting for the first time.
 	Stored core.Stored
@@ -166,6 +180,12 @@ type Node struct {
 	roundOpen  bool                   // that round isn't confirmed yet
 	roundAcked map[core.NodeID]uint64 // highest round each follower has echoed
 	reads      []pendingRead
+
+	// Lease state (lease.go). leaseFrom is, per follower, the tick at which
+	// this Leader sent the latest message that follower has answered.
+	// contact is the tick this Member last heard from a Leader, or started.
+	leaseFrom map[core.NodeID]int
+	contact   int
 }
 
 // New builds a Member as a follower, with whatever cfg.Stored says it had
@@ -178,6 +198,9 @@ func New(cfg Config) *Node {
 	slices.Sort(members)
 	if cfg.MaxBatch == 0 {
 		cfg.MaxBatch = maxBatch
+	}
+	if cfg.LeaseTicks == 0 {
+		cfg.LeaseTicks = cfg.ElectionTicks - 2
 	}
 	n := &Node{id: cfg.ID, members: members, cfg: cfg, pending: map[core.Index]uint64{}}
 	n.term, n.votedFor = cfg.Stored.HardState.Term, cfg.Stored.HardState.VotedFor
@@ -293,6 +316,10 @@ func (n *Node) tick(out *core.Output) {
 }
 
 func (n *Node) send(out *core.Output, to core.NodeID, body any) {
+	if a, ok := body.(Append); ok && n.cfg.Reads == ReadsByLease {
+		a.Sent = n.now
+		body = a
+	}
 	out.Messages = append(out.Messages, core.Message{From: n.id, To: to, Body: body})
 }
 
@@ -421,7 +448,10 @@ func (n *Node) read(out *core.Output, r core.Read) {
 	switch {
 	case n.cfg.Reads == ReadsThroughLog:
 		panic("raft: core.Read sent to a Member configured for reads through the Log")
-	case n.role == core.LeaderRole && n.cfg.Reads == ReadsByIndex:
+	case n.role == core.LeaderRole && n.cfg.Reads == ReadsByLease && n.leaseHolds():
+		// No round is needed: the lease says nobody else can lead yet.
+		n.reads = append(n.reads, pendingRead{ref: r.Ref, index: n.commit, hasIndex: true})
+	case n.role == core.LeaderRole && n.cfg.Reads != ReadsFromMemory:
 		n.queueRead(out, r)
 	case n.role == core.LeaderRole:
 		out.Reads = append(out.Reads, core.Result{Ref: r.Ref, Reason: core.OK})

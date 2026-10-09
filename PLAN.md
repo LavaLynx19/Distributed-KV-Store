@@ -60,7 +60,7 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P5.5 Range scans → §P5
 - [x] P5.6 Transactions within one Group → §P5
 - [x] P5.7 Whole-store Porcupine model for scans and transactions → §P5
-- [ ] P5.8 Lease read variant behind a switch; demonstrate its Stale read under skew; measure → §P5
+- [x] P5.8 Lease read variant behind a switch; demonstrate its Stale read under skew; measure → §P5
 - [ ] P5.9 Rung 5 suite; `retros/rung-5.md` → §P5
 
 ### Phase 6 — Rung 6: two Majorities (§P6)

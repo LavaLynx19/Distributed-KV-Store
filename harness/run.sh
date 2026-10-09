@@ -21,7 +21,8 @@
 #   RETRY=1    clients open a Session and retry unanswered requests (A§6.3)
 #   READ_PCT=35  percentage of requests that are gets
 #   TAG=name   added to the output file name, to keep variants apart
-#   READS=index|log   how gets are answered (default index, A§6.2)
+#   READS=index|log|lease   how gets are answered (default index, A§6.2)
+#   TTL_PCT=0  percentage of puts given a time-to-live (A§6.7)
 #   NODATA=1   Members keep nothing on disk, as before Rung 3
 #
 # Output is also saved to harness/out/run-<backend>-<members>-<fault>.txt.
@@ -80,6 +81,7 @@ log="$OUT/run-$BACKEND-$N-$FAULT${TAG:+-$TAG}.txt"
   bench=("$ROOT/bin/kvbench" -nodes "$(IFS=,; echo "${nodes[*]}")" -clients "$CLIENTS" -duration "$DURATION")
   [[ -n "${RETRY:-}" ]] && bench+=(-retry)
   [[ -n "${READ_PCT:-}" ]] && bench+=(-read-pct "$READ_PCT")
+  [[ -n "${TTL_PCT:-}" ]] && bench+=(-ttl-pct "$TTL_PCT")
   if [[ $FAULT == none ]]; then
     "${bench[@]}"
     status=$?

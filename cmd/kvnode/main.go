@@ -44,7 +44,7 @@ func main() {
 	data := flag.String("data", "", "directory for this Node's durable state; empty keeps nothing across a restart")
 	snapshotEvery := flag.Int("snapshot-every", 20000, "take a Snapshot and trim the Log after this many applied Entries (0 never)")
 	sessionTTL := flag.Duration("session-ttl", time.Hour, "remove a Session unused for this long (0 never); must be the same on every Member")
-	reads := flag.String("reads", "index", "how gets are answered: index (read index, A§6.2) or log (as Log Entries)")
+	reads := flag.String("reads", "index", "how gets are answered: index (read index, A§6.2), log (as Log Entries), or lease (from the Leader's memory under a lease: faster, and not Linearizable if clocks run at different speeds)")
 	flag.Parse()
 
 	var mode raft.ReadMode
@@ -53,8 +53,10 @@ func main() {
 		mode = raft.ReadsByIndex
 	case "log":
 		mode = raft.ReadsThroughLog
+	case "lease":
+		mode = raft.ReadsByLease
 	default:
-		log.Fatalf("kvnode: -reads must be index or log, not %q", *reads)
+		log.Fatalf("kvnode: -reads must be index, log or lease, not %q", *reads)
 	}
 	if err := run(core.NodeID(*id), *peersFlag, *clientsFlag, *listenPeer, *listenClient, *tick, *electionTicks, *heartbeatTicks, *timeout, mode, *data, *snapshotEvery, *sessionTTL); err != nil {
 		log.Fatalf("kvnode: %v", err)

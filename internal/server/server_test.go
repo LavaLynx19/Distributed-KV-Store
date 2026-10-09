@@ -242,6 +242,22 @@ func TestClientAPIWithReadsThroughLog(t *testing.T) {
 	}
 }
 
+func TestClientAPIWithLeaseReads(t *testing.T) {
+	members := clusterReading(t, 3, raft.ReadsByLease)
+	leader := leaderURL(t, members)
+	if a := call(t, "PUT", leader+"/v1/kv/a", `{"value":"1"}`); a.code != 200 {
+		t.Fatalf("put: %+v", a)
+	}
+	for range 20 {
+		if a := call(t, "GET", leader+"/v1/kv/a", ""); a.code != 200 || a.body["value"] != "1" {
+			t.Fatalf("get: %+v", a)
+		}
+	}
+	if a := call(t, "GET", leader+"/v1/kv", ""); a.code != 200 || len(a.body["items"].([]any)) != 1 {
+		t.Fatalf("scan: %+v", a)
+	}
+}
+
 func TestReadIndexFollowerRedirectsGets(t *testing.T) {
 	members := cluster(t, 3)
 	leader := leaderURL(t, members)

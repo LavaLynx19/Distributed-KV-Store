@@ -3,13 +3,16 @@ package rungtest_test
 import (
 	"testing"
 
+	"distributed-kv-store/internal/raft"
+
 	"distributed-kv-store/internal/rungtest"
 )
 
 // timed is rung4Store with clients that give some keys a time-to-live, and
 // every request stamped with the receiving Member's clock.
-func timed() rungtest.Store {
-	s := rung4Store
+func timed() rungtest.Store { return timedFrom(rung4Store) }
+
+func timedFrom(s rungtest.Store) rungtest.Store {
 	s.Stamped = true
 	s.Workload.TTLPercent = 40
 	s.Workload.TTL = [2]int64{100, 600}
@@ -166,4 +169,62 @@ func TestScansAndTransactions(t *testing.T) {
 		t.Errorf("the checker ran out of time on %d of %d runs, which proves nothing about them", timedOut, runs)
 	}
 	t.Logf("%d runs", runs)
+}
+
+// leased is rung5Store with reads answered under a Leader lease (A§6.2).
+var leased = timedFrom(durable(func(c *raft.Config) { c.Reads = raft.ReadsByLease }))
+
+// mostlyReads is what a lease is for: nine requests in ten are gets.
+func mostlyReads(s rungtest.Store) rungtest.Store {
+	s.Workload.ReadPercent = 90
+	return s
+}
+
+// The lease variant (A§6.2) is exempt from the consistency promise, and
+// this is why: a Leader whose clock runs slow believes its lease long after
+// the others have elected someone else, and answers reads from old data.
+func TestLeaseGivesStaleReadsUnderASlowClock(t *testing.T) {
+	for _, tt := range []struct {
+		members int
+		seed    uint64
+	}{{3, 1}, {5, 2}} {
+		if r := rungtest.Run(mostlyReads(leased), scenario(t, "slow-leader"), tt.members, tt.seed); r.Linearizable {
+			t.Errorf("lease, %d Members, seed %d: expected a Stale read, got %v", tt.members, tt.seed, r)
+		}
+		// The same run with the lease off, which is the default.
+		if r := rungtest.Run(mostlyReads(rung5Store), scenario(t, "slow-leader"), tt.members, tt.seed); !r.Passed() {
+			t.Errorf("read index, %d Members, seed %d: %v", tt.members, tt.seed, r)
+		}
+	}
+	// With the lease off it can't be reproduced at all.
+	seeds := uint64(100)
+	if testing.Short() {
+		seeds = 10
+	}
+	for _, members := range []int{3, 5} {
+		for seed := uint64(1); seed <= seeds; seed++ {
+			if r := rungtest.Run(mostlyReads(rung5Store), scenario(t, "slow-leader"), members, seed); !r.Safe() {
+				t.Errorf("read index: %v", r)
+			}
+		}
+	}
+}
+
+// While every Member's ticks run at the same speed the lease is as safe as
+// read index, whatever else goes wrong.
+func TestLeaseIsSafeWhenClocksAgree(t *testing.T) {
+	seeds := uint64(50)
+	if testing.Short() {
+		seeds = 5
+	}
+	for _, sc := range append(append(everyScenario(), rungtest.Rung4...), scenario(t, "clock-jumps")) {
+		for _, members := range []int{3, 5} {
+			for seed := uint64(1); seed <= seeds; seed++ {
+				r := rungtest.Run(mostlyReads(leased), sc, members, seed)
+				if !r.Safe() || (!r.Stalled && len(r.Diverged) > 0) {
+					t.Errorf("%v\n  diverged: %v", r, r.Diverged)
+				}
+			}
+		}
+	}
 }
