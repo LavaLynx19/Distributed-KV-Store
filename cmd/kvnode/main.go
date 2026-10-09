@@ -44,6 +44,7 @@ func main() {
 	data := flag.String("data", "", "directory for this Node's durable state; empty keeps nothing across a restart")
 	snapshotEvery := flag.Int("snapshot-every", 20000, "take a Snapshot and trim the Log after this many applied Entries (0 never)")
 	sessionTTL := flag.Duration("session-ttl", time.Hour, "remove a Session unused for this long (0 never); must be the same on every Member")
+	membersFlag := flag.String("members", "", "ids of the Members the Group starts with: 1,2,3 (default: every Node in -peers). A Node that isn't listed starts as a Spare, to be added later")
 	reads := flag.String("reads", "index", "how gets are answered: index (read index, A§6.2), log (as Log Entries), or lease (from the Leader's memory under a lease: faster, and not Linearizable if clocks run at different speeds)")
 	flag.Parse()
 
@@ -58,12 +59,12 @@ func main() {
 	default:
 		log.Fatalf("kvnode: -reads must be index, log or lease, not %q", *reads)
 	}
-	if err := run(core.NodeID(*id), *peersFlag, *clientsFlag, *listenPeer, *listenClient, *tick, *electionTicks, *heartbeatTicks, *timeout, mode, *data, *snapshotEvery, *sessionTTL); err != nil {
+	if err := run(core.NodeID(*id), *peersFlag, *clientsFlag, *listenPeer, *listenClient, *tick, *electionTicks, *heartbeatTicks, *timeout, mode, *data, *snapshotEvery, *sessionTTL, *membersFlag); err != nil {
 		log.Fatalf("kvnode: %v", err)
 	}
 }
 
-func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string, tick time.Duration, electionTicks, heartbeatTicks int, timeout time.Duration, reads raft.ReadMode, data string, snapshotEvery int, sessionTTL time.Duration) error {
+func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string, tick time.Duration, electionTicks, heartbeatTicks int, timeout time.Duration, reads raft.ReadMode, data string, snapshotEvery int, sessionTTL time.Duration, membersFlag string) error {
 	peers, err := parseAddrs(peersFlag)
 	if err != nil {
 		return fmt.Errorf("-peers: %w", err)
@@ -86,6 +87,16 @@ func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string
 		members = append(members, m)
 	}
 	slices.Sort(members)
+	if membersFlag != "" {
+		members = nil
+		for _, field := range strings.Split(membersFlag, ",") {
+			m, err := strconv.ParseUint(strings.TrimSpace(field), 10, 64)
+			if err != nil || peers[core.NodeID(m)] == "" {
+				return fmt.Errorf("-members: %q isn't the id of a Node in -peers", field)
+			}
+			members = append(members, core.NodeID(m))
+		}
+	}
 
 	var store *storage.Store
 	var stored core.Stored
@@ -139,7 +150,7 @@ func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string
 	for m, addr := range clients {
 		hints[m] = "http://" + addr
 	}
-	api := &server.API{Node: node, Clients: hints, Timeout: timeout, ReadsBypassLog: reads != raft.ReadsThroughLog}
+	api := &server.API{Node: node, Clients: hints, Timeout: timeout, AdminTimeout: 6 * timeout, ReadsBypassLog: reads != raft.ReadsThroughLog}
 	srv := &http.Server{Addr: listenClient, Handler: api.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()

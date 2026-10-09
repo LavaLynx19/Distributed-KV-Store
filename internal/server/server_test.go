@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -35,6 +37,13 @@ func cluster(t *testing.T, n int) map[core.NodeID]*member {
 
 func clusterReading(t *testing.T, n int, reads raft.ReadMode) map[core.NodeID]*member {
 	t.Helper()
+	return clusterOf(t, n, n, reads)
+}
+
+// clusterOf starts n Nodes, of which the first founders are the Group and
+// the rest are Spares.
+func clusterOf(t *testing.T, n, founders int, reads raft.ReadMode) map[core.NodeID]*member {
+	t.Helper()
 	transport.Register(raft.MessageBodies()...)
 
 	listeners := map[core.NodeID]net.Listener{}
@@ -56,13 +65,13 @@ func clusterReading(t *testing.T, n int, reads raft.ReadMode) map[core.NodeID]*m
 	for _, id := range ids {
 		var node *server.Node
 		tr := transport.New(id, listeners[id], peers, func(m core.Message) { node.Deliver(m) })
-		c := raft.New(raft.Config{ID: id, Members: ids, ElectionTicks: 10, HeartbeatTicks: 1,
+		c := raft.New(raft.Config{ID: id, Members: ids[:founders], ElectionTicks: 10, HeartbeatTicks: 1,
 			Rand: rand.New(rand.NewPCG(uint64(id), 99)), Reads: reads})
 		node = server.NewNode(c, fsm.New(), tr.Send, 5*time.Millisecond)
 		node.TimeEntry = server.TimeEntries(nil)
 		ctx, cancel := context.WithCancel(context.Background())
 		go node.Run(ctx)
-		api := &server.API{Node: node, Clients: clients, Timeout: 2 * time.Second, ReadsBypassLog: reads != raft.ReadsThroughLog}
+		api := &server.API{Node: node, Clients: clients, Timeout: 2 * time.Second, AdminTimeout: 10 * time.Second, ReadsBypassLog: reads != raft.ReadsThroughLog}
 		m := &member{api: httptest.NewServer(api.Handler()), cancel: cancel, tr: tr}
 		members[id] = m
 		clients[id] = m.api.URL
@@ -377,5 +386,100 @@ func TestScanAndTransaction(t *testing.T) {
 	}
 	if a := call(t, "POST", leader+"/v1/txn", `{"writes":[{"op":"get","key":"a"}]}`); a.code != 400 {
 		t.Fatalf("a transaction with a get: %+v", a)
+	}
+}
+
+// memberIDs reads the Member list out of a status or admin answer.
+func memberIDs(a answer) []float64 {
+	var ids []float64
+	for _, m := range a.body["members"].([]any) {
+		ids = append(ids, m.(float64))
+	}
+	return ids
+}
+
+func TestAddAndRemoveAMember(t *testing.T) {
+	members := clusterOf(t, 4, 3, raft.ReadsByIndex)
+	spare := members[4].api.URL
+	all := maps.Clone(members)
+	delete(members, 4) // leaderURL must look among the founders
+	leader := leaderURL(t, members)
+	for i := range 20 {
+		if a := call(t, "PUT", leader+"/v1/kv/k"+strconv.Itoa(i), `{"value":"x"}`); a.code != 200 {
+			t.Fatalf("put %d: %+v", i, a)
+		}
+	}
+	if a := call(t, "GET", spare+"/v1/status", ""); !slices.Equal(memberIDs(a), []float64{1, 2, 3}) || a.body["role"] != "follower" {
+		t.Fatalf("the Spare's status: %+v", a)
+	}
+
+	// Refusals that change nothing.
+	if a := call(t, "POST", leader+"/v1/admin/members", `{"id":2}`); a.code != 400 || a.body["reason"] != "invalid" {
+		t.Fatalf("adding a Member that is one already: %+v", a)
+	}
+	if a := call(t, "DELETE", leader+"/v1/admin/members/9", ""); a.code != 400 {
+		t.Fatalf("removing a Node that isn't a Member: %+v", a)
+	}
+	for _, m := range members {
+		if m.api.URL == leader {
+			continue
+		}
+		if a := call(t, "POST", m.api.URL+"/v1/admin/members", `{"id":4}`); a.code != 421 || a.body["leader"] != leader {
+			t.Fatalf("asking a follower: %+v", a)
+		}
+	}
+	// A Spare hears nothing from the Group, so it can't even say who leads.
+	if a := call(t, "POST", spare+"/v1/admin/members", `{"id":4}`); a.code != 503 {
+		t.Fatalf("asking the Spare: %+v", a)
+	}
+
+	// The Spare is brought up to date and added.
+	if a := call(t, "POST", leader+"/v1/admin/members", `{"id":4}`); a.code != 200 || !slices.Equal(memberIDs(a), []float64{1, 2, 3, 4}) {
+		t.Fatalf("add: %+v", a)
+	}
+	resp, err := http.Get(spare + "/v1/debug/items")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var items []server.ItemJSON
+	decode(t, resp, &items)
+	if len(items) != 20 {
+		t.Fatalf("the new Member holds %d keys when it is added, want all 20", len(items))
+	}
+
+	// A founder that doesn't lead is removed. The Group goes on.
+	var gone string
+	for id, m := range members {
+		if m.api.URL != leader {
+			gone = strconv.FormatUint(uint64(id), 10)
+			break
+		}
+	}
+	if a := call(t, "DELETE", leader+"/v1/admin/members/"+gone, ""); a.code != 200 || len(memberIDs(a)) != 3 {
+		t.Fatalf("remove %s: %+v", gone, a)
+	}
+	if a := call(t, "PUT", leader+"/v1/kv/after", `{"value":"x"}`); a.code != 200 {
+		t.Fatalf("put after the changes: %+v", a)
+	}
+	// The Leader can be removed too: it hands over and says so.
+	me := call(t, "GET", leader+"/v1/status", "").body["id"].(float64)
+	if a := call(t, "DELETE", leader+"/v1/admin/members/"+strconv.Itoa(int(me)), ""); a.code != 200 || len(memberIDs(a)) != 2 {
+		t.Fatalf("removing the Leader: %+v", a)
+	}
+	// The two Members left elect one of themselves and serve. The removed
+	// Leader answers no_majority from now on, so a client must look around.
+	deadline := time.Now().Add(3 * time.Second)
+	for served := false; !served; time.Sleep(20 * time.Millisecond) {
+		for _, m := range all {
+			if a := call(t, "GET", m.api.URL+"/v1/kv/after", ""); a.code == 200 {
+				served = true
+			}
+		}
+		if !served && time.Now().After(deadline) {
+			for id, m := range all {
+				t.Logf("node %d: %+v", id, call(t, "GET", m.api.URL+"/v1/status", "").body)
+			}
+			t.Fatal("the two Members left never served a read")
+		}
 	}
 }

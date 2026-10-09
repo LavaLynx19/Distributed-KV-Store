@@ -194,6 +194,7 @@ func run(cfg config) bool {
 	if waited := cfg.settle - time.Until(settleBy); waited > 200*time.Millisecond {
 		fmt.Printf("settle:      Members took %s to converge\n", waited.Round(100*time.Millisecond))
 	}
+	current := members(httpc, cfg.nodes)
 	switch {
 	case len(diffs) > 0:
 		ok = false
@@ -202,9 +203,9 @@ func run(cfg config) bool {
 			fmt.Println("             " + d)
 		}
 	case unreachable > 0:
-		fmt.Printf("end state:   identical on the %d Members that answered (%d unreachable)\n", len(cfg.nodes)-unreachable, unreachable)
+		fmt.Printf("end state:   identical on the %d Members that answered (%d unreachable)\n", len(current)-unreachable, unreachable)
 	default:
-		fmt.Printf("end state:   identical on all %d Members\n", len(cfg.nodes))
+		fmt.Printf("end state:   identical on all %d Members %v\n", len(current), current)
 	}
 	return ok
 }
@@ -399,10 +400,47 @@ func (c *client) send(cmd fsm.Command) (check.Result, fsm.Response) {
 	return check.Lost, fsm.Response{} // 504 and anything unexpected: outcome unknown
 }
 
-// compare fetches every Member's own data and lists the differences.
+// members asks the Nodes who is in the Group now, preferring the Leader's
+// answer. Node i of nodes must have id i+1. If nobody says, every Node is
+// taken to be a Member.
+func members(httpc *http.Client, nodes []string) []core.NodeID {
+	var list []core.NodeID
+	for _, n := range nodes {
+		resp, err := httpc.Get(n + "/v1/status")
+		if err != nil {
+			continue
+		}
+		var st struct {
+			Role    string        `json:"role"`
+			Members []core.NodeID `json:"members"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&st)
+		resp.Body.Close()
+		if err != nil || len(st.Members) == 0 {
+			continue
+		}
+		if st.Role == "leader" {
+			return st.Members
+		}
+		list = st.Members
+	}
+	if list == nil {
+		for i := range nodes {
+			list = append(list, core.NodeID(i+1))
+		}
+	}
+	return list
+}
+
+// compare fetches every Member's own data and lists the differences. Nodes
+// that aren't Members now, Spares and the removed, are left out.
 func compare(httpc *http.Client, nodes []string) (diffs []string, unreachable int) {
 	items := map[core.NodeID][]fsm.Item{}
+	current := members(httpc, nodes)
 	for i, n := range nodes {
+		if !slices.Contains(current, core.NodeID(i+1)) {
+			continue
+		}
 		resp, err := httpc.Get(n + "/v1/debug/items")
 		if err != nil {
 			unreachable++

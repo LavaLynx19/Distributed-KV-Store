@@ -35,6 +35,9 @@ type proposal struct {
 	// read marks a query that bypasses the Log (A§6.2): the core says when
 	// it may be answered, and payload is then run against the state machine.
 	read bool
+	// members, if set, makes this a request for a Membership change to
+	// that list (A§6.5).
+	members []core.NodeID
 }
 
 // Storage makes a Member's durable state survive a restart. Write applies a
@@ -121,7 +124,9 @@ func (n *Node) Run(ctx context.Context) {
 	admit := func(p proposal) {
 		nextRef++
 		pending[nextRef] = p.done
-		if p.read {
+		if p.members != nil {
+			outs = append(outs, n.core.Step(core.Reconfigure{Ref: nextRef, Members: p.members}))
+		} else if p.read {
 			queries[nextRef] = p.payload
 			outs = append(outs, n.core.Step(core.Read{Ref: nextRef}))
 		} else {
@@ -257,6 +262,12 @@ func (n *Node) Propose(ctx context.Context, payload []byte) Reply {
 // Reply is Unknown, which for a read just means "ask again".
 func (n *Node) Read(ctx context.Context, query []byte) Reply {
 	return n.submit(ctx, proposal{payload: query, read: true})
+}
+
+// Reconfigure asks for a Membership change to the given list and waits for
+// its outcome (A§6.5). If ctx ends first the outcome is Unknown.
+func (n *Node) Reconfigure(ctx context.Context, members []core.NodeID) Reply {
+	return n.submit(ctx, proposal{members: members})
 }
 
 func (n *Node) submit(ctx context.Context, p proposal) Reply {

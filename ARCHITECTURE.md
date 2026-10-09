@@ -287,7 +287,9 @@ Requests carry `Session-Id` and `Request-Seq` headers so that a retry takes effe
 | 503 | `no_majority` | This Member knows of no Leader backed by a Majority: it is cut off, or an election is under way | Retry later, same request number |
 | 504 | `timeout` | Outcome unknown | Retry, same request number |
 | 410 | `session_expired` | The Session was cleaned up | Open a new Session; the outcome of the last request is unknown |
-| 400 | `invalid` | Malformed request | Fix the request |
+| 400 | `invalid` | Malformed request, or a Membership change that isn't one: the Node is already a Member, or isn't one, or is the last | Fix the request |
+| 409 | `change_in_progress` | Another Membership change is under way, or the Leader has only just been elected. Nothing changed | Retry later |
+| 503 | `member_unreachable` | The Node to be added didn't catch up with the Log. Nothing changed | Check the Node is running as a Spare, then retry |
 | 500 | `internal` | A bug in the store | Report it; the outcome is unknown |
 
 New reasons are added here first.
@@ -295,8 +297,12 @@ New reasons are added here first.
 ### 7.3 Admin
 | Method and path | Purpose |
 |---|---|
-| `POST /v1/admin/members` | Add a Member |
-| `DELETE /v1/admin/members/{id}` | Remove a Member |
+| `POST /v1/admin/members` | Add a Member: `{"id": 4}`. The Node must be running as a Spare. Answers once the change is Committed, with the new Member list |
+| `DELETE /v1/admin/members/{id}` | Remove a Member. Answers once the change is Committed, with the new Member list |
+
+`GET /v1/status` includes `members`: the list as that Node has it. `kvctl -nodes <urls> status|add <id>|remove <id>` wraps these, finds the Leader, and retries while the answer is `change_in_progress`.
+
+A Node is started as a Spare by leaving it out of `kvnode -members`, which names the Members the Group begins with.
 
 Unsafe recovery is a command-line action on a stopped Member, not an API call.
 

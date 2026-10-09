@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"time"
 
@@ -28,6 +29,9 @@ type API struct {
 	// Now is this Member's clock, in milliseconds. Nil means the system
 	// clock.
 	Now func() int64
+	// AdminTimeout bounds a Membership change, which can take far longer
+	// than a write: a Node being added must first be sent the whole Log.
+	AdminTimeout time.Duration
 }
 
 func (a *API) now() int64 {
@@ -93,6 +97,8 @@ type statusResponse struct {
 	// Recovering is set while the Member stays out of elections after
 	// finding damage on its disk (A§6.8).
 	Recovering bool `json:"recovering,omitempty"`
+	// Members is the Group's Member list as this Node has it (A§6.5).
+	Members []core.NodeID `json:"members"`
 }
 
 const maxBody = 1 << 20
@@ -106,6 +112,8 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/kv", a.scan)
 	mux.HandleFunc("POST /v1/txn", a.txn)
 	mux.HandleFunc("POST /v1/sessions", a.openSession)
+	mux.HandleFunc("POST /v1/admin/members", a.addMember)
+	mux.HandleFunc("DELETE /v1/admin/members/{id}", a.removeMember)
 	mux.HandleFunc("GET /v1/status", a.status)
 	mux.HandleFunc("GET /v1/debug/items", a.debugItems)
 	return mux
@@ -297,6 +305,69 @@ func (a *API) run(w http.ResponseWriter, r *http.Request, cmd fsm.Command) {
 	}
 }
 
+// addMember adds one Node to the Group (A§7.3). The Node must already be
+// running as a Spare: the Leader brings it up to date before it is added.
+func (a *API) addMember(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID core.NodeID `json:"id"`
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
+	if err == nil {
+		err = json.Unmarshal(body, &req)
+	}
+	if err != nil || req.ID == 0 {
+		writeError(w, http.StatusBadRequest, errorResponse{Reason: "invalid", Message: "body must be JSON like {\"id\": 4}"})
+		return
+	}
+	a.changeMembers(w, r, func(members []core.NodeID) []core.NodeID { return append(members, req.ID) })
+}
+
+// removeMember removes one Member from the Group (A§7.3).
+func (a *API) removeMember(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
+	if err != nil || id == 0 {
+		writeError(w, http.StatusBadRequest, errorResponse{Reason: "invalid", Message: "the Member's id must be a positive integer"})
+		return
+	}
+	a.changeMembers(w, r, func(members []core.NodeID) []core.NodeID {
+		return slices.DeleteFunc(members, func(m core.NodeID) bool { return m == core.NodeID(id) })
+	})
+}
+
+// changeMembers asks for the Member list change(current), and answers with
+// the list as it then stands.
+func (a *API) changeMembers(w http.ResponseWriter, r *http.Request, change func([]core.NodeID) []core.NodeID) {
+	ctx, cancel := context.WithTimeout(r.Context(), a.AdminTimeout)
+	defer cancel()
+	st, ok := a.Node.Status(ctx)
+	if !ok {
+		writeError(w, http.StatusGatewayTimeout, errorResponse{Reason: "timeout"})
+		return
+	}
+	want := change(slices.Clone(st.Members))
+	switch reply := a.Node.Reconfigure(ctx, want); reply.Reason {
+	case core.OK:
+		slices.Sort(want)
+		writeJSON(w, http.StatusOK, membersResponse{Members: want})
+	case core.NotLeader:
+		writeError(w, http.StatusMisdirectedRequest, errorResponse{Reason: "not_leader", Leader: a.Clients[reply.Leader]})
+	case core.NoMajority:
+		writeError(w, http.StatusServiceUnavailable, errorResponse{Reason: "no_majority"})
+	case core.Busy:
+		writeError(w, http.StatusConflict, errorResponse{Reason: "change_in_progress", Message: "another Membership change is under way, or the Leader is new; try again"})
+	case core.NoCatchUp:
+		writeError(w, http.StatusServiceUnavailable, errorResponse{Reason: "member_unreachable", Message: "the Node didn't catch up with the Log, so it wasn't added"})
+	case core.Invalid:
+		writeError(w, http.StatusBadRequest, errorResponse{Reason: "invalid", Message: "that Node is already a Member, or isn't one, or is the last one"})
+	default:
+		writeError(w, http.StatusGatewayTimeout, errorResponse{Reason: "timeout", Message: "outcome unknown"})
+	}
+}
+
+type membersResponse struct {
+	Members []core.NodeID `json:"members"`
+}
+
 func (a *API) status(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), a.Timeout)
 	defer cancel()
@@ -306,7 +377,7 @@ func (a *API) status(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	role := map[core.Role]string{core.Follower: "follower", core.Candidate: "candidate", core.LeaderRole: "leader"}[st.Role]
-	writeJSON(w, http.StatusOK, statusResponse{ID: st.ID, Role: role, Term: st.Term, Leader: st.Leader, Commit: st.Commit, Recovering: st.Recovering})
+	writeJSON(w, http.StatusOK, statusResponse{ID: st.ID, Role: role, Term: st.Term, Leader: st.Leader, Commit: st.Commit, Recovering: st.Recovering, Members: st.Members})
 }
 
 // ItemJSON is one key in the debug dump (A§7.4).
