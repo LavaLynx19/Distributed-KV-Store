@@ -1,6 +1,6 @@
 # Rung 6 retro: changing who is in the Group
 
-Status: **in progress**. The failures of a store that swaps its Member list in one step are recorded below (P6.1), with the one-at-a-time change that replaces it (P6.2–P6.3). The admin tools, Unsafe recovery and real runs follow.
+Status: **done**. A store that swaps its Member list in one step elects two Leaders. The store this Rung ends with changes one Member at a time under two rules, brings a new Member up to date before it counts, and can be forced back to life by an operator after losing its Majority. 5,300 simulated runs with 12,612 Membership changes are safe, and a dead Member was replaced under load on real processes with a pause of 37–76 ms.
 
 Environment: the Simulation, now with two **Spares** beside the Group: Nodes that run from the start and belong to no Group. A run asks the Leader for Membership changes while clients carry on. At the end only the Nodes that are still Members are compared.
 
@@ -81,6 +81,16 @@ Neither of the two main rules was tested by the scenarios I wrote first. Those a
 - **`impatient-shrink`** cuts the Leader off with one follower and asks it, three times in ten units, to remove a Member on the other side. Each request is a single change. Without rule 1 the Leader's side whittles the list down to itself and commits alone, while the other side still has a Majority of the list it knows.
 - **`straddle`** is the published flaw. With four founders, the Leader is cut off with a Spare and adds it, which can't Commit. The other three elect a Leader, which is cut off with one follower the instant it wins and asked to remove the old Leader. Without rule 2 it does, and commits with that one follower. Then the old Leader, the Spare and the founder that heard nothing of the new Term are joined, and elect the old Leader under the list of five. Two Groups now take writes.
 
+Three more breaks, tried later:
+
+| Break | Caught by the suite | Caught by |
+|---|---|---|
+| A Learner is added at once, caught up or not | No: it isn't unsafe | `TestCountingBeforeCatchingUpIsExposed`: the dead Node is added and the Group stops for 2,024 units |
+| A Leader that has removed itself still counts itself | **No**: 0 of 5,300 | A unit test only (`TestLeaderRemovesItself`) |
+| A change replaced in the Log stays in force | **No**: 0 of 5,300 | A unit test only (`TestReplacedChangeIsForgotten`) |
+
+The last two are real gaps. Each needs a further failure on top of the mistake before anything goes wrong, and no scenario I have lines them up.
+
 ## Unsafe recovery (P6.5)
 
 A Group that loses its Majority for good can never elect a Leader again. That is the price of never having two.
@@ -120,3 +130,65 @@ My first design appended the forced list to the survivor's Log as an ordinary En
 go test -run 'TestUnsafeRecovery' -v ./internal/rungtest/
 go test -run 'TestForceMembers' ./internal/storage/
 ```
+
+## Real runs (P6.6)
+
+M4 Pro, 10 s each, local processes, default mix.
+
+### Cost of the Rung (3 Members, 64 clients, no Faults)
+| | Requests/s | p50 |
+|---|---|---|
+| Rung 5 | 1,378 | 46.1 ms |
+| Rung 6 | **1,387** | 45.7 ms |
+
+### Replacing a dead Member under load (clients retrying in Sessions)
+A follower is killed for good. `kvctl add` brings in the Spare and `kvctl remove` drops the dead Member, while clients keep writing.
+
+| Founders | Clients | Requests/s | Rejected / lost | Longest pause in writes | Members at the end | Verdicts |
+|---|---|---|---|---|---|---|
+| 3 | 8 | 223 | 0 / 0 | 53 ms | [1 2 4] | Linearizable; identical |
+| 3 | 64 | 1,374 | 0 / 0 | 37 ms | [1 3 4] | Linearizable; identical |
+| 5 | 8 | 160 | 0 / 0 | 76 ms | [1 2 4 5 6] | Linearizable; identical |
+
+Clients didn't notice. Adding the Spare took a quarter of a second with a short Log.
+
+### Recovery after losing the Leader (3 Members, 8 clients, Leader killed and restarted)
+Six runs: **178, 221, 222, 283, 334 and 413 ms**. The first run gave 413 ms, over the 400 ms target, and Rung 5's one run gave 395 ms. Five more show the spread: usually well inside, with a tail that crosses the line. The tail is an election that takes two rounds. One run per Rung was never enough to say this, and the earlier retros' single figures should be read that way.
+
+Docker, 5 Members, Leader isolated: 1,939 requests/s, 0 rejected, 0 lost, 154 ms pause, Linearizable, identical.
+
+**Not covered by real runs:** Membership changes in Docker. The Compose file starts no Spares, and I didn't change it. Unsafe recovery was run once by hand on real processes (above) and isn't part of `run.sh`.
+
+### Reproduce
+```
+go test -run 'TestRung6|TestSwappingMembers|TestCountingBeforeCatchingUp|TestUnsafeRecovery' ./internal/rungtest/
+CLIENTS=64 harness/run.sh local 3
+RETRY=1 harness/run.sh local 3 replace-follower
+CLIENTS=64 RETRY=1 harness/run.sh local 3 replace-follower
+RETRY=1 harness/run.sh local 3 kill-leader
+harness/local.sh start 3 1 && harness/local.sh members
+```
+
+## Known limits
+- **Addresses are fixed at start.** Every Node is started with the address of every Node that may ever join. A change names a Node by id. Adding a Node nobody planned for means restarting the others with a longer list.
+- **A removed Member that was down when it was removed never learns of it.** It stands for election for ever and is ignored. The operator should stop it. The Leader could tell it before letting go, and doesn't.
+- **A Spare knows nothing about the Group**, not even who leads, so a client that asks one is told `no_majority` and must look elsewhere. So is a client that follows a stale hint to a removed Leader.
+
+## Verdict
+| Check (README → Success Criteria) | Result |
+|---|---|
+| Exposed | **Pass**: two Leaders in one Term and a History that isn't Linearizable (`TestSwappingMembersIsExposed`); a Group stopped by its own new Member (`TestCountingBeforeCatchingUpIsExposed`) |
+| Faults: never two Leaders during a change, including changes that straddle Terms | **Pass**: 5,300 simulated runs. Both rules are shown to matter by switching them off |
+| Faults: a dead Member replaced under load | **Pass**: three real runs, no request rejected or lost, pauses of 37–76 ms; and 200 simulated runs of `replace-the-dead` |
+| Faults: Unsafe recovery reports what it discarded | **Pass, as far as it can**: it reports the last Entry held and the Members discarded. It can't name the lost writes |
+| Numbers: at least 0.9× Rung 5 | **Pass**: 1.01× (1,387 against 1,378 requests/s) |
+| Numbers: recovery within 400 ms of losing a Leader | **5 of 6 runs**: 178–334 ms, and one of 413 ms |
+| Retro | This document |
+
+## Lessons
+1. **Scenarios that behave politely test nothing.** Mine asked for a change, waited, and asked for the next. Both safety rules could be deleted without a single failure in 800 runs. They exist for the operator who doesn't wait and the Leader that has just changed.
+2. **Safe and sensible are different questions.** Adding a Member one at a time is safe. Adding a dead one that counts at once is still safe, and stops the Group. The Learner step is there for availability and no correctness check will ever ask for it.
+3. **Some things can't be decided offline.** Unsafe recovery wanted to write an Entry, and an Entry needs a Term, and no Term chosen by a tool that can see one disk is right. The answer was to write less: a note beside the Log, and let an election decide.
+4. **The command can't report what it most needs to.** "What was discarded" is known only to the Members that were lost. Saying that plainly is more useful than a number that looks like an answer.
+5. **One measurement is an anecdote.** Earlier Rungs reported one run per Fault and called the recovery target met. Six runs of the same Fault here span 178 to 413 ms.
+6. **The byte-compatible habit paid off again.** The Snapshot's Member list hides behind a bit that old files never set, so every pinned seed from Rung 4 still fails the same way for the same reason.

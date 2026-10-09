@@ -69,7 +69,7 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P6.3 New Member catches up before it counts → §P6
 - [x] P6.4 Admin API and `kvctl`; replace a dead Member under load → §P6
 - [x] P6.5 Unsafe recovery command (A§6.6) → §P6
-- [ ] P6.6 Rung 6 suite: changes during crashes and Partitions; `retros/rung-6.md` → §P6
+- [x] P6.6 Rung 6 suite: changes during crashes and Partitions; `retros/rung-6.md` → §P6
 
 ### Phase 7 — Rung 7: several Groups (§P7)
 - [>] P7.0 Confirm or replace the A§10 sketch; write A§11 and Decision Log entries → defer until: Rung 6 retro is done
