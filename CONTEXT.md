@@ -32,6 +32,14 @@ _Avoid_: Epoch, generation, view
 Adding, removing or replacing a Member of a Group while it keeps serving.
 _Avoid_: Reconfiguration, resize
 
+**Spare**:
+A Node that is running but belongs to no Group.
+_Avoid_: Standby, idle node
+
+**Learner**:
+A Spare that a Leader is sending its Log to before adding it as a Member. It counts toward nothing until it is added.
+_Avoid_: Observer, non-voter, witness
+
 ## Data
 
 **Log**:

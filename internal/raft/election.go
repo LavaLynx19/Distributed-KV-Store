@@ -43,7 +43,7 @@ func (n *Node) handleRequestVote(out *core.Output, from core.NodeID, m RequestVo
 }
 
 func (n *Node) handleVoteReply(out *core.Output, from core.NodeID, m VoteReply) {
-	if n.role != core.Candidate || m.Term != n.term || !m.Granted {
+	if n.role != core.Candidate || m.Term != n.term || !m.Granted || !n.isMember(from) {
 		return
 	}
 	n.votes[from] = true
@@ -65,6 +65,7 @@ func (n *Node) becomeLeader(out *core.Output) {
 	n.sentSnap = map[core.NodeID]int{}
 	n.roundAcked = map[core.NodeID]uint64{}
 	n.leaseFrom = map[core.NodeID]int{}
+	n.learner, n.learnerRef = 0, 0
 	n.roundOpen = false
 	for _, m := range n.members {
 		n.next[m] = n.lastIndex() + 1

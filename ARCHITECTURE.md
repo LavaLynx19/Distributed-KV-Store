@@ -146,9 +146,9 @@ The state machine obeys the same rules, so every Member that applies the same En
 |---|---|
 | Vote state | Current **Term** and the Member voted for in it |
 | **Log** | **Entries**: index, Term, kind, payload. From Rung 5 a command's payload carries the Leader's time stamp |
-| **Snapshot** | Last included index and Term, and the state machine's full contents: keys and **Sessions**. The Member list joins them in Rung 6 |
+| **Snapshot** | Last included index and Term, and the state machine's full contents: keys and **Sessions**. From Rung 6, also the Member list as of that index, once it has ever changed |
 
-Entry kinds: no-op, command. Membership change arrives in Rung 6, and Rungs 7–8 add more (§10).
+Entry kinds: no-op, command, and from Rung 6 Membership change, whose payload is the Group's new Member list. Rungs 7–8 add more (§10).
 
 The commit index is not stored. A restarted Member knows only that its Snapshot is Committed, and learns the rest again from the Leader. The shell rebuilds the state machine from the Snapshot plus the Entries the core hands over again as they are confirmed.
 
@@ -174,7 +174,7 @@ A Member's data directory (`internal/storage`):
 | File | Content | How it changes |
 |---|---|---|
 | `state.a`, `state.b` | Term and vote, 16 bytes, twice | Each replaced whole, one after the other: written to a temporary file, synced, renamed |
-| `snapshot` | Index, Term, then the state machine's data | Replaced whole, the same way |
+| `snapshot` | Index, Term, then the state machine's data. If it carries a Member list, the Term's top bit is set and the list sits between the two: a 4-byte count and 8 bytes per Member | Replaced whole, the same way |
 | `log/<first>.seg` | Log segments, named by their first Entry's index. Each is a run of records | Appended to; a new segment starts every 4 MB |
 | `damaged` | Empty. Present while the Member is **Recovering** (§6.8) | Created when damage is found, removed when the core says it has recovered |
 
@@ -223,11 +223,19 @@ In Rung 1 clients never retry: a request with no definite answer is recorded as 
   - **It doesn't:** its Log is behind or has diverged, and it is dropped.
 
 ### 6.5 Membership change
-One Member is added or removed per change, as a Log Entry. A Member uses a new Member list as soon as the Entry is in its Log. Two rules guard it:
+One Member is added or removed per change, as a Log Entry that carries the whole new Member list. A Member uses a new list as soon as the Entry is in its Log, Committed or not, and goes back to the list before it if the Entry is replaced. Two rules guard it:
 - Only one change may be uncommitted at a time.
 - A Leader may not append a change until it has Committed an Entry from its own Term. Without this, changes that straddle Terms can produce two Majorities (a published flaw in the original single-change scheme).
 
-A new Member first catches up without counting toward the Majority.
+**Adding.** A Node to be added runs first as a **Spare**: it knows the Group's Member list, isn't in it, and so never stands for election. Asked to add it, the Leader makes it a **Learner**: it is sent the Log (or the Snapshot) like a follower and counts toward nothing. When it holds everything Committed, the Leader appends the change. If it hasn't caught up within 20 election timeouts the Leader gives up, and nothing has changed.
+
+**Removing.** The Leader appends the change and stops sending to the removed Member at once. A Leader may remove itself: it leads until the change is Committed, without counting itself toward the Majority, and then steps down.
+
+**A removed Member may never hear that it was removed**, and will then stand for election for ever. So a Member ignores a request for its vote from a Node that isn't in its list, and doesn't take that Node's Term either.
+
+**Where the list is kept.** Each Member remembers the list at its Snapshot (or the one the Group started with) and one per change still in its Log. A restarted Member reads them from its disk, and its start-up flags only name the starting list.
+
+**Addresses.** Every Node is started with the address of every Node that may ever join, Spares included. A change names a Node by id only.
 
 ### 6.6 Unsafe recovery
 An operator command, run on a surviving Member while the Group is stopped, rewrites its Member list to the survivors. It prints the last index it holds and warns that anything Committed beyond the survivors' Logs is lost. It is never automatic.

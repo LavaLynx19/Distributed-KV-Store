@@ -27,6 +27,10 @@ const (
 	EntryNoop EntryKind = iota
 	// EntryCommand carries a state machine command in Payload.
 	EntryCommand
+	// EntryMembers is a Membership change (A§6.5): Payload is the Group's
+	// new Member list, which a Member uses from the moment the Entry is in
+	// its Log. The state machine ignores it.
+	EntryMembers
 )
 
 // Entry is one change in the Log.
@@ -50,6 +54,10 @@ type Snapshot struct {
 	Index Index
 	Term  Term
 	Data  []byte
+	// Members is the Group's Member list as of Index, if a Membership
+	// change had been made by then. Nil means the list the Group started
+	// with.
+	Members []NodeID
 }
 
 // Persist is the change a step makes to a Member's durable state. Its parts
@@ -151,8 +159,8 @@ type Message struct {
 	Body any
 }
 
-// Event is one input to a core. The events are Tick, Receive, Propose, Read
-// and Snapshotted.
+// Event is one input to a core. The events are Tick, Receive, Propose, Read,
+// Snapshotted and Reconfigure.
 type Event interface{ event() }
 
 // Tick tells the core that one unit of time has passed. Timeouts are counted
@@ -186,11 +194,21 @@ type Snapshotted struct {
 	Data  []byte
 }
 
+// Reconfigure asks the core for a Membership change: Members is the Member
+// list the Group should have afterwards (A§6.5). The core reports the
+// request's fate exactly once, in Output.Results with the same Ref: OK once
+// the change is Committed.
+type Reconfigure struct {
+	Ref     uint64
+	Members []NodeID
+}
+
 func (Tick) event()        {}
 func (Receive) event()     {}
 func (Propose) event()     {}
 func (Read) event()        {}
 func (Snapshotted) event() {}
+func (Reconfigure) event() {}
 
 // Reason says why a proposal did not commit.
 type Reason uint8
@@ -207,6 +225,17 @@ const (
 	// Unknown: the Member accepted the proposal and then lost the ability to
 	// say whether it committed (for example, it stopped being Leader).
 	Unknown
+	// Invalid: a Membership change that isn't one the core makes: it must
+	// add or remove exactly one Member, and leave at least one. Nothing
+	// changed.
+	Invalid
+	// Busy: a Membership change was refused because another is still under
+	// way, or the Leader has yet to commit an Entry of its own Term. Nothing
+	// changed; ask again.
+	Busy
+	// NoCatchUp: the Member to be added didn't catch up with the Log in
+	// time, so it wasn't added. Nothing changed.
+	NoCatchUp
 )
 
 // Result is the fate of one proposal. With Reason OK, Index is where its
@@ -259,6 +288,8 @@ type Status struct {
 	// Recovering is set while a Member that found damage on its disk is
 	// staying out of elections (A§6.8).
 	Recovering bool
+	// Members is the Group's Member list as this Node has it, ascending.
+	Members []NodeID
 }
 
 // Node is a consensus core. Step must be called from one goroutine at a

@@ -45,7 +45,11 @@ type observer interface{ Observe(now int64) }
 // Config describes one simulated Group.
 type Config struct {
 	Seed  uint64
-	Nodes int // Members are numbered 1..Nodes
+	Nodes int // Nodes are numbered 1..Nodes
+	// Members is how many of them the Group starts with: Nodes 1..Members.
+	// The rest run from the start as spares, in no Group, until a
+	// Membership change adds them (A§6.5). Zero means every Node.
+	Members int
 
 	// NewNode builds a Member's core. members lists every Member, id included.
 	NewNode func(id core.NodeID, members []core.NodeID, rng core.Rand) core.Node
@@ -154,7 +158,11 @@ type Sim struct {
 	dup     float64                 // chance that any one message arrives twice
 	nextRef uint64
 	digest  uint64
+	changes int // Membership changes that were Committed
 }
+
+// Changes is how many Membership changes have been Committed.
+func (s *Sim) Changes() int { return s.changes }
 
 // New builds a Group and schedules each Member's first tick.
 func New(cfg Config) *Sim {
@@ -180,7 +188,7 @@ func New(cfg Config) *Sim {
 	for _, id := range s.ids {
 		m := &member{
 			id:      id,
-			core:    cfg.NewNode(id, slices.Clone(s.ids), rand.New(rand.NewPCG(cfg.Seed, uint64(id)))),
+			core:    cfg.NewNode(id, s.Founders(), rand.New(rand.NewPCG(cfg.Seed, uint64(id)))),
 			machine: cfg.NewMachine(),
 			up:      true,
 			pending: map[uint64]func(Reply){},
@@ -202,6 +210,14 @@ func (s *Sim) Now() int64 { return s.now }
 
 // IDs lists the Members in order.
 func (s *Sim) IDs() []core.NodeID { return slices.Clone(s.ids) }
+
+// Founders are the Members the Group starts with.
+func (s *Sim) Founders() []core.NodeID {
+	if s.cfg.Members == 0 {
+		return slices.Clone(s.ids)
+	}
+	return slices.Clone(s.ids[:s.cfg.Members])
+}
 
 // Status is a Member's own view of the Group.
 func (s *Sim) Status(id core.NodeID) core.Status { return s.members[id].core.Status() }
@@ -252,6 +268,26 @@ func (s *Sim) Propose(to core.NodeID, payload []byte, done func(Reply)) {
 		payload = s.cfg.Stamp(payload, m.clock(s.now))
 	}
 	s.step(m, core.Propose{Ref: ref, Payload: payload})
+}
+
+// Reconfigure asks one Member for a Membership change to the given list, as
+// an operator would. done is called exactly once, with the outcome.
+func (s *Sim) Reconfigure(to core.NodeID, members []core.NodeID, done func(Reply)) {
+	m := s.members[to]
+	if !m.up {
+		done(Reply{Refused: true})
+		return
+	}
+	s.nextRef++
+	ref := s.nextRef
+	m.pending[ref] = func(r Reply) {
+		if r.Reason == core.OK {
+			s.changes++
+		}
+		done(r)
+	}
+	s.mix('M', uint64(to), ref)
+	s.step(m, core.Reconfigure{Ref: ref, Members: slices.Clone(members)})
 }
 
 // Read asks one Member to answer a query from its own state, bypassing the
@@ -335,7 +371,7 @@ func (s *Sim) Restart(id core.NodeID) {
 	}
 	m.up, m.store, m.startErr = true, store, nil
 	rng := rand.New(rand.NewPCG(s.cfg.Seed, uint64(id)+uint64(m.life)<<32))
-	m.core = s.cfg.Restart(id, slices.Clone(s.ids), rng, stored)
+	m.core = s.cfg.Restart(id, s.Founders(), rng, stored)
 }
 
 func (s *Sim) openDisk(fs *storage.MemFS) (*storage.Store, core.Stored, error) {

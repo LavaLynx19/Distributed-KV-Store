@@ -225,3 +225,41 @@ func TestMatchesStoredApply(t *testing.T) {
 		s.Close()
 	}
 }
+
+// A Snapshot's Member list comes back with it, and a Membership change Entry
+// comes back as what it was. A Snapshot with no list is stored exactly as it
+// was before lists existed.
+func TestMemberListsSurviveARestart(t *testing.T) {
+	dir := t.TempDir()
+	s, _, err := Open(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	change := core.Entry{Index: 3, Term: 2, Kind: core.EntryMembers, Payload: []byte{2, 1, 4}}
+	save(t, s, core.Persist{Entries: append(es(1, 2, 1), change)})
+	save(t, s, core.Persist{Snapshot: &core.Snapshot{Index: 2, Term: 1, Data: []byte("state"), Members: []core.NodeID{1, 2, 5}}})
+	s, stored := reopen(t, s, dir, 0)
+	want := &core.Snapshot{Index: 2, Term: 1, Data: []byte("state"), Members: []core.NodeID{1, 2, 5}}
+	if !reflect.DeepEqual(stored.Snapshot, want) {
+		t.Fatalf("snapshot = %+v, want %+v", stored.Snapshot, want)
+	}
+	if len(stored.Entries) != 1 || !reflect.DeepEqual(stored.Entries[0], change) {
+		t.Fatalf("entries = %+v, want the Membership change", stored.Entries)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	plain := &core.Snapshot{Index: 7, Term: 3, Data: []byte("state")}
+	if raw := encodeSnapshot(plain); len(raw) != 16+5 || raw[8] != 0 {
+		t.Fatalf("a Snapshot with no Member list encoded as %v", raw)
+	}
+	if got := decodeSnapshot(encodeSnapshot(plain)); !reflect.DeepEqual(got, plain) {
+		t.Fatalf("round trip gave %+v", got)
+	}
+	// A header that promises more Members than the file holds is damage.
+	short := encodeSnapshot(want)[:20]
+	if readableSnapshot(short) {
+		t.Fatal("a Snapshot cut off inside its Member list was accepted")
+	}
+}

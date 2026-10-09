@@ -175,7 +175,7 @@ func OpenWith(fs FS, dir string, opts Options) (*Store, core.Stored, error) {
 	raw, err := s.readWhole("snapshot")
 	var corrupt *CorruptError
 	switch {
-	case errors.As(err, &corrupt) || (err == nil && raw != nil && len(raw) < 16):
+	case errors.As(err, &corrupt) || (err == nil && raw != nil && !readableSnapshot(raw)):
 		if err := s.markDamaged(&stored); err != nil {
 			return nil, core.Stored{}, err
 		}
@@ -189,11 +189,7 @@ func OpenWith(fs FS, dir string, opts Options) (*Store, core.Stored, error) {
 	case err != nil:
 		return nil, core.Stored{}, err
 	case raw != nil:
-		stored.Snapshot = &core.Snapshot{
-			Index: core.Index(binary.BigEndian.Uint64(raw[:8])),
-			Term:  core.Term(binary.BigEndian.Uint64(raw[8:16])),
-			Data:  raw[16:],
-		}
+		stored.Snapshot = decodeSnapshot(raw)
 		s.first = stored.Snapshot.Index + 1
 		s.snapshotTerm = stored.Snapshot.Term
 	}
@@ -517,10 +513,7 @@ func (s *Store) Write(p *core.Persist) error {
 		}
 	}
 	if p.Snapshot != nil {
-		raw := make([]byte, 16, 16+len(p.Snapshot.Data))
-		binary.BigEndian.PutUint64(raw[:8], uint64(p.Snapshot.Index))
-		binary.BigEndian.PutUint64(raw[8:], uint64(p.Snapshot.Term))
-		if err := s.replaceFile("snapshot", append(raw, p.Snapshot.Data...)); err != nil {
+		if err := s.replaceFile("snapshot", encodeSnapshot(p.Snapshot)); err != nil {
 			return err
 		}
 		if err := s.dropThrough(p.Snapshot.Index, p.ResetLog); err != nil {
@@ -719,6 +712,58 @@ func (s *Store) dropThrough(index core.Index, all bool) error {
 		}
 	}
 	return nil
+}
+
+// withMembers is set in a Snapshot file's Term field when a Member list
+// follows the header. No Term comes near it.
+const withMembers = 1 << 63
+
+// encodeSnapshot lays a Snapshot out as Index and Term, 8 bytes each, then
+// the state machine's data. If the Snapshot carries a Member list (A§6.5),
+// the Term's top bit is set and the list comes between the two: a 4-byte
+// count, then 8 bytes per Member.
+func encodeSnapshot(snap *core.Snapshot) []byte {
+	raw := make([]byte, 16, 16+4+8*len(snap.Members)+len(snap.Data))
+	binary.BigEndian.PutUint64(raw[:8], uint64(snap.Index))
+	term := uint64(snap.Term)
+	if snap.Members != nil {
+		term |= withMembers
+		raw = binary.BigEndian.AppendUint32(raw, uint32(len(snap.Members)))
+		for _, m := range snap.Members {
+			raw = binary.BigEndian.AppendUint64(raw, uint64(m))
+		}
+	}
+	binary.BigEndian.PutUint64(raw[8:16], term)
+	return append(raw, snap.Data...)
+}
+
+// readableSnapshot reports whether raw is long enough for what its header
+// says it holds.
+func readableSnapshot(raw []byte) bool {
+	if len(raw) < 16 {
+		return false
+	}
+	if binary.BigEndian.Uint64(raw[8:16])&withMembers == 0 {
+		return true
+	}
+	return len(raw) >= 20 && uint64(len(raw)-20) >= 8*uint64(binary.BigEndian.Uint32(raw[16:20]))
+}
+
+func decodeSnapshot(raw []byte) *core.Snapshot {
+	term := binary.BigEndian.Uint64(raw[8:16])
+	snap := &core.Snapshot{Index: core.Index(binary.BigEndian.Uint64(raw[:8])), Term: core.Term(term &^ withMembers)}
+	rest := raw[16:]
+	if term&withMembers != 0 {
+		count := binary.BigEndian.Uint32(rest[:4])
+		rest = rest[4:]
+		snap.Members = make([]core.NodeID, count)
+		for i := range snap.Members {
+			snap.Members[i] = core.NodeID(binary.BigEndian.Uint64(rest[:8]))
+			rest = rest[8:]
+		}
+	}
+	snap.Data = rest
+	return snap
 }
 
 // endMark closes every checked record. It is non-zero on purpose.

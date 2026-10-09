@@ -32,7 +32,10 @@ func (n *Node) leaseHolds() bool {
 	if !n.ownTermCommitted() {
 		return false
 	}
-	sent := []int{n.now}
+	var sent []int
+	if n.isMember(n.id) {
+		sent = append(sent, n.now)
+	}
 	for _, m := range n.members {
 		if at, ok := n.leaseFrom[m]; ok && m != n.id {
 			sent = append(sent, at)

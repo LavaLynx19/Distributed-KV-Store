@@ -2,6 +2,7 @@ package raft
 
 import (
 	"fmt"
+	"slices"
 
 	"distributed-kv-store/internal/core"
 )
@@ -103,10 +104,18 @@ func (n *Node) handleInstallSnapshot(out *core.Output, from core.NodeID, m Insta
 	p.Snapshot = &snap
 	if snap.Index <= n.lastIndex() && n.termAt(snap.Index) == snap.Term {
 		n.log.compactTo(snap.Index)
+		n.foldListsTo(snap.Index)
 	} else {
 		n.log = raftLog{base: snap.Index, baseTerm: snap.Term}
 		p.ResetLog = true
+		n.lists = n.lists[:1]
 	}
+	if snap.Members != nil {
+		// The Snapshot's list is the one in force at its last Entry.
+		n.lists[0] = memberList{index: snap.Index, members: slices.Clone(snap.Members)}
+		n.changed = true
+	}
+	n.members = n.lists[len(n.lists)-1].members
 	n.commit, n.applied = snap.Index, snap.Index
 	out.Restore = &snap
 	n.sendReply(out, from, AppendReply{Term: n.term, Success: true, Match: snap.Index, ReadRound: m.ReadRound})
@@ -169,6 +178,7 @@ func (n *Node) handleAppend(out *core.Output, from core.NodeID, m Append) {
 				panic(fmt.Sprintf("raft: node %d asked to replace Committed Entry %d", n.id, index))
 			}
 			n.log.truncateFrom(index)
+			n.dropListsFrom(index)
 			persist(out).TruncateFrom = index
 		}
 		n.appendEntry(out, e)
@@ -193,6 +203,9 @@ func (n *Node) handleAppend(out *core.Output, from core.NodeID, m Append) {
 func (n *Node) handleAppendReply(out *core.Output, from core.NodeID, m AppendReply) {
 	if n.role != core.LeaderRole || m.Term != n.term {
 		return
+	}
+	if _, followed := n.next[from]; !followed {
+		return // a Node this Leader no longer replicates to
 	}
 	n.heard[from] = n.now
 	if at, ok := n.leaseFrom[from]; m.Sent != 0 && (!ok || m.Sent > at) {
@@ -240,7 +253,7 @@ func (n *Node) handleAppendReply(out *core.Output, from core.NodeID, m AppendRep
 // to stop a later Leader from replacing it.
 func (n *Node) advanceCommit() {
 	for i := n.lastIndex(); i > n.commit && n.termAt(i) == n.term; i-- {
-		holders := 1
+		holders := n.self()
 		for _, m := range n.members {
 			if m != n.id && n.match[m] >= i {
 				holders++
