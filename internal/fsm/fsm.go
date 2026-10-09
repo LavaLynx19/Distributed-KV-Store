@@ -28,9 +28,34 @@ const (
 	// in a Group nobody is writing to (A§6.7). A Leader's shell proposes one
 	// when Due says so.
 	OpTick
+	// OpScan reads the keys from Key up to but not including End, in key
+	// order, Limit at most. An empty End means to the last key (A§7.1).
+	OpScan
+	// OpTxn is a Transaction: if every key in Conds has the version given,
+	// all of Writes are applied, and otherwise none are (A§5.2).
+	OpTxn
 
-	lastOp = OpTick
+	lastOp = OpTxn
 )
+
+// MaxScan is the most keys one scan returns, whatever Limit it asks for.
+const MaxScan = 1000
+
+// Cond is one condition of a Transaction: Key's version must be Version.
+// Version 0 means the key must not exist.
+type Cond struct {
+	Key     string
+	Version uint64
+}
+
+// Write is one change a Transaction makes. Op is OpPut or OpDelete. A
+// delete of a key that doesn't exist changes nothing and is not a failure.
+type Write struct {
+	Op    Op
+	Key   string
+	Value []byte
+	TTL   int64
+}
 
 // Command is one client request, carried in an Entry's payload.
 type Command struct {
@@ -55,6 +80,11 @@ type Command struct {
 	// TTL, on a put, is how long the key lives, in the units of Stamp. Zero
 	// means for good.
 	TTL int64
+	// End and Limit bound an OpScan. Conds and Writes make up an OpTxn.
+	End    string
+	Limit  uint64
+	Conds  []Cond
+	Writes []Write
 }
 
 // Stamp returns the encoded Command with its Stamp set to now. A shell calls
@@ -87,13 +117,17 @@ const (
 
 // Response is what the client gets back. Version is the key's version after
 // the Command: the Index of the Entry that last wrote it, or 0 if it doesn't
-// exist. On a mismatch it is the version found.
+// exist. On a mismatch it is the version found. For a Transaction that was
+// applied it is the version every key it put now has.
 type Response struct {
 	Status  Status
 	Value   []byte
 	Version uint64
 	// Session is the new Session's id, in the answer to OpOpenSession.
 	Session uint64
+	// Items are the keys a scan found. For a Transaction that was refused
+	// they are the conditions that failed, each with the version found.
+	Items []Item
 }
 
 // Item is one key with its value and version. Expires is its deadline, or
@@ -327,7 +361,7 @@ func (m *Machine) Sessions() int { return m.sessions.Len() }
 // Whether that answer is safe to give a client is the core's call (A§6.2).
 func (m *Machine) Read(query []byte) []byte {
 	cmd, err := DecodeCommand(query)
-	if err != nil || cmd.Op != OpGet {
+	if err != nil || (cmd.Op != OpGet && cmd.Op != OpScan) {
 		return Response{Status: StatusInvalid}.Encode()
 	}
 	return m.apply(cmd, 0).Encode()
@@ -347,20 +381,7 @@ func (m *Machine) apply(cmd Command, index uint64) Response {
 		if cmd.Conditional && cur.version != cmd.IfVersion {
 			return Response{Status: StatusVersionMismatch, Version: cur.version}
 		}
-		put := entry{value: bytes.Clone(cmd.Value), version: index}
-		if cmd.TTL > 0 {
-			// The deadline counts from logTime, which every Member agrees
-			// on. The naive store counts from the Leader's reading and
-			// leaves each Member to compare it with its own clock.
-			put.deadline = m.logTime + cmd.TTL
-			if m.ownClock {
-				put.deadline = cmd.Stamp + cmd.TTL
-			}
-			if put.deadline == 0 {
-				put.deadline = 1 // zero means no deadline
-			}
-		}
-		m.set(cmd.Key, put)
+		m.set(cmd.Key, entry{value: bytes.Clone(cmd.Value), version: index, deadline: m.deadline(cmd.Stamp, cmd.TTL)})
 		return Response{Status: StatusOK, Version: index}
 	case OpDelete:
 		if cmd.Conditional && cur.version != cmd.IfVersion {
@@ -373,8 +394,58 @@ func (m *Machine) apply(cmd Command, index uint64) Response {
 		return Response{Status: StatusOK}
 	case OpTick:
 		return Response{Status: StatusOK}
+	case OpScan:
+		limit := cmd.Limit
+		if limit == 0 || limit > MaxScan {
+			limit = MaxScan
+		}
+		resp := Response{Status: StatusOK}
+		m.keys.Ascend(cmd.Key, cmd.End, func(k string, e entry) bool {
+			resp.Items = append(resp.Items, Item{Key: k, Value: e.value, Version: e.version})
+			return uint64(len(resp.Items)) < limit
+		})
+		return resp
+	case OpTxn:
+		var failed []Item
+		for _, c := range cmd.Conds {
+			if found, _ := m.keys.Get(c.Key); found.version != c.Version {
+				failed = append(failed, Item{Key: c.Key, Version: found.version})
+			}
+		}
+		if len(failed) > 0 {
+			return Response{Status: StatusVersionMismatch, Items: failed}
+		}
+		for _, w := range cmd.Writes {
+			switch w.Op {
+			case OpPut:
+				m.set(w.Key, entry{value: bytes.Clone(w.Value), version: index, deadline: m.deadline(cmd.Stamp, w.TTL)})
+			case OpDelete:
+				m.unset(w.Key)
+			default:
+				// DecodeCommand lets nothing else through.
+			}
+		}
+		return Response{Status: StatusOK, Version: index}
 	}
 	return Response{Status: StatusInvalid}
+}
+
+// deadline is when a key written now with this time-to-live stops existing,
+// or zero if it has none. It counts from logTime, which every Member agrees
+// on. The naive store counts from the Leader's reading and leaves each
+// Member to compare it with its own clock.
+func (m *Machine) deadline(stamp, ttl int64) int64 {
+	if ttl <= 0 {
+		return 0
+	}
+	d := m.logTime + ttl
+	if m.ownClock {
+		d = stamp + ttl
+	}
+	if d == 0 {
+		d = 1 // zero means no deadline
+	}
+	return d
 }
 
 // Items lists every key in key order, for End-state comparison (A§8.2).
@@ -391,8 +462,9 @@ var errMalformed = errors.New("fsm: malformed payload")
 
 // Encode lays a Command out as: op, flags, if-version, session, seq, key
 // length, key, value length, value. Integers are unsigned varints. A Command
-// with a Stamp or a TTL sets the timed flag and ends with those two, as
-// signed varints.
+// with a Stamp or a TTL sets the timed flag and follows with those two, as
+// signed varints. A scan or a Transaction sets the extended flag and ends
+// with its own fields.
 func (c Command) Encode() []byte {
 	b := make([]byte, 0, 4+len(c.Key)+len(c.Value)+7*binary.MaxVarintLen64)
 	b = append(b, byte(c.Op))
@@ -403,6 +475,10 @@ func (c Command) Encode() []byte {
 	timed := c.Stamp != 0 || c.TTL != 0
 	if timed {
 		flags |= flagTimed
+	}
+	extended := c.Op == OpScan || c.Op == OpTxn
+	if extended {
+		flags |= flagExtended
 	}
 	b = append(b, flags)
 	b = binary.AppendUvarint(b, c.IfVersion)
@@ -416,12 +492,31 @@ func (c Command) Encode() []byte {
 		b = binary.AppendVarint(b, c.Stamp)
 		b = binary.AppendVarint(b, c.TTL)
 	}
+	switch c.Op {
+	case OpScan:
+		b = appendBytes(b, []byte(c.End))
+		b = binary.AppendUvarint(b, c.Limit)
+	case OpTxn:
+		b = binary.AppendUvarint(b, uint64(len(c.Conds)))
+		for _, cond := range c.Conds {
+			b = appendBytes(b, []byte(cond.Key))
+			b = binary.AppendUvarint(b, cond.Version)
+		}
+		b = binary.AppendUvarint(b, uint64(len(c.Writes)))
+		for _, w := range c.Writes {
+			b = append(b, byte(w.Op))
+			b = appendBytes(b, []byte(w.Key))
+			b = appendBytes(b, w.Value)
+			b = binary.AppendVarint(b, w.TTL)
+		}
+	}
 	return b
 }
 
 const (
 	flagConditional = 1 << iota
 	flagTimed
+	flagExtended
 )
 
 func DecodeCommand(b []byte) (Command, error) {
@@ -430,6 +525,9 @@ func DecodeCommand(b []byte) (Command, error) {
 	}
 	c := Command{Op: Op(b[0]), Conditional: b[1]&flagConditional != 0}
 	timed := b[1]&flagTimed != 0
+	if extended := b[1]&flagExtended != 0; extended != (c.Op == OpScan || c.Op == OpTxn) {
+		return Command{}, errMalformed
+	}
 	if c.Op < OpGet || c.Op > lastOp {
 		return Command{}, errMalformed
 	}
@@ -460,6 +558,55 @@ func DecodeCommand(b []byte) (Command, error) {
 			return Command{}, errMalformed
 		}
 	}
+	switch c.Op {
+	case OpScan:
+		var end []byte
+		if end, b, ok = lengthPrefixed(b); !ok {
+			return Command{}, errMalformed
+		}
+		c.End = string(end)
+		if c.Limit, b, ok = uvarint(b); !ok {
+			return Command{}, errMalformed
+		}
+	case OpTxn:
+		var n uint64
+		if n, b, ok = uvarint(b); !ok || n > uint64(len(b)) {
+			return Command{}, errMalformed
+		}
+		for i := uint64(0); i < n; i++ {
+			var key []byte
+			var cond Cond
+			if key, b, ok = lengthPrefixed(b); !ok {
+				return Command{}, errMalformed
+			}
+			cond.Key = string(key)
+			if cond.Version, b, ok = uvarint(b); !ok {
+				return Command{}, errMalformed
+			}
+			c.Conds = append(c.Conds, cond)
+		}
+		if n, b, ok = uvarint(b); !ok || n > uint64(len(b)) {
+			return Command{}, errMalformed
+		}
+		for i := uint64(0); i < n; i++ {
+			if len(b) == 0 {
+				return Command{}, errMalformed
+			}
+			w := Write{Op: Op(b[0])}
+			var key []byte
+			if key, b, ok = lengthPrefixed(b[1:]); !ok || (w.Op != OpPut && w.Op != OpDelete) {
+				return Command{}, errMalformed
+			}
+			w.Key = string(key)
+			if w.Value, b, ok = lengthPrefixed(b); !ok {
+				return Command{}, errMalformed
+			}
+			if w.TTL, b, ok = varint(b); !ok || w.TTL < 0 {
+				return Command{}, errMalformed
+			}
+			c.Writes = append(c.Writes, w)
+		}
+	}
 	if len(b) != 0 {
 		return Command{}, errMalformed
 	}
@@ -467,7 +614,8 @@ func DecodeCommand(b []byte) (Command, error) {
 }
 
 // Encode lays a Response out as: status, version, session, value length,
-// value.
+// value. A Response with Items follows that with their count and, for each,
+// its key, value and version.
 func (r Response) Encode() []byte {
 	b := make([]byte, 0, 1+len(r.Value)+3*binary.MaxVarintLen64)
 	b = append(b, byte(r.Status))
@@ -475,6 +623,15 @@ func (r Response) Encode() []byte {
 	b = binary.AppendUvarint(b, r.Session)
 	b = binary.AppendUvarint(b, uint64(len(r.Value)))
 	b = append(b, r.Value...)
+	if len(r.Items) == 0 {
+		return b
+	}
+	b = binary.AppendUvarint(b, uint64(len(r.Items)))
+	for _, it := range r.Items {
+		b = appendBytes(b, []byte(it.Key))
+		b = appendBytes(b, it.Value)
+		b = binary.AppendUvarint(b, it.Version)
+	}
 	return b
 }
 
@@ -491,7 +648,32 @@ func DecodeResponse(b []byte) (Response, error) {
 	if r.Session, b, ok = uvarint(b); !ok {
 		return Response{}, errMalformed
 	}
-	if r.Value, b, ok = lengthPrefixed(b); !ok || len(b) != 0 {
+	if r.Value, b, ok = lengthPrefixed(b); !ok {
+		return Response{}, errMalformed
+	}
+	if len(b) == 0 {
+		return r, nil
+	}
+	var n uint64
+	if n, b, ok = uvarint(b); !ok || n == 0 || n > uint64(len(b)) {
+		return Response{}, errMalformed
+	}
+	for i := uint64(0); i < n; i++ {
+		var key []byte
+		var it Item
+		if key, b, ok = lengthPrefixed(b); !ok {
+			return Response{}, errMalformed
+		}
+		it.Key = string(key)
+		if it.Value, b, ok = lengthPrefixed(b); !ok {
+			return Response{}, errMalformed
+		}
+		if it.Version, b, ok = uvarint(b); !ok {
+			return Response{}, errMalformed
+		}
+		r.Items = append(r.Items, it)
+	}
+	if len(b) != 0 {
 		return Response{}, errMalformed
 	}
 	return r, nil

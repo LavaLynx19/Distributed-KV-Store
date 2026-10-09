@@ -258,6 +258,16 @@ func describe(cmd fsm.Command, out Outcome) string {
 		call = fmt.Sprintf("put(%s, %q%s)", cmd.Key, cmd.Value, cond)
 	case fsm.OpDelete:
 		call = fmt.Sprintf("delete(%s%s)", cmd.Key, cond)
+	case fsm.OpScan:
+		call = fmt.Sprintf("scan(%q..%q, limit %d)", cmd.Key, cmd.End, cmd.Limit)
+		if !out.Unknown && out.Resp.Status == fsm.StatusOK {
+			return fmt.Sprintf("%s → %v", call, out.Resp.Items)
+		}
+	case fsm.OpTxn:
+		call = fmt.Sprintf("txn(if %v then %v)", cmd.Conds, cmd.Writes)
+		if !out.Unknown && out.Resp.Status == fsm.StatusVersionMismatch {
+			return fmt.Sprintf("%s → refused, found %v", call, out.Resp.Items)
+		}
 	}
 	if out.Unknown {
 		return call + " → ?"

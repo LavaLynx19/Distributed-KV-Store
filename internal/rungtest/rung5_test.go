@@ -131,3 +131,39 @@ func TestRung5(t *testing.T) {
 		}
 	}
 }
+
+// multiKey is rung5Store with clients that also scan and run Transactions.
+// A History with either is checked against the whole store at once (A§8.2).
+var multiKey = func() rungtest.Store {
+	s := timed()
+	s.Workload.ScanPercent = 20
+	s.Workload.TxnPercent = 25
+	return s
+}()
+
+// Rung 5's promise (README): scans and Transactions are Linearizable.
+func TestScansAndTransactions(t *testing.T) {
+	seeds := uint64(100)
+	if testing.Short() {
+		seeds = 10
+	}
+	runs, timedOut := 0, 0
+	for _, sc := range rung5Scenarios() {
+		for _, members := range []int{3, 5} {
+			for seed := uint64(1); seed <= seeds; seed++ {
+				r := rungtest.Run(multiKey, sc, members, seed)
+				runs++
+				if r.TimedOut {
+					timedOut++
+				}
+				if !r.Safe() || (!r.Stalled && len(r.Diverged) > 0) {
+					t.Errorf("%v\n  diverged: %v", r, r.Diverged)
+				}
+			}
+		}
+	}
+	if timedOut > 0 {
+		t.Errorf("the checker ran out of time on %d of %d runs, which proves nothing about them", timedOut, runs)
+	}
+	t.Logf("%d runs", runs)
+}

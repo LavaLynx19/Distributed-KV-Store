@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -49,12 +50,34 @@ type kvResponse struct {
 	Version uint64  `json:"version"`
 }
 
+type scanResponse struct {
+	Items []ItemJSON `json:"items"`
+}
+
+// txnRequest is a Transaction (A§5.2): if every key under "if" has the
+// version given (0 for a key that must not exist), every write is applied.
+type txnRequest struct {
+	If []struct {
+		Key     string `json:"key"`
+		Version uint64 `json:"version"`
+	} `json:"if"`
+	Writes []struct {
+		Op    string `json:"op"` // "put" or "delete"
+		Key   string `json:"key"`
+		Value string `json:"value"`
+		TTL   int64  `json:"ttl"`
+	} `json:"writes"`
+}
+
 // errorResponse is the body of every non-2xx answer (A§7.2).
 type errorResponse struct {
 	Reason  string  `json:"reason"`
 	Message string  `json:"message,omitempty"`
 	Leader  string  `json:"leader,omitempty"`
 	Version *uint64 `json:"version,omitempty"`
+	// Failed lists the conditions a refused Transaction failed, each with
+	// the version found.
+	Failed []ItemJSON `json:"failed,omitempty"`
 }
 
 type sessionResponse struct {
@@ -80,6 +103,8 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/kv/{key}", a.get)
 	mux.HandleFunc("PUT /v1/kv/{key}", a.put)
 	mux.HandleFunc("DELETE /v1/kv/{key}", a.delete)
+	mux.HandleFunc("GET /v1/kv", a.scan)
+	mux.HandleFunc("POST /v1/txn", a.txn)
 	mux.HandleFunc("POST /v1/sessions", a.openSession)
 	mux.HandleFunc("GET /v1/status", a.status)
 	mux.HandleFunc("GET /v1/debug/items", a.debugItems)
@@ -120,6 +145,74 @@ func (a *API) delete(w http.ResponseWriter, r *http.Request) {
 	a.run(w, r, cmd)
 }
 
+// scan answers a range scan: the keys from start up to but not including
+// end, in key order (A§7.1).
+func (a *API) scan(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	cmd := fsm.Command{Op: fsm.OpScan, Key: q.Get("start"), End: q.Get("end")}
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, errorResponse{Reason: "invalid", Message: "limit must be a non-negative integer"})
+			return
+		}
+		cmd.Limit = n
+	}
+	resp, ok := a.propose(w, r, cmd)
+	if !ok {
+		return
+	}
+	out := scanResponse{Items: []ItemJSON{}}
+	for _, it := range resp.Items {
+		out.Items = append(out.Items, ItemJSON{Key: it.Key, Value: string(it.Value), Version: it.Version})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (a *API) txn(w http.ResponseWriter, r *http.Request) {
+	var req txnRequest
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
+	if err == nil {
+		err = json.Unmarshal(body, &req)
+	}
+	cmd := fsm.Command{Op: fsm.OpTxn}
+	for _, c := range req.If {
+		cmd.Conds = append(cmd.Conds, fsm.Cond{Key: c.Key, Version: c.Version})
+	}
+	for _, wr := range req.Writes {
+		switch {
+		case wr.Op == "put" && wr.TTL >= 0:
+			cmd.Writes = append(cmd.Writes, fsm.Write{Op: fsm.OpPut, Key: wr.Key, Value: []byte(wr.Value), TTL: wr.TTL})
+		case wr.Op == "delete":
+			cmd.Writes = append(cmd.Writes, fsm.Write{Op: fsm.OpDelete, Key: wr.Key})
+		default:
+			err = errors.New("bad write")
+		}
+	}
+	if err != nil || !identify(r, &cmd) {
+		writeError(w, http.StatusBadRequest, errorResponse{Reason: "invalid", Message: "body must be JSON like {\"if\": [{\"key\": …, \"version\": …}], \"writes\": [{\"op\": \"put\"|\"delete\", \"key\": …}]}"})
+		return
+	}
+	resp, ok := a.propose(w, r, cmd)
+	if !ok {
+		return
+	}
+	switch resp.Status {
+	case fsm.StatusOK:
+		writeJSON(w, http.StatusOK, kvResponse{Version: resp.Version})
+	case fsm.StatusVersionMismatch:
+		failed := []ItemJSON{}
+		for _, it := range resp.Items {
+			failed = append(failed, ItemJSON{Key: it.Key, Version: it.Version})
+		}
+		writeError(w, http.StatusConflict, errorResponse{Reason: "version_mismatch", Failed: failed})
+	case fsm.StatusSessionExpired:
+		writeError(w, http.StatusGone, errorResponse{Reason: "session_expired"})
+	default:
+		writeError(w, http.StatusBadRequest, errorResponse{Reason: "invalid"})
+	}
+}
+
 func (a *API) openSession(w http.ResponseWriter, r *http.Request) {
 	if resp, ok := a.propose(w, r, fsm.Command{Op: fsm.OpOpenSession}); ok {
 		writeJSON(w, http.StatusOK, sessionResponse{Session: resp.Session})
@@ -146,7 +239,7 @@ func (a *API) propose(w http.ResponseWriter, r *http.Request, cmd fsm.Command) (
 	ctx, cancel := context.WithTimeout(r.Context(), a.Timeout)
 	defer cancel()
 	var reply Reply
-	if a.ReadsBypassLog && cmd.Op == fsm.OpGet {
+	if a.ReadsBypassLog && (cmd.Op == fsm.OpGet || cmd.Op == fsm.OpScan) {
 		reply = a.Node.Read(ctx, cmd.Encode())
 	} else {
 		// This Member's clock reading goes in with the request. It counts

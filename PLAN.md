@@ -57,9 +57,9 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P5.2 Expose: time-to-live judged by each Member's clock; Members disagree → §P5
 - [x] P5.3 Leader stamps, Log time, Expiry, deterministic sweep (A§6.7) → §P5
 - [x] P5.4 Session cleanup by Log time; `session_expired` → §P5
-- [ ] P5.5 Range scans → §P5
-- [ ] P5.6 Transactions within one Group → §P5
-- [ ] P5.7 Whole-store Porcupine model for scans and transactions → §P5
+- [x] P5.5 Range scans → §P5
+- [x] P5.6 Transactions within one Group → §P5
+- [x] P5.7 Whole-store Porcupine model for scans and transactions → §P5
 - [ ] P5.8 Lease read variant behind a switch; demonstrate its Stale read under skew; measure → §P5
 - [ ] P5.9 Rung 5 suite; `retros/rung-5.md` → §P5
 

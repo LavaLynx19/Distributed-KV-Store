@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
@@ -312,5 +313,53 @@ func TestKeyExpiresInAnIdleGroup(t *testing.T) {
 			}
 			time.Sleep(20 * time.Millisecond)
 		}
+	}
+}
+
+func TestScanAndTransaction(t *testing.T) {
+	members := cluster(t, 3)
+	leader := leaderURL(t, members)
+	for _, k := range []string{"b", "a", "c"} {
+		if a := call(t, "PUT", leader+"/v1/kv/"+k, `{"value":"`+k+`"}`); a.code != 200 {
+			t.Fatalf("put %s: %+v", k, a)
+		}
+	}
+	keys := func(a answer) []string {
+		var ks []string
+		for _, it := range a.body["items"].([]any) {
+			ks = append(ks, it.(map[string]any)["key"].(string))
+		}
+		return ks
+	}
+	if a := call(t, "GET", leader+"/v1/kv", ""); a.code != 200 || !slices.Equal(keys(a), []string{"a", "b", "c"}) {
+		t.Fatalf("scan of everything: %+v", a)
+	}
+	if a := call(t, "GET", leader+"/v1/kv?start=b&end=c", ""); a.code != 200 || !slices.Equal(keys(a), []string{"b"}) {
+		t.Fatalf("scan [b, c): %+v", a)
+	}
+	if a := call(t, "GET", leader+"/v1/kv?limit=2", ""); !slices.Equal(keys(a), []string{"a", "b"}) {
+		t.Fatalf("scan with limit 2: %+v", a)
+	}
+	if a := call(t, "GET", leader+"/v1/kv?limit=x", ""); a.code != 400 {
+		t.Fatalf("bad limit: %+v", a)
+	}
+
+	a := call(t, "GET", leader+"/v1/kv/a", "")
+	va := uint64(a.body["version"].(float64))
+	move := fmt.Sprintf(`{"if":[{"key":"a","version":%d},{"key":"new","version":0}],"writes":[{"op":"put","key":"new","value":"from a"},{"op":"delete","key":"a"}]}`, va)
+	done := call(t, "POST", leader+"/v1/txn", move)
+	if done.code != 200 || done.body["version"] == nil {
+		t.Fatalf("transaction: %+v", done)
+	}
+	// The same Transaction again is refused, and says which conditions failed.
+	again := call(t, "POST", leader+"/v1/txn", move)
+	if again.code != 409 || again.body["reason"] != "version_mismatch" || len(again.body["failed"].([]any)) != 2 {
+		t.Fatalf("repeated transaction: %+v", again)
+	}
+	if a := call(t, "GET", leader+"/v1/kv", ""); !slices.Equal(keys(a), []string{"b", "c", "new"}) {
+		t.Fatalf("after the transaction: %+v", a)
+	}
+	if a := call(t, "POST", leader+"/v1/txn", `{"writes":[{"op":"get","key":"a"}]}`); a.code != 400 {
+		t.Fatalf("a transaction with a get: %+v", a)
 	}
 }

@@ -157,7 +157,8 @@ The commit index is not stored. A restarted Member knows only that its Snapshot 
 |---|---|
 | Put, Delete | Set or remove one key, optionally with a time-to-live |
 | Compare-and-set | Set a key only if its current version matches |
-| Transaction | A list of conditions and writes over several keys, applied all or nothing (Rung 5) |
+| Transaction | A list of conditions and writes over several keys, applied all or nothing (Rung 5). A condition is a key and the version it must have, with 0 for a key that must not exist. A write is a put or a delete. If any condition fails nothing is written, and the answer names each failed condition with the version found. Every key a Transaction puts gets the same version, its Entry's index |
+| Time | Carries a stamp and changes nothing else (§6.7) |
 | Open Session | Registers a **Session** |
 
 A get is also a command in Rung 1. From Rung 2 on, gets and range scans are reads that bypass the Log (§6.2).
@@ -263,8 +264,8 @@ The mark survives restarts, so a Member that restarts while Recovering is still 
 | `GET /v1/kv/{key}` | Read a key: value and version |
 | `PUT /v1/kv/{key}` | Write a key; optional `ttl` in milliseconds; optional `if_version` for compare-and-set |
 | `DELETE /v1/kv/{key}` | Delete a key; optional `if_version` |
-| `GET /v1/kv?start=&end=&limit=` | Range scan in key order |
-| `POST /v1/txn` | Transaction: conditions and writes |
+| `GET /v1/kv?start=&end=&limit=` | Range scan in key order: keys from `start` up to but not including `end`. An empty `end` means to the last key. At most `limit` keys, and never more than 1,000. Answers `{"items": [{key, value, version}]}` |
+| `POST /v1/txn` | Transaction: `{"if": [{key, version}], "writes": [{op: "put" or "delete", key, value, ttl}]}`. A refusal is `version_mismatch` with `failed`: the conditions that didn't hold and the versions found |
 | `GET /v1/status` | This Member's role, Term, Leader hint, commit index |
 
 Requests carry `Session-Id` and `Request-Seq` headers so that a retry takes effect once (§6.3). A request without them is applied every time it arrives.
@@ -311,7 +312,7 @@ A seed determines everything: the order events are delivered, which Faults fire 
 A failing run prints its seed, and rerunning the seed reproduces it.
 
 ### 8.2 The three verdicts
-1. **Linearizability:** clients record a History, and Porcupine checks it against a model of the store. Single-key operations are checked per key. Scans and transactions span keys, so their Histories are checked against a whole-store model and kept short.
+1. **Linearizability:** clients record a History, and Porcupine checks it against a model of the store. Single-key operations are checked per key. Scans and transactions span keys, so a History containing either is checked against a whole-store model. With the Simulation's three keys that costs little; it grows quickly with the number of keys, so such Histories must stay small.
 2. **End state:** after Faults stop and the Group settles, every Member's tree is identical.
 3. **Client signals:** counts of each error reason, requests that never got a definite answer, and the time from losing a Leader to the next successful write.
 
