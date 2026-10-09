@@ -26,7 +26,15 @@ type keyState struct {
 	// floor is the highest version ever observed for the key. A version is
 	// the Index of the Entry that wrote it, so later writes must exceed it.
 	floor uint64
+	// mortal: the key was written with a time-to-live. The model doesn't
+	// know the store's time, so it lets such a key stop existing at any
+	// moment. What it does insist on is that the key then stays gone until
+	// something writes it again (A§6.7).
+	mortal bool
 }
+
+// expired is the state after a mortal key's time ran out.
+func (s keyState) expired() keyState { return s.removed() }
 
 // versionIs returns the state narrowed by learning that the key's version is
 // v, and whether that is possible.
@@ -56,16 +64,16 @@ func (s keyState) versionMayDiffer(v uint64) bool {
 }
 
 // written is the state after a write that reported version v.
-func (s keyState) written(value string, v uint64) (keyState, bool) {
+func (s keyState) written(cmd fsm.Command, v uint64) (keyState, bool) {
 	if v <= s.floor {
 		return s, false
 	}
-	return keyState{exists: true, value: value, version: v, known: true, floor: v}, true
+	return keyState{exists: true, value: string(cmd.Value), version: v, known: true, floor: v, mortal: cmd.TTL > 0}, true
 }
 
 // writtenUnseen is the state after a write nobody saw the response to.
-func (s keyState) writtenUnseen(value string) keyState {
-	return keyState{exists: true, value: value, floor: s.floor}
+func (s keyState) writtenUnseen(cmd fsm.Command) keyState {
+	return keyState{exists: true, value: string(cmd.Value), floor: s.floor, mortal: cmd.TTL > 0}
 }
 
 func (s keyState) removed() keyState {
@@ -73,8 +81,17 @@ func (s keyState) removed() keyState {
 }
 
 // step returns every state the key could be in after cmd produced out, or
-// nil if cmd could not have produced out from s.
+// nil if cmd could not have produced out from s. A mortal key may have
+// expired just before cmd, so both possibilities are followed.
 func step(s keyState, cmd fsm.Command, out Outcome) []keyState {
+	next := stepFrom(s, cmd, out)
+	if s.exists && s.mortal {
+		next = append(next, stepFrom(s.expired(), cmd, out)...)
+	}
+	return next
+}
+
+func stepFrom(s keyState, cmd fsm.Command, out Outcome) []keyState {
 	if out.Unknown {
 		return stepUnknown(s, cmd)
 	}
@@ -113,7 +130,7 @@ func step(s keyState, cmd fsm.Command, out Outcome) []keyState {
 					return nil
 				}
 			}
-			return one(s.written(string(cmd.Value), r.Version))
+			return one(s.written(cmd, r.Version))
 		case fsm.StatusVersionMismatch:
 			if cmd.Conditional {
 				return mismatch()
@@ -149,7 +166,7 @@ func stepUnknown(s keyState, cmd fsm.Command) []keyState {
 	var applied keyState
 	switch cmd.Op {
 	case fsm.OpPut:
-		applied = s.writtenUnseen(string(cmd.Value))
+		applied = s.writtenUnseen(cmd)
 	case fsm.OpDelete:
 		applied = s.removed()
 	default:
@@ -161,7 +178,7 @@ func stepUnknown(s keyState, cmd fsm.Command) []keyState {
 	var next []keyState
 	if matched, ok := s.versionIs(cmd.IfVersion); ok {
 		if cmd.Op == fsm.OpPut {
-			applied = matched.writtenUnseen(string(cmd.Value))
+			applied = matched.writtenUnseen(cmd)
 		} else if !matched.exists {
 			applied = matched
 		}
@@ -210,12 +227,19 @@ func Model() porcupine.Model {
 			case !s.exists:
 				return "absent"
 			case !s.known:
-				return fmt.Sprintf("%q v?", s.value)
+				return fmt.Sprintf("%q v?%s", s.value, mortal(s))
 			}
-			return fmt.Sprintf("%q v%d", s.value, s.version)
+			return fmt.Sprintf("%q v%d%s", s.value, s.version, mortal(s))
 		},
 	}
 	return nm.ToModel()
+}
+
+func mortal(s keyState) string {
+	if s.mortal {
+		return " (may expire)"
+	}
+	return ""
 }
 
 func describe(cmd fsm.Command, out Outcome) string {
@@ -228,6 +252,9 @@ func describe(cmd fsm.Command, out Outcome) string {
 	case fsm.OpGet:
 		call = fmt.Sprintf("get(%s)", cmd.Key)
 	case fsm.OpPut:
+		if cmd.TTL > 0 {
+			cond += fmt.Sprintf(" ttl %d", cmd.TTL)
+		}
 		call = fmt.Sprintf("put(%s, %q%s)", cmd.Key, cmd.Value, cond)
 	case fsm.OpDelete:
 		call = fmt.Sprintf("delete(%s%s)", cmd.Key, cond)

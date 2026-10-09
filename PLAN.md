@@ -53,8 +53,8 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P4.5 Rung 4 suite; `retros/rung-4.md` → §P4
 
 ### Phase 5 — Rung 5: time (§P5)
-- [ ] P5.1 Simulation clock Faults: per-Member rate, jumps → §P5
-- [ ] P5.2 Expose: time-to-live judged by each Member's clock; Members disagree → §P5
+- [x] P5.1 Simulation clock Faults: per-Member rate, jumps → §P5
+- [x] P5.2 Expose: time-to-live judged by each Member's clock; Members disagree → §P5
 - [ ] P5.3 Leader stamps, Log time, Expiry, deterministic sweep (A§6.7) → §P5
 - [ ] P5.4 Session cleanup by Log time; `session_expired` → §P5
 - [ ] P5.5 Range scans → §P5

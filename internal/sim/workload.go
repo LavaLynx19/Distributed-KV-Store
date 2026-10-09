@@ -33,6 +33,10 @@ type Workload struct {
 	// Sessions makes each client open a Session first and number its
 	// requests within it, so the store can recognise a retry (A§6.3).
 	Sessions bool
+	// TTLPercent of puts carry a time-to-live of TTL[0]..TTL[1] units
+	// (A§6.7).
+	TTLPercent int
+	TTL        [2]int64
 }
 
 // DefaultWorkload is enough contention to make ordering mistakes visible.
@@ -206,16 +210,21 @@ func (w Workload) choose(s *Sim, c *client) fsm.Command {
 	key := fmt.Sprintf("k%d", s.Rand().IntN(w.Keys))
 	c.count++
 	value := []byte(fmt.Sprintf("c%d-%d", c.id, c.count))
+	var cmd fsm.Command
 	switch roll := s.Rand().IntN(100); {
 	case roll < 35:
 		return fsm.Command{Op: fsm.OpGet, Key: key}
 	case roll < 65:
-		return fsm.Command{Op: fsm.OpPut, Key: key, Value: value}
+		cmd = fsm.Command{Op: fsm.OpPut, Key: key, Value: value}
 	case roll < 90:
-		return fsm.Command{Op: fsm.OpPut, Key: key, Value: value, Conditional: true, IfVersion: c.seen[key]}
+		cmd = fsm.Command{Op: fsm.OpPut, Key: key, Value: value, Conditional: true, IfVersion: c.seen[key]}
 	default:
 		return fsm.Command{Op: fsm.OpDelete, Key: key}
 	}
+	if w.TTLPercent > 0 && s.Rand().IntN(100) < w.TTLPercent {
+		cmd.TTL = w.TTL[0] + s.Rand().Int64N(w.TTL[1]-w.TTL[0]+1)
+	}
+	return cmd
 }
 
 func (c *client) observe(cmd fsm.Command, resp fsm.Response) {

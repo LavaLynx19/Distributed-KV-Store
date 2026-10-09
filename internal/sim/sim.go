@@ -38,6 +38,10 @@ type Machine interface {
 	Restore(data []byte) error
 }
 
+// observer is a Machine that wants to know its Member's clock before it
+// applies or answers anything.
+type observer interface{ Observe(now int64) }
+
 // Config describes one simulated Group.
 type Config struct {
 	Seed  uint64
@@ -67,6 +71,10 @@ type Config struct {
 	// whenever it has applied this many Entries since the last one, and hand
 	// it to the core (A§6.4). Zero means never.
 	SnapshotEvery int
+
+	// Stamp, if set, puts a Member's clock reading into each proposal it is
+	// handed, as the real shell does (A§6.1).
+	Stamp func(payload []byte, now int64) []byte
 
 	// Copy, if set, stands in for the network's encoding: every message is
 	// passed through it on the way, so Members never share memory.
@@ -113,6 +121,12 @@ type member struct {
 	inbox        []core.Event
 	life         int   // counts crashes, so a write from a past life is ignored
 	stalledUntil int64 // writes don't complete before this time
+
+	// The Member's clock (A§8.1). It read clockBase at virtual time clockAt
+	// and has run at clockRate percent of true speed since. Its ticks come
+	// at the same rate, so a slow clock also means slow timeouts.
+	clockBase, clockAt int64
+	clockRate          int64
 
 	applied    core.Index // the last Entry applied to machine
 	snapshotAt core.Index // the Entry the last Snapshot was taken at
@@ -165,6 +179,8 @@ func New(cfg Config) *Sim {
 			pending: map[uint64]func(Reply){},
 			queries: map[uint64][]byte{},
 			fs:      storage.NewMemFS(),
+
+			clockRate: 100,
 		}
 		m.store, _, _ = s.openDisk(m.fs) // an empty MemFS can't fail to open
 		s.members[id] = m
@@ -225,6 +241,9 @@ func (s *Sim) Propose(to core.NodeID, payload []byte, done func(Reply)) {
 	ref := s.nextRef
 	m.pending[ref] = done
 	s.mix('P', uint64(to), ref)
+	if s.cfg.Stamp != nil {
+		payload = s.cfg.Stamp(payload, m.clock(s.now))
+	}
 	s.step(m, core.Propose{Ref: ref, Payload: payload})
 }
 
@@ -411,8 +430,36 @@ func (s *Sim) Heal() {
 	s.mix('H', 0, 0)
 }
 
+// Clock is what a Member's own clock reads now, in the units of virtual
+// time. Clocks start at zero and agree until a Fault makes them differ.
+func (s *Sim) Clock(id core.NodeID) int64 { return s.members[id].clock(s.now) }
+
+func (m *member) clock(now int64) int64 {
+	return m.clockBase + (now-m.clockAt)*m.clockRate/100
+}
+
+// SetClockRate makes a Member's clock run at percent of true speed from now
+// on: 50 is half speed, 200 double. Its ticks slow down or speed up with it.
+func (s *Sim) SetClockRate(id core.NodeID, percent int64) {
+	if percent <= 0 {
+		panic("sim: a clock must move forwards")
+	}
+	m := s.members[id]
+	m.clockBase, m.clockAt, m.clockRate = m.clock(s.now), s.now, percent
+	s.mix('C', uint64(id), uint64(percent))
+}
+
+// JumpClock moves a Member's clock by delta at once, forwards or backwards.
+// Its ticks are unaffected: a jump changes what time it is, not how fast
+// time passes.
+func (s *Sim) JumpClock(id core.NodeID, delta int64) {
+	m := s.members[id]
+	m.clockBase, m.clockAt = m.clock(s.now)+delta, s.now
+	s.mix('J', uint64(id), uint64(delta))
+}
+
 func (s *Sim) tick(m *member) {
-	s.schedule(s.cfg.TickEvery, func() { s.tick(m) })
+	s.schedule(max(s.cfg.TickEvery*100/m.clockRate, 1), func() { s.tick(m) })
 	if m.up {
 		s.mix('T', uint64(m.id), 0)
 		s.step(m, core.Tick{})
@@ -483,6 +530,9 @@ func (s *Sim) finish(m *member, out core.Output) {
 			panic(fmt.Sprintf("sim: node %d can't install a Snapshot: %v", m.id, err))
 		}
 		m.applied, m.snapshotAt = snap.Index, snap.Index
+	}
+	if o, ok := m.machine.(observer); ok && len(out.Committed)+len(out.Reads) > 0 {
+		o.Observe(m.clock(s.now))
 	}
 	responses := make(map[core.Index][]byte, len(out.Committed))
 	for _, e := range out.Committed {

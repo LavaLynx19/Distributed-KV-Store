@@ -26,7 +26,10 @@ func history(ops ...op) *History {
 
 func put(k, v string) fsm.Command { return fsm.Command{Op: fsm.OpPut, Key: k, Value: []byte(v)} }
 func get(k string) fsm.Command    { return fsm.Command{Op: fsm.OpGet, Key: k} }
-func del(k string) fsm.Command    { return fsm.Command{Op: fsm.OpDelete, Key: k} }
+func putTTL(k, v string) fsm.Command {
+	return fsm.Command{Op: fsm.OpPut, Key: k, Value: []byte(v), TTL: 100}
+}
+func del(k string) fsm.Command { return fsm.Command{Op: fsm.OpDelete, Key: k} }
 func cas(k, v string, ifVersion uint64) fsm.Command {
 	return fsm.Command{Op: fsm.OpPut, Key: k, Value: []byte(v), Conditional: true, IfVersion: ifVersion}
 }
@@ -143,6 +146,32 @@ func TestLinearizable(t *testing.T) {
 			{get("a"), 20, 30, Answered, read("1", 1)},
 			{get("b"), 20, 30, Answered, read("2", 2)},
 		}, true},
+		{"a key with a time-to-live may be found gone", []op{
+			{putTTL("a", "1"), 0, 10, Answered, wrote(1)},
+			{get("a"), 20, 30, Answered, read("1", 1)},
+			{get("a"), 40, 50, Answered, notFound},
+			{get("a"), 60, 70, Answered, notFound},
+		}, true},
+		{"a key that expired doesn't come back", []op{
+			{putTTL("a", "1"), 0, 10, Answered, wrote(1)},
+			{get("a"), 20, 30, Answered, notFound},
+			{get("a"), 40, 50, Answered, read("1", 1)},
+		}, false},
+		{"a key without a time-to-live never just goes", []op{
+			{putTTL("a", "1"), 0, 10, Answered, wrote(1)},
+			{put("a", "2"), 20, 30, Answered, wrote(2)},
+			{get("a"), 40, 50, Answered, notFound},
+		}, false},
+		{"create-if-absent succeeds once the old key has expired", []op{
+			{putTTL("a", "1"), 0, 10, Answered, wrote(1)},
+			{cas("a", "2", 0), 20, 30, Answered, wrote(2)},
+			{get("a"), 40, 50, Answered, read("2", 2)},
+		}, true},
+		{"a compare-and-set on an expired key reports version 0", []op{
+			{putTTL("a", "1"), 0, 10, Answered, wrote(1)},
+			{cas("a", "2", 1), 20, 30, Answered, mismatch(0)},
+			{get("a"), 40, 50, Answered, read("1", 1)},
+		}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
