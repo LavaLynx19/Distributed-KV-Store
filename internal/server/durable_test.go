@@ -78,7 +78,10 @@ func (d *durable) start(id core.NodeID) {
 	}
 	var node *server.Node
 	tr := transport.New(id, ln, d.peers, func(m core.Message) { node.Deliver(m) })
-	c := raft.New(raft.Config{ID: id, Members: d.ids, ElectionTicks: 10, HeartbeatTicks: 1,
+	// An election timeout of 200 ms: these Members sync real files, and under
+	// a loaded disk one sync can take longer than the 50 ms the other tests
+	// use, which would cost the Leader its place in the middle of a test.
+	c := raft.New(raft.Config{ID: id, Members: d.ids, ElectionTicks: 40, HeartbeatTicks: 1,
 		Rand: rand.New(rand.NewPCG(uint64(id), uint64(time.Now().UnixNano()))), Reads: raft.ReadsByIndex, Stored: stored})
 	machine := fsm.New()
 	node = server.NewNode(c, machine, tr.Send, 5*time.Millisecond)
