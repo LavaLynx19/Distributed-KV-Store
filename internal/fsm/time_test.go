@@ -180,3 +180,52 @@ func TestDueUntilTheTickIsApplied(t *testing.T) {
 		t.Fatal("due by a clock that is behind Log time")
 	}
 }
+
+func TestIdleSessionIsRemovedByLogTime(t *testing.T) {
+	m := New()
+	m.SessionTTL = 1000
+	got := run(t, m,
+		at(100, Command{Op: OpOpenSession}),      // Session 1
+		at(100, Command{Op: OpOpenSession}),      // Session 2
+		at(900, inSession(put("a", "1"), 1, 1)),  // Session 1 is used
+		at(1200, put("x", "1")),                  // Session 2 has now been idle for 1100
+		at(1200, inSession(put("b", "1"), 2, 1)), // so this is refused
+		at(1300, inSession(put("a", "2"), 1, 2)), // Session 1 lives on
+		at(1300, inSession(put("a", "2"), 1, 2)), // and still recognises a retry
+		at(2400, put("x", "2")),                  // idle since 1300
+		at(2400, inSession(put("a", "3"), 1, 3)),
+	)
+	if got[4].Status != StatusSessionExpired {
+		t.Errorf("a request in a Session idle for longer than SessionTTL got %+v", got[4])
+	}
+	if got[5].Status != StatusOK || got[6].Version != got[5].Version {
+		t.Errorf("the Session in use: %+v, retry %+v", got[5], got[6])
+	}
+	if got[8].Status != StatusSessionExpired || m.Sessions() != 0 {
+		t.Errorf("after 1100 idle: %+v, %d Sessions left", got[8], m.Sessions())
+	}
+	if want := []Item{{Key: "a", Value: []byte("2"), Version: 6}, {Key: "x", Value: []byte("2"), Version: 8}}; !reflect.DeepEqual(m.Items(), want) {
+		t.Errorf("items = %+v, want %+v", m.Items(), want)
+	}
+}
+
+// A restored Machine removes Sessions at the same Entry as the original.
+func TestCaptureKeepsWhenSessionsWereUsed(t *testing.T) {
+	m := New()
+	m.SessionTTL = 1000
+	run(t, m, at(100, Command{Op: OpOpenSession}), at(100, Command{Op: OpOpenSession}), at(700, inSession(put("a", "1"), 2, 1)))
+	restored := New()
+	restored.SessionTTL = 1000
+	if err := restored.Restore(m.Capture()()); err != nil {
+		t.Fatal(err)
+	}
+	for _, x := range []*Machine{m, restored} {
+		x.Apply(entryAt(4, at(1300, put("x", "1"))))
+		if x.Sessions() != 1 {
+			t.Fatalf("%d Sessions left at 1300, want only the one used at 700", x.Sessions())
+		}
+	}
+	if !reflect.DeepEqual(restored.Capture()(), m.Capture()()) {
+		t.Fatal("the same state encoded differently")
+	}
+}

@@ -117,6 +117,8 @@ type entry struct {
 type session struct {
 	lastSeq  uint64
 	lastResp []byte
+	// lastUsed is Log time when the Session was opened or last used.
+	lastUsed int64
 }
 
 // Machine holds the keys and the Sessions, each in a copy-on-write tree
@@ -135,9 +137,48 @@ type Machine struct {
 	expiries tree.Tree[struct{}]
 	logTime  int64
 
+	// SessionTTL, if set, removes a Session that hasn't been used for this
+	// long by Log time. A request in a removed Session is answered
+	// StatusSessionExpired (A§6.3). Every Member must use the same value.
+	SessionTTL int64
+
 	// ownClock is the store Rung 5 starts from: time is whatever this
 	// Member's clock says, given to Observe.
 	ownClock bool
+}
+
+// advance moves Log time to a later Stamp and removes what that makes due.
+// Sessions are checked each time Log time enters a new quarter of
+// SessionTTL, so the work is spread out and still happens at the same Entry
+// on every Member.
+func (m *Machine) advance(to int64) {
+	from := m.logTime
+	m.logTime = to
+	m.sweep()
+	if m.SessionTTL <= 0 {
+		return
+	}
+	if q := max(m.SessionTTL/4, 1); floorDiv(from, q) == floorDiv(to, q) {
+		return
+	}
+	var idle []string
+	m.sessions.Ascend("", "", func(k string, s session) bool {
+		if to-s.lastUsed >= m.SessionTTL {
+			idle = append(idle, k)
+		}
+		return true
+	})
+	for _, k := range idle {
+		m.sessions = m.sessions.Delete(k)
+	}
+}
+
+func floorDiv(a, b int64) int64 {
+	q := a / b
+	if a%b != 0 && a < 0 {
+		q--
+	}
+	return q
 }
 
 func New() *Machine { return &Machine{} }
@@ -248,14 +289,13 @@ func (m *Machine) Apply(e core.Entry) []byte {
 		return Response{Status: StatusInvalid}.Encode()
 	}
 	if !m.ownClock && cmd.Stamp > m.logTime {
-		m.logTime = cmd.Stamp
-		m.sweep()
+		m.advance(cmd.Stamp)
 	}
 	index := uint64(e.Index)
 	if cmd.Op == OpOpenSession {
 		// The Entry's Index is unique and the same on every Member, which
 		// makes it a ready-made Session id.
-		m.sessions = m.sessions.Put(sessionKey(index), session{})
+		m.sessions = m.sessions.Put(sessionKey(index), session{lastUsed: m.logTime})
 		return Response{Status: StatusOK, Session: index}.Encode()
 	}
 	if cmd.Session == 0 {
@@ -267,12 +307,16 @@ func (m *Machine) Apply(e core.Entry) []byte {
 	case !ok:
 		return Response{Status: StatusSessionExpired}.Encode()
 	case cmd.Seq == s.lastSeq && s.lastSeq != 0:
+		if s.lastUsed != m.logTime {
+			s.lastUsed = m.logTime
+			m.sessions = m.sessions.Put(sessionKey(cmd.Session), s)
+		}
 		return s.lastResp // a retry: answer as before, change nothing
 	case cmd.Seq < s.lastSeq:
 		return Response{Status: StatusInvalid}.Encode()
 	}
 	resp := m.apply(cmd, index).Encode()
-	m.sessions = m.sessions.Put(sessionKey(cmd.Session), session{lastSeq: cmd.Seq, lastResp: resp})
+	m.sessions = m.sessions.Put(sessionKey(cmd.Session), session{lastSeq: cmd.Seq, lastResp: resp, lastUsed: m.logTime})
 	return resp
 }
 
@@ -488,7 +532,8 @@ func lengthPrefixed(b []byte) (field, rest []byte, ok bool) {
 // (A§6.4).
 //
 // The encoding is the keys, then the Sessions, then, only if the Machine has
-// seen any time at all, a section with logTime and every key's deadline.
+// seen any time at all, a section with logTime, every key's deadline, and
+// when each Session was last used.
 func (m *Machine) Capture() func() []byte {
 	keys, sessions, expiries, logTime := m.keys, m.sessions, m.expiries, m.logTime
 	return func() []byte {
@@ -516,6 +561,10 @@ func (m *Machine) Capture() func() []byte {
 			b = appendBytes(b, []byte(k[8:]))
 			return true
 		})
+		sessions.Ascend("", "", func(_ string, s session) bool {
+			b = binary.AppendVarint(b, s.lastUsed)
+			return true
+		})
 		return b
 	}
 }
@@ -524,6 +573,7 @@ func (m *Machine) Capture() func() []byte {
 func (m *Machine) Restore(data []byte) error {
 	var keys tree.Tree[entry]
 	var sessions tree.Tree[session]
+	var sessionIDs []string // in the order they were encoded
 	n, b, ok := uvarint(data)
 	for i := uint64(0); ok && i < n; i++ {
 		var k, v []byte
@@ -553,6 +603,7 @@ func (m *Machine) Restore(data []byte) error {
 		}
 		if s.lastResp, b, ok = lengthPrefixed(b); ok {
 			sessions = sessions.Put(id, s)
+			sessionIDs = append(sessionIDs, id)
 		}
 	}
 	var expiries tree.Tree[struct{}]
@@ -578,6 +629,15 @@ func (m *Machine) Restore(data []byte) error {
 			e.deadline = deadline
 			keys = keys.Put(string(k), e)
 			expiries = expiries.Put(expiryKey(deadline, string(k)), struct{}{})
+		}
+		for _, id := range sessionIDs {
+			if !ok {
+				break
+			}
+			s, _ := sessions.Get(id)
+			if s.lastUsed, b, ok = varint(b); ok {
+				sessions = sessions.Put(id, s)
+			}
 		}
 	}
 	if !ok || len(b) != 0 {

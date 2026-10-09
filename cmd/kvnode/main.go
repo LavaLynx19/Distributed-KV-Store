@@ -43,6 +43,7 @@ func main() {
 	timeout := flag.Duration("request-timeout", 5*time.Second, "how long a client request waits to commit")
 	data := flag.String("data", "", "directory for this Node's durable state; empty keeps nothing across a restart")
 	snapshotEvery := flag.Int("snapshot-every", 20000, "take a Snapshot and trim the Log after this many applied Entries (0 never)")
+	sessionTTL := flag.Duration("session-ttl", time.Hour, "remove a Session unused for this long (0 never); must be the same on every Member")
 	reads := flag.String("reads", "index", "how gets are answered: index (read index, A§6.2) or log (as Log Entries)")
 	flag.Parse()
 
@@ -55,12 +56,12 @@ func main() {
 	default:
 		log.Fatalf("kvnode: -reads must be index or log, not %q", *reads)
 	}
-	if err := run(core.NodeID(*id), *peersFlag, *clientsFlag, *listenPeer, *listenClient, *tick, *electionTicks, *heartbeatTicks, *timeout, mode, *data, *snapshotEvery); err != nil {
+	if err := run(core.NodeID(*id), *peersFlag, *clientsFlag, *listenPeer, *listenClient, *tick, *electionTicks, *heartbeatTicks, *timeout, mode, *data, *snapshotEvery, *sessionTTL); err != nil {
 		log.Fatalf("kvnode: %v", err)
 	}
 }
 
-func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string, tick time.Duration, electionTicks, heartbeatTicks int, timeout time.Duration, reads raft.ReadMode, data string, snapshotEvery int) error {
+func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string, tick time.Duration, electionTicks, heartbeatTicks int, timeout time.Duration, reads raft.ReadMode, data string, snapshotEvery int, sessionTTL time.Duration) error {
 	peers, err := parseAddrs(peersFlag)
 	if err != nil {
 		return fmt.Errorf("-peers: %w", err)
@@ -113,6 +114,7 @@ func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string
 		Stored: stored,
 	})
 	machine := fsm.New()
+	machine.SessionTTL = sessionTTL.Milliseconds()
 	node = server.NewNode(c, machine, tr.Send, tick)
 	node.SnapshotEvery = snapshotEvery
 	node.TimeEntry = server.TimeEntries(nil)

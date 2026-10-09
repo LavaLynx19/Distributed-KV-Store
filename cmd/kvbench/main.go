@@ -47,6 +47,8 @@ type config struct {
 	seed     uint64
 	retry    bool
 	readPct  int
+	ttlPct   int
+	ttl      time.Duration
 }
 
 func main() {
@@ -61,6 +63,8 @@ func main() {
 	flag.DurationVar(&cfg.checkFor, "check", time.Minute, "time limit for the linearizability check (0 skips it)")
 	flag.Uint64Var(&cfg.seed, "seed", 1, "seed for the clients' choices")
 	flag.IntVar(&cfg.readPct, "read-pct", 35, "percentage of requests that are gets; the rest keep the default write mix")
+	flag.IntVar(&cfg.ttlPct, "ttl-pct", 0, "percentage of puts that carry a time-to-live (A§6.7)")
+	flag.DurationVar(&cfg.ttl, "ttl", 200*time.Millisecond, "the longest time-to-live given; each is between a quarter of this and all of it")
 	flag.BoolVar(&cfg.retry, "retry", false, "open a Session per client and retry requests that get no definite answer (A§6.3)")
 	flag.Parse()
 	for _, n := range strings.Split(*nodes, ",") {
@@ -125,10 +129,12 @@ func run(cfg config) bool {
 				target: cfg.nodes[i%len(cfg.nodes)],
 				seen:   map[string]uint64{},
 			}
-			if cfg.retry && !c.openSession(ctx) {
-				return
-			}
 			for ctx.Err() == nil {
+				// A client opens a Session first, and again whenever the
+				// store has removed the one it had.
+				if cfg.retry && c.session == 0 && !c.openSession(ctx) {
+					return
+				}
 				c.request()
 			}
 		}()
@@ -260,7 +266,7 @@ func (c *client) request() {
 	}
 	id, began := c.rec.begin(c.id, cmd)
 	result, resp := c.send(cmd)
-	for giveUp := began.Add(4 * c.cfg.timeout); c.cfg.retry && result != check.Answered && time.Now().Before(giveUp); {
+	for giveUp := began.Add(4 * c.cfg.timeout); c.cfg.retry && c.session != 0 && result != check.Answered && time.Now().Before(giveUp); {
 		time.Sleep(2 * time.Millisecond)
 		result, resp = c.send(cmd)
 	}
@@ -288,14 +294,20 @@ func (c *client) pick() fsm.Command {
 	if c.rng.IntN(100) < c.cfg.readPct {
 		return fsm.Command{Op: fsm.OpGet, Key: key}
 	}
+	var cmd fsm.Command
 	switch roll := c.rng.IntN(65); {
 	case roll < 30:
-		return fsm.Command{Op: fsm.OpPut, Key: key, Value: value}
+		cmd = fsm.Command{Op: fsm.OpPut, Key: key, Value: value}
 	case roll < 55:
-		return fsm.Command{Op: fsm.OpPut, Key: key, Value: value, Conditional: true, IfVersion: c.seen[key]}
+		cmd = fsm.Command{Op: fsm.OpPut, Key: key, Value: value, Conditional: true, IfVersion: c.seen[key]}
 	default:
 		return fsm.Command{Op: fsm.OpDelete, Key: key}
 	}
+	if c.cfg.ttlPct > 0 && c.rng.IntN(100) < c.cfg.ttlPct {
+		longest := max(c.cfg.ttl.Milliseconds(), 4)
+		cmd.TTL = longest/4 + c.rng.Int64N(longest-longest/4+1)
+	}
+	return cmd
 }
 
 type answer struct {
@@ -321,6 +333,9 @@ func (c *client) send(cmd fsm.Command) (check.Result, fsm.Response) {
 		body := map[string]any{"value": string(cmd.Value)}
 		if cmd.Conditional {
 			body["if_version"] = cmd.IfVersion
+		}
+		if cmd.TTL > 0 {
+			body["ttl"] = cmd.TTL
 		}
 		raw, _ := json.Marshal(body) // a map of strings and numbers always encodes
 		req, err = http.NewRequest(http.MethodPut, endpoint, bytes.NewReader(raw))
@@ -366,6 +381,11 @@ func (c *client) send(cmd fsm.Command) (check.Result, fsm.Response) {
 		return check.Answered, fsm.Response{Status: fsm.StatusNotFound}
 	case http.StatusConflict:
 		return check.Answered, fsm.Response{Status: fsm.StatusVersionMismatch, Version: a.Version}
+	case http.StatusGone:
+		// The store removed this client's Session. An earlier attempt may
+		// have gone through before it did.
+		c.session, c.seq = 0, 0
+		return check.Lost, fsm.Response{}
 	case http.StatusMisdirectedRequest, http.StatusServiceUnavailable:
 		if a.Leader != "" && slices.Contains(c.cfg.nodes, a.Leader) {
 			c.target = a.Leader

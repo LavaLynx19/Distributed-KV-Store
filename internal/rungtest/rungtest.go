@@ -39,6 +39,9 @@ type Store struct {
 	// Stamped puts the receiving Member's clock reading into every request
 	// (A§6.1), as Rung 5 and later do.
 	Stamped bool
+	// SessionTTL removes a Session unused for this long by Log time
+	// (fsm.Machine.SessionTTL). Zero means never.
+	SessionTTL int64
 	// OwnClock gives each Member a state machine that judges Expiry by its
 	// own clock, as Rung 5's naive store does.
 	OwnClock bool
@@ -141,7 +144,11 @@ const (
 // through the network encoding, so the core's message types must have been
 // given to transport.Register.
 func Run(store Store, sc Scenario, members int, seed uint64) Report {
-	newMachine := func() sim.Machine { return fsm.New() }
+	newMachine := func() sim.Machine {
+		m := fsm.New()
+		m.SessionTTL = store.SessionTTL
+		return m
+	}
 	if store.OwnClock {
 		newMachine = func() sim.Machine { return fsm.NewOwnClock() }
 	}
@@ -206,6 +213,7 @@ func Run(store Store, sc Scenario, members int, seed uint64) Report {
 	rep.verdict = h.Linearizable(20 * time.Second)
 	rep.Linearizable, rep.TimedOut = rep.verdict.Linearizable, rep.verdict.TimedOut
 	items := map[core.NodeID][]fsm.Item{}
+	sessions := map[core.NodeID]int{}
 	fit := 0
 	for _, id := range s.IDs() {
 		if err := s.StartError(id); err != nil {
@@ -215,6 +223,7 @@ func Run(store Store, sc Scenario, members int, seed uint64) Report {
 		machine := s.Machine(id).(*fsm.Machine)
 		machine.Observe(s.Clock(id))
 		items[id] = machine.Items()
+		sessions[id] = machine.Sessions()
 		if s.Status(id).Recovering {
 			rep.StillRecovering++
 		} else {
@@ -223,6 +232,13 @@ func Run(store Store, sc Scenario, members int, seed uint64) Report {
 	}
 	rep.Stalled = fit < members/2+1
 	rep.Diverged = check.Diverged(items)
+	// Members must agree on which Sessions exist too.
+	for _, id := range s.IDs()[1:] {
+		a, b := sessions[s.IDs()[0]], sessions[id]
+		if _, ok := items[id]; ok && items[s.IDs()[0]] != nil && a != b {
+			rep.Diverged = append(rep.Diverged, fmt.Sprintf("node %d has %d Sessions, node %d has %d", s.IDs()[0], a, id, b))
+		}
+	}
 	rep.Signals = h.Signals
 	rep.Recovery = h.Signals.RecoveryAfter(faultsEnd)
 	return rep

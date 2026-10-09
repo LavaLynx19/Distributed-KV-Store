@@ -16,6 +16,40 @@ func timed() rungtest.Store {
 	return s
 }
 
+// forgetsSessions is rung5Store with Sessions that are removed after 800
+// units unused, which is short enough for a Partition or a clock jump to
+// cost a client its Session in the middle of a request.
+var forgetsSessions = func() rungtest.Store {
+	s := timed()
+	s.SessionTTL = 800
+	return s
+}()
+
+// Session cleanup (A§6.3) must not let a retry take effect twice, or make
+// Members disagree about which Sessions exist.
+func TestSessionCleanup(t *testing.T) {
+	seeds := uint64(100)
+	if testing.Short() {
+		seeds = 10
+	}
+	expired := 0
+	for _, name := range []string{"none", "isolate-leader", "crash-leader", "everything", "full-restart", "clock-skew", "clock-jumps"} {
+		for _, members := range []int{3, 5} {
+			for seed := uint64(1); seed <= seeds; seed++ {
+				r := rungtest.Run(forgetsSessions, scenario(t, name), members, seed)
+				if !r.Safe() || (!r.Stalled && len(r.Diverged) > 0) {
+					t.Errorf("%v\n  diverged: %v", r, r.Diverged)
+				}
+				expired += r.Signals.SessionExpired
+			}
+		}
+	}
+	if expired == 0 {
+		t.Error("no client ever lost its Session, so cleanup wasn't exercised")
+	}
+	t.Logf("clients were told their Session had expired %d times", expired)
+}
+
 // ownClock is the store Rung 5 starts from: a key's deadline is the
 // Leader's clock reading plus its time-to-live, and each Member decides
 // whether the key is still there by looking at its own clock.

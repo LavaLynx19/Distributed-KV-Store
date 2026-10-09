@@ -296,6 +296,7 @@ func (w Workload) nextRetrying(s *Sim, h *check.History, c *client, until int64)
 					// This attempt changed nothing, but an earlier one may
 					// have, before the store lost the Session.
 					c.session, c.seq = 0, 0
+					h.Signals.SessionExpired++
 					finish(check.Lost, fsm.Response{})
 					return
 				}

@@ -212,6 +212,8 @@ Read paths, in the order they appear:
 ### 6.3 Retries
 In Rung 1 clients never retry: a request with no definite answer is recorded as outcome unknown, which the checker allows for. Rung 2 lets clients retry, shows a compare-and-set applying twice, and adds Sessions. From then on every command carries a Session id and a request number. Before applying, the state machine checks the Session: a request number already applied returns its saved response and changes nothing. Because this happens when an Entry is applied, it is identical on every Member and survives a change of Leader.
 
+**Cleanup (Rung 5).** A Session records Log time (§6.7) whenever it is opened or used, and is removed once Log time has moved a set span past that (an hour by default, and the same on every Member). Sessions are checked each time Log time enters a new quarter of that span. A request in a removed Session is answered `session_expired` and changes nothing, so a late retry can't take effect a second time; the client opens a new Session and treats its last request's outcome as unknown. An idle Group keeps its Sessions until the next stamped Entry.
+
 ### 6.4 Snapshot and catch-up
 - **Taking one.** After every so many applied Entries, the shell captures the state machine by keeping its tree roots, which is instant. The real shell encodes the capture on another goroutine while the core carries on. It then hands the result to the core, which stores it and drops its Log up to that Entry. Each Member does this for itself.
 - **Sending one.** A Leader whose follower needs Entries it has dropped sends its Snapshot instead, at most once per election timeout, with ordinary heartbeats in between. The Log after the Snapshot follows.

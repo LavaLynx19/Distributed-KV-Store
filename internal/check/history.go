@@ -50,6 +50,9 @@ type Signals struct {
 	Answered int
 	Rejected int
 	Lost     int
+	// SessionExpired counts requests refused because the store had removed
+	// the client's Session. The client records them as Lost.
+	SessionExpired int
 	// okWrites are the times at which a put or delete was answered OK.
 	okWrites []int64
 }
