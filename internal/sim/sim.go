@@ -138,6 +138,7 @@ type member struct {
 	clockRate          int64
 
 	timePending bool // a time Entry this Member proposed is still undecided
+	destroyed   bool // gone for good: Restart does nothing
 
 	applied    core.Index // the last Entry applied to machine
 	snapshotAt core.Index // the Entry the last Snapshot was taken at
@@ -344,7 +345,7 @@ func (s *Sim) Crash(id core.NodeID) {
 // back with only what its disk holds.
 func (s *Sim) Restart(id core.NodeID) {
 	m := s.members[id]
-	if m.up {
+	if m.up || m.destroyed {
 		return
 	}
 	s.mix('R', uint64(id), 0)
@@ -376,6 +377,31 @@ func (s *Sim) Restart(id core.NodeID) {
 
 func (s *Sim) openDisk(fs *storage.MemFS) (*storage.Store, core.Stored, error) {
 	return storage.OpenWith(fs, dataDir, storage.Options{Unchecked: s.cfg.UncheckedDisk})
+}
+
+// Destroy stops a Node for good, as if its machine had been lost. Nothing
+// restarts it.
+func (s *Sim) Destroy(id core.NodeID) {
+	s.Crash(id)
+	s.members[id].destroyed = true
+}
+
+// Destroyed reports whether the Node was lost for good.
+func (s *Sim) Destroyed(id core.NodeID) bool { return s.members[id].destroyed }
+
+// ForceMembers is Unsafe recovery (A§6.6) on a stopped Member: it writes
+// members to the Member's disk as its Member list, as the operator's
+// command does. The Member must be down, and acts on the list when it is
+// next started.
+func (s *Sim) ForceMembers(id core.NodeID, members []core.NodeID) storage.Recovery {
+	m := s.members[id]
+	if m.up {
+		panic("sim: Unsafe recovery on a running Member")
+	}
+	s.mix('U', uint64(id), uint64(len(members)))
+	rec, err := storage.ForceMembers(m.fs, dataDir, members, storage.Options{Unchecked: s.cfg.UncheckedDisk})
+	must(err)
+	return rec
 }
 
 // StartError is why a Member's last restart failed, or nil. A Member that

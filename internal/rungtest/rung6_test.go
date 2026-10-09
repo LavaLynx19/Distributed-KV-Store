@@ -112,3 +112,36 @@ func TestRung6(t *testing.T) {
 		}
 	}
 }
+
+// Unsafe recovery (A§6.6): a Group that has lost its Majority for good stops
+// for ever, until an operator forces the survivors' Member list.
+func TestUnsafeRecovery(t *testing.T) {
+	seeds := uint64(50)
+	if testing.Short() {
+		seeds = 5
+	}
+	for _, members := range []int{3, 5} {
+		for seed := uint64(1); seed <= seeds; seed++ {
+			// Left alone, the survivors never take another write.
+			if r := rungtest.Run(rung6Store, scenario(t, "lose-the-majority-and-wait"), members, seed); !r.Safe() || r.Recovery >= 0 {
+				t.Errorf("with the Majority gone and nothing done: %v", r)
+			}
+			// Forced, they carry on as a smaller Group, and agree.
+			r := rungtest.Run(rung6Store, scenario(t, "lose-the-majority"), members, seed)
+			if r.Panic != "" || r.TwoLeaders != "" || len(r.Diverged) > 0 || r.Recovery < 0 || len(r.Final) != (members-1)/2 {
+				t.Errorf("after Unsafe recovery: %v, final Members %v\n  diverged: %v", r, r.Final, r.Diverged)
+			}
+			// Even when they were behind. What they hadn't received is gone,
+			// which is the next assertion.
+			r = rungtest.Run(rung6Store, scenario(t, "lose-the-majority-while-behind"), members, seed)
+			if r.Panic != "" || r.TwoLeaders != "" || len(r.Diverged) > 0 || r.Recovery < 0 {
+				t.Errorf("after Unsafe recovery of survivors that were behind: %v\n  diverged: %v", r, r.Diverged)
+			}
+		}
+	}
+	// It is unsafe: here clients were told writes had succeeded that the
+	// survivors never received, and the recovered Group doesn't have them.
+	if r := rungtest.Run(rung6Store, scenario(t, "lose-the-majority-while-behind"), 3, 1); r.Linearizable {
+		t.Errorf("seed 1: expected Acknowledged writes to be lost, got %v", r)
+	}
+}

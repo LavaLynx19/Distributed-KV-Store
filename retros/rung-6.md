@@ -80,3 +80,43 @@ Neither of the two main rules was tested by the scenarios I wrote first. Those a
 
 - **`impatient-shrink`** cuts the Leader off with one follower and asks it, three times in ten units, to remove a Member on the other side. Each request is a single change. Without rule 1 the Leader's side whittles the list down to itself and commits alone, while the other side still has a Majority of the list it knows.
 - **`straddle`** is the published flaw. With four founders, the Leader is cut off with a Spare and adds it, which can't Commit. The other three elect a Leader, which is cut off with one follower the instant it wins and asked to remove the old Leader. Without rule 2 it does, and commits with that one follower. Then the old Leader, the Spare and the founder that heard nothing of the new Term are joined, and elect the old Leader under the list of five. Two Groups now take writes.
+
+## Unsafe recovery (P6.5)
+
+A Group that loses its Majority for good can never elect a Leader again. That is the price of never having two.
+
+`kvctl unsafe-recover -data <dir> -members <ids>`, run on each stopped survivor, writes the survivors' list beside the Log. Started again, they act on that list and nothing older. They elect a Leader by the usual rule, so the survivor holding the most wins, and its first act is to append the list as a Membership change.
+
+50 seeds per cell, 3 / 5 founders. A Majority is destroyed, chosen at random.
+
+| | Take another write | End identical |
+|---|---|---|
+| Nothing done | 0 / 0 of 50 | — |
+| Unsafe recovery after 400 units | 50 / 50 | 50 / 50 |
+| The same, with the survivors cut off for 200 units before the loss | 50 / 50 | 50 / 50 |
+
+**What it costs.** In the first recovery row every one of 200 Histories is still Linearizable: the survivors happened to hold everything. In the second, 72 of 100 (3 founders) and 67 of 100 (5) are not. Clients had been told writes succeeded that the survivors never received, and the recovered Group doesn't have them. Pinned: `lose-the-majority-while-behind`, 3 founders, seed 1.
+
+**What it reports.** On three real processes with five keys written, two killed for good:
+```
+Unsafe recovery of the Member in harness/out/local/data3
+  It holds Entries up to 6 (Term 1). The latest Term it saw is 4.
+  Its Member list is the one the Group started with. It becomes [3].
+  DISCARDED: every write the Group Committed after Entry 6, unless another survivor holds it.
+  Run this on every survivor with the same list. The survivor holding the most will lead.
+  Never start a discarded Member again with its old data: it would form a second Group.
+```
+Before it, a write to the survivor was answered `no_majority`. After it, the survivor led a Group of one, held all five keys, and took writes.
+
+The report can't name the writes that were lost. The Members that knew are gone. It gives the last Entry the survivor holds, and the operator has to take it from there.
+
+**It also lets a damaged Member vote again.** Rung 4 left a Group stopped for good when a Majority was Recovering at once, and said the way out would be this command. It clears that mark, and says it did.
+
+### What I got wrong first
+My first design appended the forced list to the survivor's Log as an ordinary Entry. That needs a Term for the Entry. Any Term I could choose offline was wrong: the Member's latest Term lets a survivor with a short Log and a high Term beat one holding more, and the last Entry's Term can make two different Entries look the same to the Log-matching check. The list is now kept outside the Log until a Leader elected in the normal way writes it in.
+
+### Reproduce
+```
+go test -run 'TestUnsafeRecovery' -v ./internal/rungtest/
+go test -run 'TestForceMembers' ./internal/storage/
+```

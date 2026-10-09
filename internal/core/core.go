@@ -93,6 +93,18 @@ type Stored struct {
 	// vote are always the true ones: a Member that can't establish those
 	// doesn't start.
 	Damaged bool
+	// Forced is the Member list an operator imposed by Unsafe recovery
+	// (A§6.6), if one ever did.
+	Forced *ForcedMembers
+}
+
+// ForcedMembers is a Member list written straight to a stopped Member's
+// disk by an operator, to let what is left of a Group carry on after its
+// Majority is gone for good. It overrides every Membership change the Member
+// held at the time: those in Entries up to and including At.
+type ForcedMembers struct {
+	Members []NodeID
+	At      Index
 }
 
 // Apply makes the change p describes. Both shells keep a Member's durable
@@ -143,7 +155,7 @@ func (s *Stored) firstIndex() Index {
 // Clone returns a copy that shares no memory with s, except Snapshot data and
 // Entry payloads, which nothing modifies.
 func (s *Stored) Clone() Stored {
-	c := Stored{HardState: s.HardState, Entries: append([]Entry(nil), s.Entries...), Damaged: s.Damaged}
+	c := Stored{HardState: s.HardState, Entries: append([]Entry(nil), s.Entries...), Damaged: s.Damaged, Forced: s.Forced}
 	if s.Snapshot != nil {
 		snap := *s.Snapshot
 		c.Snapshot = &snap

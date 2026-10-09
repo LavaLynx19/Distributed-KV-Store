@@ -268,7 +268,8 @@ func finalMembers(s *sim.Sim) []core.NodeID {
 			return list
 		}
 	}
-	return s.Founders()
+	// Nobody leads. Compare the founders that still exist.
+	return slices.DeleteFunc(s.Founders(), s.Destroyed)
 }
 
 // watchLeaders samples every Member's status and records the first moment
@@ -1007,4 +1008,69 @@ var Rung6 = []Scenario{
 			})
 		})
 	}},
+}
+
+// Recovery loses a Majority for good (README). These scenarios are apart
+// from Rung6 because the second can't keep the store's promises: Unsafe
+// recovery may discard Acknowledged writes.
+var Recovery = []Scenario{
+	// More than half the Members are lost for good, so the rest can never
+	// elect a Leader. Nobody does anything about it.
+	{"lose-the-majority-and-wait", func(s *sim.Sim, from, to int64) {
+		s.At(from+600, func() { loseTheMajority(s, false, 0) })
+	}},
+
+	// The same loss. After a while an operator stops the survivors and
+	// forces their Member list to just themselves (A§6.6).
+	{"lose-the-majority", func(s *sim.Sim, from, to int64) {
+		s.At(from+600, func() { loseTheMajority(s, true, 0) })
+	}},
+
+	// The survivors were cut off from the others when the others were
+	// lost, so they are missing what the Group Committed meanwhile.
+	{"lose-the-majority-while-behind", func(s *sim.Sim, from, to int64) {
+		s.At(from+600, func() { loseTheMajority(s, true, 200) })
+	}},
+}
+
+// loseTheMajority destroys a Majority of the Group, chosen at random, and
+// if recover is set runs Unsafe recovery on the survivors 400 units later.
+// With behind set, the survivors are first cut off from the rest for that
+// many units, so the Majority commits writes they never see.
+func loseTheMajority(s *sim.Sim, recover bool, behind int64) {
+	members := s.Founders()
+	if l := leader(s); l != 0 {
+		members = s.Status(l).Members
+	}
+	s.Rand().Shuffle(len(members), func(i, j int) { members[i], members[j] = members[j], members[i] })
+	survivors := members[:(len(members)-1)/2]
+	if behind > 0 {
+		s.Partition(survivors, members[len(survivors):])
+		s.After(behind, func() {
+			s.Heal()
+			loseRest(s, members, survivors, recover)
+		})
+		return
+	}
+	loseRest(s, members, survivors, recover)
+}
+
+func loseRest(s *sim.Sim, members, survivors []core.NodeID, recover bool) {
+	for _, id := range members[len(survivors):] {
+		s.Destroy(id)
+	}
+	if !recover {
+		return
+	}
+	s.After(400, func() {
+		for _, id := range survivors {
+			s.Crash(id)
+		}
+		for _, id := range survivors {
+			s.ForceMembers(id, survivors)
+		}
+		for _, id := range survivors {
+			s.Restart(id)
+		}
+	})
 }

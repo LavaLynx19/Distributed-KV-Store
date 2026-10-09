@@ -72,6 +72,11 @@ func (n *Node) becomeLeader(out *core.Output) {
 		n.heard[m] = n.now
 	}
 	n.appendEntry(out, core.Entry{Index: n.lastIndex() + 1, Term: n.term, Kind: core.EntryNoop})
+	if n.forced {
+		// Unsafe recovery: put the forced list in the Log, where every
+		// survivor and every later Member will find it.
+		n.appendEntry(out, core.Entry{Index: n.lastIndex() + 1, Term: n.term, Kind: core.EntryMembers, Payload: encodeMembers(n.members)})
+	}
 	for _, m := range n.members {
 		if m != n.id {
 			n.sendAppend(out, m)

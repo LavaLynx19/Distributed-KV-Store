@@ -7,11 +7,17 @@
 //
 // -nodes lists the client API of any Nodes, Members or Spares. A change is
 // sent to whichever of them leads.
+//
+// It also performs Unsafe recovery (A§6.6), which works on a stopped
+// Member's files and talks to nobody:
+//
+//	kvctl unsafe-recover -data DIR -members 2,5 [-confirm]
 package main
 
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -20,13 +26,25 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"distributed-kv-store/internal/core"
+	"distributed-kv-store/internal/raft"
+	"distributed-kv-store/internal/storage"
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "unsafe-recover" {
+		if err := unsafeRecover(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "kvctl:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	nodes := flag.String("nodes", "", "client API URLs of some Nodes, comma-separated")
 	wait := flag.Duration("wait", 30*time.Second, "how long to keep trying a change that is refused for now")
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: kvctl -nodes URL[,URL…] status | add ID | remove ID")
+		fmt.Fprintln(os.Stderr, "       kvctl unsafe-recover -data DIR -members ID[,ID…] [-confirm]")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -179,4 +197,84 @@ func change(httpc *http.Client, urls []string, verb string, id uint64, wait time
 			time.Sleep(200 * time.Millisecond)
 		}
 	}
+}
+
+// unsafeRecover forces the Member list on a stopped Member's disk, after
+// saying what that does. Without -confirm it only says.
+func unsafeRecover(args []string) error {
+	fs := flag.NewFlagSet("unsafe-recover", flag.ExitOnError)
+	data := fs.String("data", "", "the stopped Member's data directory")
+	list := fs.String("members", "", "ids of the Members that survive: 2,5")
+	confirm := fs.Bool("confirm", false, "do it. Without this, only say what would be done")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *data == "" || *list == "" {
+		return errors.New("unsafe-recover needs -data and -members")
+	}
+	var members []core.NodeID
+	for _, field := range strings.Split(*list, ",") {
+		id, err := strconv.ParseUint(strings.TrimSpace(field), 10, 64)
+		if err != nil || id == 0 {
+			return fmt.Errorf("-members: %q isn't a Node id", field)
+		}
+		members = append(members, core.NodeID(id))
+	}
+	if _, err := os.Stat(*data); err != nil {
+		return fmt.Errorf("-data: %w", err)
+	}
+
+	// Opening the directory repairs it if it is damaged, exactly as starting
+	// the Member would, so looking first changes nothing a start wouldn't.
+	store, stored, err := storage.Open(*data, 0)
+	if err != nil {
+		return err
+	}
+	if err := store.Close(); err != nil {
+		return err
+	}
+	last, lastTerm := core.Index(0), core.Term(0)
+	if stored.Snapshot != nil {
+		last, lastTerm = stored.Snapshot.Index, stored.Snapshot.Term
+	}
+	if n := len(stored.Entries); n > 0 {
+		last, lastTerm = stored.Entries[n-1].Index, stored.Entries[n-1].Term
+	}
+	fmt.Printf("Unsafe recovery of the Member in %s\n", *data)
+	fmt.Printf("  It holds Entries up to %d (Term %d). The latest Term it saw is %d.\n", last, lastTerm, stored.HardState.Term)
+	if was, known := raft.StoredMembers(stored); known {
+		var removed []core.NodeID
+		for _, m := range was {
+			if !containsID(members, m) {
+				removed = append(removed, m)
+			}
+		}
+		fmt.Printf("  Its Member list is %v. It becomes %v, which discards %v.\n", was, members, removed)
+	} else {
+		fmt.Printf("  Its Member list is the one the Group started with. It becomes %v.\n", members)
+	}
+	if stored.Damaged {
+		fmt.Println("  It found damage on its disk and hasn't recovered: it may be missing Entries it acknowledged. It will vote all the same.")
+	}
+	fmt.Printf("  DISCARDED: every write the Group Committed after Entry %d, unless another survivor holds it.\n", last)
+	fmt.Println("  Run this on every survivor with the same list. The survivor holding the most will lead.")
+	fmt.Println("  Never start a discarded Member again with its old data: it would form a second Group.")
+	if !*confirm {
+		fmt.Println("Nothing was changed. Run again with -confirm to do it.")
+		return nil
+	}
+	if _, err := storage.ForceMembers(storage.OSFS{}, *data, members, storage.Options{}); err != nil {
+		return err
+	}
+	fmt.Println("Done. Start the Member.")
+	return nil
+}
+
+func containsID(list []core.NodeID, id core.NodeID) bool {
+	for _, m := range list {
+		if m == id {
+			return true
+		}
+	}
+	return false
 }

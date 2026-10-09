@@ -238,7 +238,13 @@ One Member is added or removed per change, as a Log Entry that carries the whole
 **Addresses.** Every Node is started with the address of every Node that may ever join, Spares included. A change names a Node by id only.
 
 ### 6.6 Unsafe recovery
-An operator command, run on a surviving Member while the Group is stopped, rewrites its Member list to the survivors. It prints the last index it holds and warns that anything Committed beyond the survivors' Logs is lost. It is never automatic.
+An operator command, run on each surviving Member while it is stopped, rewrites its Member list to the survivors: `kvctl unsafe-recover -data <dir> -members <ids>`. It is never automatic, and without `-confirm` it only says what it would do.
+
+- **What it writes.** A file beside the Log holding the forced list and the index of the last Entry the Member held. The Log is not touched. When the Member starts, that list overrides the Snapshot's and every Membership change up to that index. A forced list that can't be read stops the Member starting.
+- **What happens next.** The survivors elect a Leader among themselves by the usual rule, so the one holding the most wins. Its first act is to append the forced list as a Membership change, so every survivor, and every Member added later, ends with the same list in its Log.
+- **What it reports.** The last index and Term the Member holds, the Member list it replaces if the disk says, the Members discarded, and that every write Committed after that index is lost unless another survivor holds it. It can't say which writes those were: the Members that knew are gone.
+- **It also clears the mark that keeps a damaged Member out of elections** (§6.8), and says so. This is the way out for a Group that has stopped because a Majority is Recovering.
+- **The discarded Members must never be started again with their old data.** They still hold the old list, and enough of them would elect a Leader of their own.
 
 ### 6.7 Expiry
 - **Log time** is the highest stamp applied so far. A stamp lower than Log time leaves it where it is, so time never goes back when a Leader's clock does.

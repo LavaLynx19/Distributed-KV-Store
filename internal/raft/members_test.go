@@ -271,3 +271,52 @@ func TestSnapshotCarriesTheMemberList(t *testing.T) {
 		t.Fatalf("after installing the Snapshot members = %v, want [1 2]", follower.Status().Members)
 	}
 }
+
+// Unsafe recovery (A§6.6): a forced list overrides every change the Member
+// held, and the first survivor to lead writes it into the Log.
+func TestForcedMembers(t *testing.T) {
+	old := core.Entry{Index: 2, Term: 1, Kind: core.EntryMembers, Payload: encodeMembers(ids(1, 2, 3, 4, 5))}
+	stored := core.Stored{
+		HardState: core.HardState{Term: 3},
+		Entries:   []core.Entry{{Index: 1, Term: 1}, old, {Index: 3, Term: 2}},
+		Forced:    &core.ForcedMembers{Members: ids(2, 1), At: 3},
+	}
+	if list, ok := StoredMembers(core.Stored{Entries: stored.Entries}); !ok || !slices.Equal(list, ids(1, 2, 3, 4, 5)) {
+		t.Fatalf("before forcing the disk says %v %v, want the list of five", list, ok)
+	}
+	if _, ok := StoredMembers(core.Stored{Entries: stored.Entries[:1]}); ok {
+		t.Fatal("a disk with no change on it claimed to know the Member list")
+	}
+
+	n := New(Config{ID: 1, Members: ids(1, 2, 3), ElectionTicks: 10, HeartbeatTicks: 1, Rand: new(counter), Stored: stored})
+	if !slices.Equal(n.Status().Members, ids(1, 2)) {
+		t.Fatalf("members = %v, want the forced [1 2]", n.Status().Members)
+	}
+	// Two Members need both. With node 2's vote it leads, and its first
+	// act is to put the list in the Log.
+	out := elect(t, n, 2)
+	var kinds []core.EntryKind
+	for _, e := range out.Persist.Entries {
+		kinds = append(kinds, e.Kind)
+	}
+	if !slices.Equal(kinds, []core.EntryKind{core.EntryNoop, core.EntryMembers}) {
+		t.Fatalf("a recovered Leader appended %v, want a no-op and then the Member list", kinds)
+	}
+	if list, _ := decodeMembers(out.Persist.Entries[1].Payload); !slices.Equal(list, ids(1, 2)) {
+		t.Fatalf("the list it appended is %v", list)
+	}
+
+	// Restarted with that Entry in its Log, it reads the list from there.
+	stored.Entries = append(stored.Entries, out.Persist.Entries...)
+	again := New(Config{ID: 1, Members: ids(1, 2, 3), ElectionTicks: 10, HeartbeatTicks: 1, Rand: new(counter), Stored: stored})
+	if !slices.Equal(again.Status().Members, ids(1, 2)) || again.forced {
+		t.Fatalf("after restart: members %v, still marked forced %v", again.Status().Members, again.forced)
+	}
+	// A change made after the recovery stands over the forced list.
+	later := core.Entry{Index: 6, Term: 4, Kind: core.EntryMembers, Payload: encodeMembers(ids(1, 2, 6))}
+	stored.Entries = append(stored.Entries, later)
+	grown := New(Config{ID: 1, Members: ids(1, 2, 3), ElectionTicks: 10, HeartbeatTicks: 1, Rand: new(counter), Stored: stored})
+	if !slices.Equal(grown.Status().Members, ids(1, 2, 6)) {
+		t.Fatalf("members = %v, want the later change [1 2 6]", grown.Status().Members)
+	}
+}

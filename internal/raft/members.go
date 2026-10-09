@@ -103,6 +103,7 @@ func (n *Node) useMembers(e core.Entry) {
 	}
 	n.lists = append(n.lists, memberList{index: e.Index, members: members})
 	n.members = members
+	n.forced = false // the Log says who the Members are again
 	if n.role == core.LeaderRole {
 		for _, m := range members {
 			n.follow(m)
@@ -274,3 +275,20 @@ func (n *Node) leaveIfRemoved(out *core.Output) {
 		n.becomeFollower(out, n.term, 0)
 	}
 }
+
+// StoredMembers is the Member list a stopped Member's disk gives it, and
+// whether the disk says at all: a Member that has seen no Membership change
+// holds only the list it was started with, which isn't on its disk. An
+// operator's tool uses this to say what Unsafe recovery replaces (A§6.6).
+func StoredMembers(stored core.Stored) ([]core.NodeID, bool) {
+	n := New(Config{ElectionTicks: 1, HeartbeatTicks: 1, Rand: noRand{}, Stored: stored})
+	if !n.changed {
+		return nil, false
+	}
+	return slices.Clone(n.members), true
+}
+
+// noRand is the randomness of a Node that is built only to be looked at.
+type noRand struct{}
+
+func (noRand) Uint64() uint64 { return 0 }

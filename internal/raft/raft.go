@@ -162,6 +162,10 @@ type Node struct {
 	learner      core.NodeID
 	learnerRef   uint64
 	learnerSince int
+	// forced is set while this Member's list is one an operator imposed and
+	// the Log doesn't say so yet (A§6.6). The first of the survivors to
+	// lead appends it as a change, so that everyone ends with the same list.
+	forced bool
 
 	term     core.Term
 	votedFor core.NodeID
@@ -237,8 +241,18 @@ func New(cfg Config) *Node {
 		}
 	}
 	n.log.entries = slices.Clone(cfg.Stored.Entries)
+	// A list an operator forced overrides everything the Member held when
+	// it was forced: the Snapshot's list and the changes in the Log up to
+	// there. Anything after it is newer and stands.
+	var forcedAt core.Index
+	if f := cfg.Stored.Forced; f != nil && f.At >= n.log.base {
+		forcedAt = f.At
+		n.members, n.changed, n.forced = slices.Clone(f.Members), true, true
+		slices.Sort(n.members)
+		n.lists = []memberList{{index: f.At, members: n.members}}
+	}
 	for _, e := range n.log.entries {
-		if e.Kind == core.EntryMembers {
+		if e.Kind == core.EntryMembers && (cfg.Stored.Forced == nil || e.Index > forcedAt) {
 			n.useMembers(e)
 			n.changed = true
 		}
