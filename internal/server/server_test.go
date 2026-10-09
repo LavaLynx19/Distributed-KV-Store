@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
@@ -58,6 +59,7 @@ func clusterReading(t *testing.T, n int, reads raft.ReadMode) map[core.NodeID]*m
 		c := raft.New(raft.Config{ID: id, Members: ids, ElectionTicks: 10, HeartbeatTicks: 1,
 			Rand: rand.New(rand.NewPCG(uint64(id), 99)), Reads: reads})
 		node = server.NewNode(c, fsm.New(), tr.Send, 5*time.Millisecond)
+		node.TimeEntry = server.TimeEntries(nil)
 		ctx, cancel := context.WithCancel(context.Background())
 		go node.Run(ctx)
 		api := &server.API{Node: node, Clients: clients, Timeout: 2 * time.Second, ReadsBypassLog: reads != raft.ReadsThroughLog}
@@ -240,6 +242,22 @@ func TestClientAPIWithReadsThroughLog(t *testing.T) {
 	}
 }
 
+func TestClientAPIWithLeaseReads(t *testing.T) {
+	members := clusterReading(t, 3, raft.ReadsByLease)
+	leader := leaderURL(t, members)
+	if a := call(t, "PUT", leader+"/v1/kv/a", `{"value":"1"}`); a.code != 200 {
+		t.Fatalf("put: %+v", a)
+	}
+	for range 20 {
+		if a := call(t, "GET", leader+"/v1/kv/a", ""); a.code != 200 || a.body["value"] != "1" {
+			t.Fatalf("get: %+v", a)
+		}
+	}
+	if a := call(t, "GET", leader+"/v1/kv", ""); a.code != 200 || len(a.body["items"].([]any)) != 1 {
+		t.Fatalf("scan: %+v", a)
+	}
+}
+
 func TestReadIndexFollowerRedirectsGets(t *testing.T) {
 	members := cluster(t, 3)
 	leader := leaderURL(t, members)
@@ -261,5 +279,103 @@ func decode(t *testing.T, resp *http.Response, into any) {
 	defer resp.Body.Close()
 	if err := json.NewDecoder(resp.Body).Decode(into); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A key with a time-to-live goes when its time is up, on every Member, with
+// nobody writing anything in between (A§6.7).
+func TestKeyExpiresInAnIdleGroup(t *testing.T) {
+	members := cluster(t, 3)
+	leader := leaderURL(t, members)
+
+	if a := call(t, "PUT", leader+"/v1/kv/brief", `{"value":"1","ttl":150}`); a.code != 200 {
+		t.Fatalf("put with ttl: %+v", a)
+	}
+	if a := call(t, "PUT", leader+"/v1/kv/lasting", `{"value":"1"}`); a.code != 200 {
+		t.Fatalf("put: %+v", a)
+	}
+	if a := call(t, "GET", leader+"/v1/kv/brief", ""); a.code != 200 {
+		t.Fatalf("get before the deadline: %+v", a)
+	}
+	if a := call(t, "PUT", leader+"/v1/kv/x", `{"value":"1","ttl":-5}`); a.code != 400 {
+		t.Fatalf("negative ttl: %+v", a)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		a := call(t, "GET", leader+"/v1/kv/brief", "")
+		if a.code == 404 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the key is still there 3s after a 150ms time-to-live: %+v", a)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// Every Member dropped it, and kept the other key.
+	for id, m := range members {
+		for wait := time.Now().Add(2 * time.Second); ; {
+			resp, err := http.Get(m.api.URL + "/v1/debug/items")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var items []server.ItemJSON
+			decode(t, resp, &items)
+			if len(items) == 1 && items[0].Key == "lasting" {
+				break
+			}
+			if time.Now().After(wait) {
+				t.Fatalf("node %d holds %+v, want only the key with no time-to-live", id, items)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+}
+
+func TestScanAndTransaction(t *testing.T) {
+	members := cluster(t, 3)
+	leader := leaderURL(t, members)
+	for _, k := range []string{"b", "a", "c"} {
+		if a := call(t, "PUT", leader+"/v1/kv/"+k, `{"value":"`+k+`"}`); a.code != 200 {
+			t.Fatalf("put %s: %+v", k, a)
+		}
+	}
+	keys := func(a answer) []string {
+		var ks []string
+		for _, it := range a.body["items"].([]any) {
+			ks = append(ks, it.(map[string]any)["key"].(string))
+		}
+		return ks
+	}
+	if a := call(t, "GET", leader+"/v1/kv", ""); a.code != 200 || !slices.Equal(keys(a), []string{"a", "b", "c"}) {
+		t.Fatalf("scan of everything: %+v", a)
+	}
+	if a := call(t, "GET", leader+"/v1/kv?start=b&end=c", ""); a.code != 200 || !slices.Equal(keys(a), []string{"b"}) {
+		t.Fatalf("scan [b, c): %+v", a)
+	}
+	if a := call(t, "GET", leader+"/v1/kv?limit=2", ""); !slices.Equal(keys(a), []string{"a", "b"}) {
+		t.Fatalf("scan with limit 2: %+v", a)
+	}
+	if a := call(t, "GET", leader+"/v1/kv?limit=x", ""); a.code != 400 {
+		t.Fatalf("bad limit: %+v", a)
+	}
+
+	a := call(t, "GET", leader+"/v1/kv/a", "")
+	va := uint64(a.body["version"].(float64))
+	move := fmt.Sprintf(`{"if":[{"key":"a","version":%d},{"key":"new","version":0}],"writes":[{"op":"put","key":"new","value":"from a"},{"op":"delete","key":"a"}]}`, va)
+	done := call(t, "POST", leader+"/v1/txn", move)
+	if done.code != 200 || done.body["version"] == nil {
+		t.Fatalf("transaction: %+v", done)
+	}
+	// The same Transaction again is refused, and says which conditions failed.
+	again := call(t, "POST", leader+"/v1/txn", move)
+	if again.code != 409 || again.body["reason"] != "version_mismatch" || len(again.body["failed"].([]any)) != 2 {
+		t.Fatalf("repeated transaction: %+v", again)
+	}
+	if a := call(t, "GET", leader+"/v1/kv", ""); !slices.Equal(keys(a), []string{"b", "c", "new"}) {
+		t.Fatalf("after the transaction: %+v", a)
+	}
+	if a := call(t, "POST", leader+"/v1/txn", `{"writes":[{"op":"get","key":"a"}]}`); a.code != 400 {
+		t.Fatalf("a transaction with a get: %+v", a)
 	}
 }

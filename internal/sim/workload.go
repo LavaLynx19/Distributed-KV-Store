@@ -33,6 +33,19 @@ type Workload struct {
 	// Sessions makes each client open a Session first and number its
 	// requests within it, so the store can recognise a retry (A§6.3).
 	Sessions bool
+	// TTLPercent of puts carry a time-to-live of TTL[0]..TTL[1] units
+	// (A§6.7).
+	TTLPercent int
+	TTL        [2]int64
+	// ScanPercent of requests are range scans and TxnPercent are
+	// Transactions over two keys (A§5.2). A History with either is checked
+	// against the whole store at once, so keep such runs short.
+	ScanPercent int
+	TxnPercent  int
+	// ReadPercent of single-key requests are gets. Zero means 35. The
+	// writes keep their proportions: 30 puts to 25 compare-and-sets to 10
+	// deletes.
+	ReadPercent int
 }
 
 // DefaultWorkload is enough contention to make ordering mistakes visible.
@@ -111,7 +124,7 @@ func (w Workload) openSession(s *Sim, c *client, then func()) {
 
 // dispatch sends cmd to a Member by the path the Workload is configured for.
 func (w Workload) dispatch(s *Sim, to core.NodeID, cmd fsm.Command, done func(Reply)) {
-	if w.ReadsBypassLog && cmd.Op == fsm.OpGet {
+	if w.ReadsBypassLog && (cmd.Op == fsm.OpGet || cmd.Op == fsm.OpScan) {
 		s.Read(to, cmd.Encode(), done)
 		return
 	}
@@ -206,19 +219,98 @@ func (w Workload) choose(s *Sim, c *client) fsm.Command {
 	key := fmt.Sprintf("k%d", s.Rand().IntN(w.Keys))
 	c.count++
 	value := []byte(fmt.Sprintf("c%d-%d", c.id, c.count))
-	switch roll := s.Rand().IntN(100); {
-	case roll < 35:
+	if w.ScanPercent+w.TxnPercent > 0 {
+		switch roll := s.Rand().IntN(100); {
+		case roll < w.ScanPercent:
+			return w.chooseScan(s)
+		case roll < w.ScanPercent+w.TxnPercent:
+			return w.chooseTxn(s, c, value)
+		}
+	}
+	var cmd fsm.Command
+	reads := 35
+	if w.ReadPercent > 0 {
+		reads = w.ReadPercent
+	}
+	roll := s.Rand().IntN(100)
+	if roll < reads {
 		return fsm.Command{Op: fsm.OpGet, Key: key}
+	}
+	switch roll = 35 + (roll-reads)*65/(100-reads); {
 	case roll < 65:
-		return fsm.Command{Op: fsm.OpPut, Key: key, Value: value}
+		cmd = fsm.Command{Op: fsm.OpPut, Key: key, Value: value}
 	case roll < 90:
-		return fsm.Command{Op: fsm.OpPut, Key: key, Value: value, Conditional: true, IfVersion: c.seen[key]}
+		cmd = fsm.Command{Op: fsm.OpPut, Key: key, Value: value, Conditional: true, IfVersion: c.seen[key]}
 	default:
 		return fsm.Command{Op: fsm.OpDelete, Key: key}
 	}
+	if w.TTLPercent > 0 && s.Rand().IntN(100) < w.TTLPercent {
+		cmd.TTL = w.TTL[0] + s.Rand().Int64N(w.TTL[1]-w.TTL[0]+1)
+	}
+	return cmd
+}
+
+// chooseScan picks the whole store, or a part of it, sometimes with a limit.
+func (w Workload) chooseScan(s *Sim) fsm.Command {
+	cmd := fsm.Command{Op: fsm.OpScan}
+	if s.Rand().IntN(2) == 0 {
+		a, b := s.Rand().IntN(w.Keys), s.Rand().IntN(w.Keys+1)
+		if a > b {
+			a, b = b, a
+		}
+		cmd.Key, cmd.End = fmt.Sprintf("k%d", a), fmt.Sprintf("k%d", b)
+	}
+	if s.Rand().IntN(3) == 0 {
+		cmd.Limit = uint64(1 + s.Rand().IntN(w.Keys))
+	}
+	return cmd
+}
+
+// chooseTxn picks two keys and changes both, usually on condition that they
+// are as the client last saw them.
+func (w Workload) chooseTxn(s *Sim, c *client, value []byte) fsm.Command {
+	a := s.Rand().IntN(w.Keys)
+	b := (a + 1 + s.Rand().IntN(max(w.Keys-1, 1))) % w.Keys
+	ka, kb := fmt.Sprintf("k%d", a), fmt.Sprintf("k%d", b)
+	cmd := fsm.Command{Op: fsm.OpTxn}
+	if s.Rand().IntN(4) != 0 {
+		cmd.Conds = []fsm.Cond{{Key: ka, Version: c.seen[ka]}, {Key: kb, Version: c.seen[kb]}}
+	}
+	first := fsm.Write{Op: fsm.OpPut, Key: ka, Value: value}
+	if w.TTLPercent > 0 && s.Rand().IntN(100) < w.TTLPercent {
+		first.TTL = w.TTL[0] + s.Rand().Int64N(w.TTL[1]-w.TTL[0]+1)
+	}
+	second := fsm.Write{Op: fsm.OpPut, Key: kb, Value: value}
+	if s.Rand().IntN(4) == 0 {
+		second = fsm.Write{Op: fsm.OpDelete, Key: kb}
+	}
+	cmd.Writes = []fsm.Write{first, second}
+	return cmd
 }
 
 func (c *client) observe(cmd fsm.Command, resp fsm.Response) {
+	switch cmd.Op {
+	case fsm.OpScan:
+		for _, it := range resp.Items {
+			c.seen[it.Key] = it.Version
+		}
+		return
+	case fsm.OpTxn:
+		switch resp.Status {
+		case fsm.StatusOK:
+			for _, w := range cmd.Writes {
+				c.seen[w.Key] = resp.Version
+				if w.Op == fsm.OpDelete {
+					c.seen[w.Key] = 0
+				}
+			}
+		case fsm.StatusVersionMismatch:
+			for _, it := range resp.Items {
+				c.seen[it.Key] = it.Version
+			}
+		}
+		return
+	}
 	switch resp.Status {
 	case fsm.StatusOK, fsm.StatusVersionMismatch:
 		c.seen[cmd.Key] = resp.Version
@@ -287,6 +379,7 @@ func (w Workload) nextRetrying(s *Sim, h *check.History, c *client, until int64)
 					// This attempt changed nothing, but an earlier one may
 					// have, before the store lost the Session.
 					c.session, c.seq = 0, 0
+					h.Signals.SessionExpired++
 					finish(check.Lost, fsm.Response{})
 					return
 				}

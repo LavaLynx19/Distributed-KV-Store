@@ -36,6 +36,15 @@ type Store struct {
 	TearWrites bool
 	// UncheckedDisk stores files without checksums, as in Rung 3.
 	UncheckedDisk bool
+	// Stamped puts the receiving Member's clock reading into every request
+	// (A§6.1), as Rung 5 and later do.
+	Stamped bool
+	// SessionTTL removes a Session unused for this long by Log time
+	// (fsm.Machine.SessionTTL). Zero means never.
+	SessionTTL int64
+	// OwnClock gives each Member a state machine that judges Expiry by its
+	// own clock, as Rung 5's naive store does.
+	OwnClock bool
 }
 
 // Scenario injects Faults into a running Simulation between times from and
@@ -127,6 +136,7 @@ const (
 	warmup    = 300  // clients run fault-free first
 	faultSpan = 3000 // Faults happen in this window
 	cooldown  = 1500 // then everything is repaired and left to settle
+	settle    = 200  // and for this long at the end nothing new is started
 )
 
 // Run drives one Simulation: clients throughout, the scenario's Faults in the
@@ -134,11 +144,35 @@ const (
 // through the network encoding, so the core's message types must have been
 // given to transport.Register.
 func Run(store Store, sc Scenario, members int, seed uint64) Report {
-	s := sim.New(sim.Config{
+	newMachine := func() sim.Machine {
+		m := fsm.New()
+		m.SessionTTL = store.SessionTTL
+		return m
+	}
+	if store.OwnClock {
+		newMachine = func() sim.Machine { return fsm.NewOwnClock() }
+	}
+	var s *sim.Sim
+	var stamp func([]byte, int64) []byte
+	var timeEntry func(sim.Machine, int64) []byte
+	if store.Stamped {
+		stamp = fsm.Stamp
+		timeEntry = func(m sim.Machine, now int64) []byte {
+			// Nothing new near the end: the Members are compared as they
+			// stand when the run stops, so they must have settled.
+			if s.Now() >= warmup+faultSpan+cooldown-settle || !m.(*fsm.Machine).Due(now) {
+				return nil
+			}
+			return fsm.Command{Op: fsm.OpTick}.Encode()
+		}
+	}
+	s = sim.New(sim.Config{
 		Seed:          seed,
 		Nodes:         members,
 		NewNode:       store.NewNode,
-		NewMachine:    func() sim.Machine { return fsm.New() },
+		NewMachine:    newMachine,
+		Stamp:         stamp,
+		TimeEntry:     timeEntry,
 		Copy:          transport.NewLoopback().Copy,
 		Restart:       store.Restart,
 		DiskDelay:     store.DiskDelay,
@@ -159,6 +193,9 @@ func Run(store Store, sc Scenario, members int, seed uint64) Report {
 		s.SetLoss(0)
 		for _, id := range s.IDs() {
 			s.Restart(id)
+			// Clocks run true again, but keep whatever they have come to
+			// read: nothing puts a clock right.
+			s.SetClockRate(id, 100)
 		}
 	})
 	watchLeaders(s, &rep, faultsEnd+cooldown)
@@ -176,13 +213,17 @@ func Run(store Store, sc Scenario, members int, seed uint64) Report {
 	rep.verdict = h.Linearizable(20 * time.Second)
 	rep.Linearizable, rep.TimedOut = rep.verdict.Linearizable, rep.verdict.TimedOut
 	items := map[core.NodeID][]fsm.Item{}
+	sessions := map[core.NodeID]int{}
 	fit := 0
 	for _, id := range s.IDs() {
 		if err := s.StartError(id); err != nil {
 			rep.Unreadable = append(rep.Unreadable, fmt.Sprintf("node %d: %v", id, err))
 			continue // it holds no state to compare
 		}
-		items[id] = s.Machine(id).(*fsm.Machine).Items()
+		machine := s.Machine(id).(*fsm.Machine)
+		machine.Observe(s.Clock(id))
+		items[id] = machine.Items()
+		sessions[id] = machine.Sessions()
 		if s.Status(id).Recovering {
 			rep.StillRecovering++
 		} else {
@@ -191,6 +232,13 @@ func Run(store Store, sc Scenario, members int, seed uint64) Report {
 	}
 	rep.Stalled = fit < members/2+1
 	rep.Diverged = check.Diverged(items)
+	// Members must agree on which Sessions exist too.
+	for _, id := range s.IDs()[1:] {
+		a, b := sessions[s.IDs()[0]], sessions[id]
+		if _, ok := items[id]; ok && items[s.IDs()[0]] != nil && a != b {
+			rep.Diverged = append(rep.Diverged, fmt.Sprintf("node %d has %d Sessions, node %d has %d", s.IDs()[0], a, id, b))
+		}
+	}
 	rep.Signals = h.Signals
 	rep.Recovery = h.Signals.RecoveryAfter(faultsEnd)
 	return rep
@@ -567,4 +615,78 @@ var Rung4 = []Scenario{
 		}
 		s.At(from, step)
 	}},
+}
+
+// Rung5 adds clocks that disagree (README): Members' clocks run at
+// different speeds, or jump. Each scenario also moves the Leader around,
+// because a clock only matters while its Member is the one answering.
+var Rung5 = []Scenario{
+	// Every Member's clock runs at its own speed.
+	{"clock-skew", func(s *sim.Sim, from, to int64) {
+		s.At(from, func() {
+			rates := []int64{60, 80, 100, 125, 170}
+			for _, id := range s.IDs() {
+				s.SetClockRate(id, rates[s.Rand().IntN(len(rates))])
+			}
+		})
+		moveLeader(s, from, to)
+	}},
+
+	// Clocks jump, forwards and backwards, by more than any time-to-live.
+	{"clock-jumps", func(s *sim.Sim, from, to int64) {
+		var step func()
+		step = func() {
+			if s.Now() >= to {
+				return
+			}
+			ids := s.IDs()
+			jump := 300 + s.Rand().Int64N(1500)
+			if s.Rand().IntN(2) == 0 {
+				jump = -jump
+			}
+			s.JumpClock(ids[s.Rand().IntN(len(ids))], jump)
+			s.After(150+s.Rand().Int64N(250), step)
+		}
+		s.At(from, step)
+		moveLeader(s, from, to)
+	}},
+
+	// The Leader's clock slows to a fifth of true speed, and then it is cut
+	// off from the others. It notices the silence five times later than it
+	// should, while the others elect a Leader on time.
+	{"slow-leader", func(s *sim.Sim, from, to int64) {
+		var step func()
+		step = func() {
+			if s.Now() >= to-600 {
+				return
+			}
+			if l := leader(s); l != 0 {
+				s.SetClockRate(l, 20)
+				s.Partition([]core.NodeID{l}, others(s, l))
+				s.After(450, func() {
+					s.Heal()
+					s.SetClockRate(l, 100)
+				})
+			}
+			s.After(700+s.Rand().Int64N(200), step)
+		}
+		s.At(from, step)
+	}},
+}
+
+// moveLeader pauses whichever Member leads, every so often, for long enough
+// that another takes over.
+func moveLeader(s *sim.Sim, from, to int64) {
+	var step func()
+	step = func() {
+		if s.Now() >= to-300 {
+			return
+		}
+		if l := leader(s); l != 0 {
+			s.Crash(l)
+			s.After(250, func() { s.Restart(l) })
+		}
+		s.After(400+s.Rand().Int64N(300), step)
+	}
+	s.At(from+100, step)
 }

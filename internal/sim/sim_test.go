@@ -397,3 +397,47 @@ func TestNilRestartKeepsMemory(t *testing.T) {
 		t.Fatalf("a frozen Member lost its held proposal (index %d)", relays[1].index)
 	}
 }
+
+func TestClocksAgreeUntilAFault(t *testing.T) {
+	s, relays := newRelaySim(1, 3)
+	s.Run(1000)
+	for _, id := range s.IDs() {
+		if got := s.Clock(id); got != 1000 {
+			t.Errorf("node %d reads %d, want 1000", id, got)
+		}
+	}
+	// Node 2 runs at half speed, node 3 at double, for 1000 units.
+	s.SetClockRate(2, 50)
+	s.SetClockRate(3, 200)
+	before := map[core.NodeID]int{1: relays[1].ticks, 2: relays[2].ticks, 3: relays[3].ticks}
+	s.Run(2000)
+	for id, want := range map[core.NodeID]int64{1: 2000, 2: 1500, 3: 3000} {
+		if got := s.Clock(id); got != want {
+			t.Errorf("node %d reads %d, want %d", id, got, want)
+		}
+	}
+	// Ticks follow the clock's rate, give or take the one in progress.
+	for id, want := range map[core.NodeID]int{1: 100, 2: 50, 3: 200} {
+		if got := relays[id].ticks - before[id]; got < want-2 || got > want+2 {
+			t.Errorf("node %d ticked %d times in 1000 units, want about %d", id, got, want)
+		}
+	}
+}
+
+func TestClockJumpsWithoutChangingTicks(t *testing.T) {
+	s, relays := newRelaySim(1, 3)
+	s.Run(500)
+	s.JumpClock(1, 10_000)
+	s.JumpClock(2, -300)
+	before := relays[1].ticks
+	s.Run(1000)
+	if got := s.Clock(1); got != 11_000 {
+		t.Errorf("node 1 reads %d after jumping forwards, want 11000", got)
+	}
+	if got := s.Clock(2); got != 700 {
+		t.Errorf("node 2 reads %d after jumping back, want 700", got)
+	}
+	if got := relays[1].ticks - before; got != 50 {
+		t.Errorf("node 1 ticked %d times in 500 units after its jump, want 50", got)
+	}
+}

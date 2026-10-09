@@ -50,6 +50,9 @@ type Signals struct {
 	Answered int
 	Rejected int
 	Lost     int
+	// SessionExpired counts requests refused because the store had removed
+	// the client's Session. The client records them as Lost.
+	SessionExpired int
 	// okWrites are the times at which a put or delete was answered OK.
 	okWrites []int64
 }
@@ -71,7 +74,7 @@ func (h *History) End(id int, result Result, resp fsm.Response, now int64) {
 	switch result {
 	case Answered:
 		h.Signals.Answered++
-		if c.cmd.Op != fsm.OpGet && resp.Status == fsm.StatusOK {
+		if !isRead(c.cmd) && resp.Status == fsm.StatusOK {
 			h.Signals.okWrites = append(h.Signals.okWrites, now)
 		}
 	case Rejected:
@@ -126,7 +129,7 @@ func (h *History) Operations() []porcupine.Operation {
 		switch {
 		case c.done && c.result == Rejected:
 			continue
-		case open && c.cmd.Op == fsm.OpGet:
+		case open && isRead(c.cmd):
 			continue
 		case open:
 			ops = append(ops, porcupine.Operation{ClientId: c.client, Input: c.cmd, Call: c.start, Output: Outcome{Unknown: true}, Return: last + 1})
@@ -144,19 +147,34 @@ type Verdict struct {
 	// TimedOut: the checker ran out of time without finding a violation.
 	TimedOut bool
 	info     porcupine.LinearizationInfo
+	model    porcupine.Model
+}
+
+func isRead(cmd fsm.Command) bool { return cmd.Op == fsm.OpGet || cmd.Op == fsm.OpScan }
+
+// model picks the specification to check against: one key at a time, unless
+// some request spans keys.
+func (h *History) model() porcupine.Model {
+	for _, c := range h.calls {
+		if c.cmd.Op == fsm.OpScan || c.cmd.Op == fsm.OpTxn {
+			return StoreModel()
+		}
+	}
+	return Model()
 }
 
 // Linearizable checks the History against the store's model, giving up
 // after timeout (zero means no limit).
 func (h *History) Linearizable(timeout time.Duration) Verdict {
-	res, info := porcupine.CheckOperationsVerbose(Model(), h.Operations(), timeout)
-	return Verdict{Linearizable: res != porcupine.Illegal, TimedOut: res == porcupine.Unknown, info: info}
+	model := h.model()
+	res, info := porcupine.CheckOperationsVerbose(model, h.Operations(), timeout)
+	return Verdict{Linearizable: res != porcupine.Illegal, TimedOut: res == porcupine.Unknown, info: info, model: model}
 }
 
 // Visualize writes an HTML timeline of the checked History to path, showing
 // where it stops being Linearizable.
 func (v Verdict) Visualize(path string) error {
-	return porcupine.VisualizePath(Model(), v.info, path)
+	return porcupine.VisualizePath(v.model, v.info, path)
 }
 
 // Diverged compares Members' final data (A§8.2, verdict 2). It returns one

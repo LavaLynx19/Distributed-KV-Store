@@ -145,7 +145,7 @@ The state machine obeys the same rules, so every Member that applies the same En
 | Item | Content |
 |---|---|
 | Vote state | Current **Term** and the Member voted for in it |
-| **Log** | **Entries**: index, Term, kind, payload. The Leader's time stamp joins them in Rung 5 |
+| **Log** | **Entries**: index, Term, kind, payload. From Rung 5 a command's payload carries the Leader's time stamp |
 | **Snapshot** | Last included index and Term, and the state machine's full contents: keys and **Sessions**. The Member list joins them in Rung 6 |
 
 Entry kinds: no-op, command. Membership change arrives in Rung 6, and Rungs 7–8 add more (§10).
@@ -157,7 +157,8 @@ The commit index is not stored. A restarted Member knows only that its Snapshot 
 |---|---|
 | Put, Delete | Set or remove one key, optionally with a time-to-live |
 | Compare-and-set | Set a key only if its current version matches |
-| Transaction | A list of conditions and writes over several keys, applied all or nothing (Rung 5) |
+| Transaction | A list of conditions and writes over several keys, applied all or nothing (Rung 5). A condition is a key and the version it must have, with 0 for a key that must not exist. A write is a put or a delete. If any condition fails nothing is written, and the answer names each failed condition with the version found. Every key a Transaction puts gets the same version, its Entry's index |
+| Time | Carries a stamp and changes nothing else (§6.7) |
 | Open Session | Registers a **Session** |
 
 A get is also a command in Rung 1. From Rung 2 on, gets and range scans are reads that bypass the Log (§6.2).
@@ -198,7 +199,7 @@ Everything carries a CRC-32C checksum. The whole files end with one over their c
 ### 6.1 Write
 1. A client sends a command to any Member over HTTP, with its Session id and request number.
 2. A Member that isn't the **Leader** answers `not_leader` with a hint.
-3. The Leader stamps the Entry with its clock reading and appends it.
+3. The Leader stamps the command with its clock reading and appends it. The stamp is put in by the shell of whichever Member receives the request, as part of the payload: the core never sees time, and only a Leader's proposal reaches the Log.
 4. The Leader and followers make it durable; once a **Majority** has, it is **Committed**.
 5. Each Member applies it in Log order. The Leader answers the client only then, which makes it an **Acknowledged write**.
 
@@ -207,10 +208,12 @@ Read paths, in the order they appear:
 1. **Through the Log** (Rung 1): a read is an Entry like any other. Correct and slow.
 2. **From the Leader's memory** (Rung 2, naive): the tempting shortcut, shipped to show the Stale read it allows. It doesn't survive the Rung.
 3. **Read index** (Rung 2, then the default): the Leader notes its commit index, confirms with a Majority that it still leads, waits until that index is applied, then answers from memory. A new Leader must first commit an Entry of its own Term.
-4. **Lease** (variant, off by default): the Leader answers from memory while its lease holds. Not Linearizable under clock skew.
+4. **Lease** (variant, off by default): the Leader answers from memory, without asking anyone, while its lease holds. A follower that hears from a Leader promises not to vote for anyone else for an election timeout, and so does a Member that has just started. The Leader's lease runs from when it sent the latest message a Majority has answered, for two ticks less than an election timeout. When the lease has run out the read falls back to read index. Leases are counted in each Member's own ticks, so a Leader whose ticks run slower than its followers' keeps answering after they have elected someone else: not Linearizable under clock skew.
 
 ### 6.3 Retries
 In Rung 1 clients never retry: a request with no definite answer is recorded as outcome unknown, which the checker allows for. Rung 2 lets clients retry, shows a compare-and-set applying twice, and adds Sessions. From then on every command carries a Session id and a request number. Before applying, the state machine checks the Session: a request number already applied returns its saved response and changes nothing. Because this happens when an Entry is applied, it is identical on every Member and survives a change of Leader.
+
+**Cleanup (Rung 5).** A Session records Log time (§6.7) whenever it is opened or used, and is removed once Log time has moved a set span past that (an hour by default, and the same on every Member). Sessions are checked each time Log time enters a new quarter of that span. A request in a removed Session is answered `session_expired` and changes nothing, so a late retry can't take effect a second time; the client opens a new Session and treats its last request's outcome as unknown. An idle Group keeps its Sessions until the next stamped Entry.
 
 ### 6.4 Snapshot and catch-up
 - **Taking one.** After every so many applied Entries, the shell captures the state machine by keeping its tree roots, which is instant. The real shell encodes the capture on another goroutine while the core carries on. It then hands the result to the core, which stores it and drops its Log up to that Entry. Each Member does this for itself.
@@ -230,7 +233,11 @@ A new Member first catches up without counting toward the Majority.
 An operator command, run on a surviving Member while the Group is stopped, rewrites its Member list to the survivors. It prints the last index it holds and warns that anything Committed beyond the survivors' Logs is lost. It is never automatic.
 
 ### 6.7 Expiry
-A key written with a time-to-live stores a deadline: the Entry's stamp plus the time-to-live. It stops existing when Log time passes the deadline. Reads compare against Log time, so a read on any Member at the same applied index gives the same answer. Expired keys are removed lazily and by a periodic sweep that is itself deterministic.
+- **Log time** is the highest stamp applied so far. A stamp lower than Log time leaves it where it is, so time never goes back when a Leader's clock does.
+- A key written with a time-to-live stores a deadline: Log time, once its own Entry's stamp has been counted, plus the time-to-live. It stops existing when Log time reaches the deadline.
+- **The sweep** runs as part of applying any Entry that moves Log time, and removes every key that is due. Keys are also held in deadline order, so the sweep looks only at those. Because it happens at the same Entry on every Member, a read on any Member at the same applied index gives the same answer, and a read never has to check a deadline.
+- **A Group nobody is writing to** would never see a new stamp. So on each tick a Leader's shell checks whether a deadline has passed by its own clock, and if so proposes a time Entry: a command that carries a stamp and does nothing else. One is outstanding at a time.
+- **A Leader whose clock is behind Log time can't move it.** Keys then live past their deadline, identically on every Member, until its clock catches up or a Leader with a later clock takes over (§2.9).
 
 ### 6.8 Damage and recovery
 When a Member starts and its storage finds damage, the storage first leaves a durable mark, then removes what it can't verify:
@@ -255,10 +262,10 @@ The mark survives restarts, so a Member that restarts while Recovering is still 
 |---|---|
 | `POST /v1/sessions` | Open a Session; returns its id |
 | `GET /v1/kv/{key}` | Read a key: value and version |
-| `PUT /v1/kv/{key}` | Write a key; optional `ttl`; optional `if_version` for compare-and-set |
+| `PUT /v1/kv/{key}` | Write a key; optional `ttl` in milliseconds; optional `if_version` for compare-and-set |
 | `DELETE /v1/kv/{key}` | Delete a key; optional `if_version` |
-| `GET /v1/kv?start=&end=&limit=` | Range scan in key order |
-| `POST /v1/txn` | Transaction: conditions and writes |
+| `GET /v1/kv?start=&end=&limit=` | Range scan in key order: keys from `start` up to but not including `end`. An empty `end` means to the last key. At most `limit` keys, and never more than 1,000. Answers `{"items": [{key, value, version}]}` |
+| `POST /v1/txn` | Transaction: `{"if": [{key, version}], "writes": [{op: "put" or "delete", key, value, ttl}]}`. A refusal is `version_mismatch` with `failed`: the conditions that didn't hold and the versions found |
 | `GET /v1/status` | This Member's role, Term, Leader hint, commit index |
 
 Requests carry `Session-Id` and `Request-Seq` headers so that a retry takes effect once (§6.3). A request without them is applied every time it arrives.
@@ -305,7 +312,7 @@ A seed determines everything: the order events are delivered, which Faults fire 
 A failing run prints its seed, and rerunning the seed reproduces it.
 
 ### 8.2 The three verdicts
-1. **Linearizability:** clients record a History, and Porcupine checks it against a model of the store. Single-key operations are checked per key. Scans and transactions span keys, so their Histories are checked against a whole-store model and kept short.
+1. **Linearizability:** clients record a History, and Porcupine checks it against a model of the store. Single-key operations are checked per key. Scans and transactions span keys, so a History containing either is checked against a whole-store model. With the Simulation's three keys that costs little; it grows quickly with the number of keys, so such Histories must stay small.
 2. **End state:** after Faults stop and the Group settles, every Member's tree is identical.
 3. **Client signals:** counts of each error reason, requests that never got a definite answer, and the time from losing a Leader to the next successful write.
 
@@ -351,7 +358,7 @@ Rung 3's file format has no checksums, so Rung 4 can show a corrupted record bei
 A Leader lease is the fastest way to serve reads, but with clock skew in the failure model it can return a Stale read. The default therefore confirms leadership with a Majority, which no clock can break. The lease stays behind a switch, measured for speed, with its Stale read demonstrated under skew. README names it as an exemption from the consistency promise.
 
 ### Time enters only through the Leader's stamp
-Expiry and Session cleanup compare against the highest stamp in the applied Log, never a Member's own clock. A Leader with a bad clock makes keys expire early or late, but identically on every Member. Letting each Member consult its clock would be simpler and would make replicas diverge under skew.
+Expiry and Session cleanup compare against the highest stamp in the applied Log, never a Member's own clock. A Leader with a bad clock makes keys expire early or late, but identically on every Member. Letting each Member consult its clock would be simpler and would make replicas diverge under skew. Rung 5 showed it is worse than that: a Member that restarts applies its Log again at a later time and reaches a different state, with every clock correct. What a Member holds must depend on its Entries and nothing else.
 
 ### One Member at a time, with the current-Term rule
 Membership changes add or remove a single Member rather than using Raft's joint consensus. It's simpler, and the README only asks for one-at-a-time changes. The original single-change scheme has a published flaw when changes straddle Terms, so a Leader must commit an Entry of its own Term before appending a change.

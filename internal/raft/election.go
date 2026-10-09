@@ -33,7 +33,7 @@ func (n *Node) handleRequestVote(out *core.Output, from core.NodeID, m RequestVo
 	}
 	lastTerm := n.termAt(n.lastIndex())
 	upToDate := m.LastTerm > lastTerm || (m.LastTerm == lastTerm && m.LastIndex >= n.lastIndex())
-	granted := upToDate && (n.votedFor == 0 || n.votedFor == from) && !n.abstaining()
+	granted := upToDate && (n.votedFor == 0 || n.votedFor == from) && !n.abstaining() && !n.promised()
 	if granted {
 		n.votedFor = from
 		n.storeHardState(out)
@@ -64,6 +64,7 @@ func (n *Node) becomeLeader(out *core.Output) {
 	n.heard = map[core.NodeID]int{}
 	n.sentSnap = map[core.NodeID]int{}
 	n.roundAcked = map[core.NodeID]uint64{}
+	n.leaseFrom = map[core.NodeID]int{}
 	n.roundOpen = false
 	for _, m := range n.members {
 		n.next[m] = n.lastIndex() + 1
