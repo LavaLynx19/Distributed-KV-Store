@@ -76,6 +76,11 @@ type Config struct {
 	// handed, as the real shell does (A§6.1).
 	Stamp func(payload []byte, now int64) []byte
 
+	// TimeEntry, if set, is asked on every tick of a Member that leads
+	// whether it has something to propose so that time moves in a Group
+	// nobody is writing to (A§6.7). It returns the proposal, or nil.
+	TimeEntry func(m Machine, now int64) []byte
+
 	// Copy, if set, stands in for the network's encoding: every message is
 	// passed through it on the way, so Members never share memory.
 	Copy func(core.Message) core.Message
@@ -127,6 +132,8 @@ type member struct {
 	// at the same rate, so a slow clock also means slow timeouts.
 	clockBase, clockAt int64
 	clockRate          int64
+
+	timePending bool // a time Entry this Member proposed is still undecided
 
 	applied    core.Index // the last Entry applied to machine
 	snapshotAt core.Index // the Entry the last Snapshot was taken at
@@ -463,7 +470,21 @@ func (s *Sim) tick(m *member) {
 	if m.up {
 		s.mix('T', uint64(m.id), 0)
 		s.step(m, core.Tick{})
+		s.timeEntry(m)
 	}
+}
+
+// timeEntry proposes a time Entry on a Leader's behalf, one at a time.
+func (s *Sim) timeEntry(m *member) {
+	if s.cfg.TimeEntry == nil || m.timePending || !m.up || m.core.Status().Role != core.LeaderRole {
+		return
+	}
+	payload := s.cfg.TimeEntry(m.machine, m.clock(s.now))
+	if payload == nil {
+		return
+	}
+	m.timePending = true
+	s.Propose(m.id, payload, func(Reply) { m.timePending = false })
 }
 
 // step feeds one event to a Member's core and carries out its Output. If the

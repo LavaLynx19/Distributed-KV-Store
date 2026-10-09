@@ -133,6 +133,7 @@ const (
 	warmup    = 300  // clients run fault-free first
 	faultSpan = 3000 // Faults happen in this window
 	cooldown  = 1500 // then everything is repaired and left to settle
+	settle    = 200  // and for this long at the end nothing new is started
 )
 
 // Run drives one Simulation: clients throughout, the scenario's Faults in the
@@ -144,16 +145,27 @@ func Run(store Store, sc Scenario, members int, seed uint64) Report {
 	if store.OwnClock {
 		newMachine = func() sim.Machine { return fsm.NewOwnClock() }
 	}
+	var s *sim.Sim
 	var stamp func([]byte, int64) []byte
+	var timeEntry func(sim.Machine, int64) []byte
 	if store.Stamped {
 		stamp = fsm.Stamp
+		timeEntry = func(m sim.Machine, now int64) []byte {
+			// Nothing new near the end: the Members are compared as they
+			// stand when the run stops, so they must have settled.
+			if s.Now() >= warmup+faultSpan+cooldown-settle || !m.(*fsm.Machine).Due(now) {
+				return nil
+			}
+			return fsm.Command{Op: fsm.OpTick}.Encode()
+		}
 	}
-	s := sim.New(sim.Config{
+	s = sim.New(sim.Config{
 		Seed:          seed,
 		Nodes:         members,
 		NewNode:       store.NewNode,
 		NewMachine:    newMachine,
 		Stamp:         stamp,
+		TimeEntry:     timeEntry,
 		Copy:          transport.NewLoopback().Copy,
 		Restart:       store.Restart,
 		DiskDelay:     store.DiskDelay,

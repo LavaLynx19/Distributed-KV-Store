@@ -24,11 +24,24 @@ type API struct {
 	// ReadsBypassLog answers gets through the core's read path (A§6.2). The
 	// core must be configured to match.
 	ReadsBypassLog bool
+	// Now is this Member's clock, in milliseconds. Nil means the system
+	// clock.
+	Now func() int64
+}
+
+func (a *API) now() int64 {
+	if a.Now != nil {
+		return a.Now()
+	}
+	return time.Now().UnixMilli()
 }
 
 type putRequest struct {
 	Value     string  `json:"value"`
 	IfVersion *uint64 `json:"if_version"`
+	// TTL is the key's time-to-live in milliseconds. Zero or absent means
+	// the key lives until it is deleted.
+	TTL int64 `json:"ttl"`
 }
 
 type kvResponse struct {
@@ -83,11 +96,11 @@ func (a *API) put(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		err = json.Unmarshal(body, &req)
 	}
-	if err != nil {
-		writeError(w, http.StatusBadRequest, errorResponse{Reason: "invalid", Message: "body must be JSON like {\"value\": \"…\"}"})
+	if err != nil || req.TTL < 0 {
+		writeError(w, http.StatusBadRequest, errorResponse{Reason: "invalid", Message: "body must be JSON like {\"value\": \"…\"}, with ttl in milliseconds if given"})
 		return
 	}
-	cmd := fsm.Command{Op: fsm.OpPut, Key: r.PathValue("key"), Value: []byte(req.Value)}
+	cmd := fsm.Command{Op: fsm.OpPut, Key: r.PathValue("key"), Value: []byte(req.Value), TTL: req.TTL}
 	if req.IfVersion != nil {
 		cmd.Conditional, cmd.IfVersion = true, *req.IfVersion
 	}
@@ -136,6 +149,10 @@ func (a *API) propose(w http.ResponseWriter, r *http.Request, cmd fsm.Command) (
 	if a.ReadsBypassLog && cmd.Op == fsm.OpGet {
 		reply = a.Node.Read(ctx, cmd.Encode())
 	} else {
+		// This Member's clock reading goes in with the request. It counts
+		// only if this Member is the Leader: nobody else's proposal reaches
+		// the Log (A§6.1).
+		cmd.Stamp = a.now()
 		reply = a.Node.Propose(ctx, cmd.Encode())
 	}
 
@@ -204,6 +221,7 @@ type ItemJSON struct {
 	Key     string `json:"key"`
 	Value   string `json:"value"`
 	Version uint64 `json:"version"`
+	Expires int64  `json:"expires,omitempty"`
 }
 
 // debugItems dumps this Member's own applied data for the harness.
@@ -214,7 +232,7 @@ func (a *API) debugItems(w http.ResponseWriter, r *http.Request) {
 	ok := a.Node.Inspect(ctx, func(m Machine) {
 		if lister, ok := m.(interface{ Items() []fsm.Item }); ok {
 			for _, it := range lister.Items() {
-				items = append(items, ItemJSON{Key: it.Key, Value: string(it.Value), Version: it.Version})
+				items = append(items, ItemJSON{Key: it.Key, Value: string(it.Value), Version: it.Version, Expires: it.Expires})
 			}
 		}
 	})

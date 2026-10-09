@@ -59,3 +59,41 @@ func TestOwnClockIsExposed(t *testing.T) {
 		}
 	}
 }
+
+// rung5Scenarios is every earlier Fault plus the clock Faults.
+func rung5Scenarios() []rungtest.Scenario {
+	return append(append(everyScenario(), rungtest.Rung4...), rungtest.Rung5...)
+}
+
+// Rung 5's promise (README): Members stay identical under clock skew and
+// jumps. Stalled runs are Rung 4's accepted cost and are judged as there.
+func TestRung5(t *testing.T) {
+	seeds := uint64(200)
+	if testing.Short() {
+		seeds = 15
+	}
+	runs := 0
+	for _, sc := range rung5Scenarios() {
+		for _, members := range []int{3, 5} {
+			for seed := uint64(1); seed <= seeds; seed++ {
+				r := rungtest.Run(rung5Store, sc, members, seed)
+				runs++
+				if !r.Safe() || (!r.Stalled && len(r.Diverged) > 0) {
+					t.Errorf("%v\n  diverged: %v", r, r.Diverged)
+				}
+			}
+		}
+	}
+	t.Logf("%d runs", runs)
+
+	// The seeds that exposed the store that trusts its own clock.
+	for _, tt := range []struct {
+		scenario string
+		members  int
+		seed     uint64
+	}{{"clock-skew", 3, 1}, {"clock-jumps", 3, 3}, {"clock-skew", 5, 1}, {"crash-leader", 3, 99}} {
+		if r := rungtest.Run(rung5Store, scenario(t, tt.scenario), tt.members, tt.seed); !r.Passed() {
+			t.Errorf("a seed that exposed the naive store still fails: %v", r)
+		}
+	}
+}

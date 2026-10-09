@@ -115,6 +115,7 @@ func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string
 	machine := fsm.New()
 	node = server.NewNode(c, machine, tr.Send, tick)
 	node.SnapshotEvery = snapshotEvery
+	node.TimeEntry = server.TimeEntries(nil)
 	if store != nil {
 		node.Storage = store
 	}

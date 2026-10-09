@@ -59,7 +59,12 @@ type Node struct {
 	SnapshotEvery int
 	// Restored is the Index of the Snapshot the state machine was restored
 	// from before Run, or 0.
-	Restored  core.Index
+	Restored core.Index
+	// TimeEntry, if set before Run, is asked on every tick while this
+	// Member leads whether it has something to propose so that time moves
+	// in a Group nobody is writing to (A§6.7). It returns the proposal, or
+	// nil. It runs on the Node's goroutine.
+	TimeEntry func(m Machine) []byte
 	snapshots chan core.Snapshotted
 
 	inbox     chan core.Message
@@ -110,6 +115,8 @@ func (n *Node) Run(ctx context.Context) {
 	var outs []core.Output
 	applied, snapshotAt := n.Restored, n.Restored
 	encoding := false // a Snapshot is being encoded on another goroutine
+	// At most one time Entry of this Member's is undecided at a time.
+	timePending, timeDone := false, make(chan Reply, 1)
 
 	admit := func(p proposal) {
 		nextRef++
@@ -200,6 +207,17 @@ func (n *Node) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			outs = append(outs, n.core.Step(core.Tick{}))
+			select {
+			case <-timeDone:
+				timePending = false
+			default:
+			}
+			if n.TimeEntry != nil && !timePending && n.core.Status().Role == core.LeaderRole {
+				if payload := n.TimeEntry(n.machine); payload != nil {
+					timePending = true
+					admit(proposal{payload: payload, done: timeDone})
+				}
+			}
 		case msg := <-n.inbox:
 			outs = append(outs, n.core.Step(core.Receive{Msg: msg}))
 		case p := <-n.proposals:

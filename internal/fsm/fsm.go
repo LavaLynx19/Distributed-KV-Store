@@ -24,6 +24,12 @@ const (
 	OpDelete
 	// OpOpenSession registers a Session. The response carries its id.
 	OpOpenSession
+	// OpTick changes nothing itself. It carries a Stamp, so that time moves
+	// in a Group nobody is writing to (A§6.7). A Leader's shell proposes one
+	// when Due says so.
+	OpTick
+
+	lastOp = OpTick
 )
 
 // Command is one client request, carried in an Entry's payload.
@@ -165,6 +171,14 @@ func (m *Machine) NextDeadline() (int64, bool) {
 		return false
 	})
 	return first, found
+}
+
+// Due reports whether a Leader whose clock reads now should propose an
+// OpTick: some key's deadline has passed by that clock, and applying the
+// Stamp would move logTime far enough to remove it.
+func (m *Machine) Due(now int64) bool {
+	deadline, ok := m.NextDeadline()
+	return ok && !m.ownClock && deadline <= now && now > m.logTime
 }
 
 // expiryKey orders keys by deadline, then by name. The sign bit is flipped
@@ -313,6 +327,8 @@ func (m *Machine) apply(cmd Command, index uint64) Response {
 		}
 		m.unset(cmd.Key)
 		return Response{Status: StatusOK}
+	case OpTick:
+		return Response{Status: StatusOK}
 	}
 	return Response{Status: StatusInvalid}
 }
@@ -370,7 +386,7 @@ func DecodeCommand(b []byte) (Command, error) {
 	}
 	c := Command{Op: Op(b[0]), Conditional: b[1]&flagConditional != 0}
 	timed := b[1]&flagTimed != 0
-	if c.Op < OpGet || c.Op > OpOpenSession {
+	if c.Op < OpGet || c.Op > lastOp {
 		return Command{}, errMalformed
 	}
 	b = b[2:]

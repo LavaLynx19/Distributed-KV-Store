@@ -154,3 +154,29 @@ func TestUntimedEncodingIsUnchanged(t *testing.T) {
 		t.Errorf("Stamp set %d, want 42", got.Stamp)
 	}
 }
+
+// Due tells a Leader when an OpTick would remove something, and stops
+// telling it once the OpTick has been applied.
+func TestDueUntilTheTickIsApplied(t *testing.T) {
+	m := New()
+	run(t, m, at(100, ttl(put("a", "1"), 50)))
+	if m.Due(149) {
+		t.Fatal("due before the deadline")
+	}
+	if !m.Due(150) {
+		t.Fatal("not due at the deadline")
+	}
+	if r, _ := DecodeResponse(m.Apply(entryAt(2, at(150, Command{Op: OpTick})))); r.Status != StatusOK {
+		t.Fatalf("tick answered %+v", r)
+	}
+	if len(m.Items()) != 0 || m.Due(1000) {
+		t.Fatalf("after the tick: items %+v, due %v", m.Items(), m.Due(1000))
+	}
+	// A Leader whose clock is behind Log time can't move it, so isn't asked.
+	run(t, New(), at(100, put("x", "1")))
+	behind := New()
+	run(t, behind, at(1000, ttl(put("a", "1"), 50)))
+	if behind.Due(900) {
+		t.Fatal("due by a clock that is behind Log time")
+	}
+}
