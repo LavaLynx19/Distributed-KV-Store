@@ -72,8 +72,22 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P6.6 Rung 6 suite: changes during crashes and Partitions; `retros/rung-6.md` → §P6
 
 ### Phase 7 — Rung 7: several Groups (§P7)
-- [>] P7.0 Confirm or replace the A§10 sketch; write A§11 and Decision Log entries → defer until: Rung 6 retro is done
-- [>] P7.1 Slots, routing table, several cores per Node, slot moves, gossip, merged scans → defer until: P7.0 is approved
+- [x] P7.0 Confirm or replace the A§10 sketch; write A§11 and Decision Log entries → §P7
+- [ ] P7a.1 Several cores per Node: Group ids on messages, a data directory per Group, the Simulation hosting several Groups (A§11.9) → §P7
+- [ ] P7a.2 The Meta Group with a fixed Slot table; keys hashed to Slots; a Group's tree keyed by Slot (A§11.2, A§11.4) → §P7
+- [ ] P7a.3 Routing: forward once, answers carry the table version; clients learn (A§11.3) → §P7
+- [ ] P7a.4 Expose: a Group that doesn't check ownership serves a key it doesn't own → §P7
+- [ ] P7a.5 Expose: the Meta Group flips the table and nobody confirms; two Groups serve one Slot → §P7
+- [ ] P7a.6 The one-owner verdict and the across-Groups End-state check (A§11.12) → §P7
+- [ ] P7a.7 The Move: intent, copy while serving, freeze, accept, done, drop; carried on after a crash at each step (A§11.4) → §P7
+- [ ] P7a.8 Versions as Epoch and index (A§11.5) → §P7
+- [ ] P7a.9 Store-wide Sessions: ids from the Meta Group, registering with a floor, moving with a Slot (A§11.6) → §P7
+- [ ] P7a.10 Store time from the Meta Group (A§11.7) → §P7
+- [ ] P7a.11 Merged scans; `cross_group` for Transactions (A§11.8) → §P7
+- [ ] P7a.12 Real shell: `kvnode` hosting several Groups, `kvctl move-slot`, harness → §P7
+- [ ] P7a.13 Stage 7a suite, real runs with the pause of a Move measured, `retros/rung-7.md` → §P7
+- [>] P7b.0 Break stage 7b (gossip, A§11.10) into tasks → defer until: stage 7a is approved
+- [>] P7c.0 Design load, threshold and damping for rebalancing; break stage 7c (A§11.11) into tasks → defer until: stage 7b is approved
 
 ### Phase 8 — Rung 8: transactions across Groups (§P8)
 - [>] P8.0 Confirm or replace the A§10 sketch → defer until: Rung 7 retro is done
@@ -142,7 +156,11 @@ P4.4 is a design decision inside the Rung: stop and get it approved before codin
 ## §P6 — Rung 6
 **Verify:** P6.1's seeds fail before and pass after. No Term ever has two Leaders during a change, including changes that straddle Terms. A dead Member is replaced while clients keep writing. Unsafe recovery prints what it discarded.
 
-## §P7–§P9
+## §P7 — Rung 7
+Design is A§11. Three stages (A§11.1), each ending with a retro section and the user's approval.
+**Verify (7a):** P7a.4's and P7a.5's seeds fail before and pass after. No run ever has two Groups serving one Slot. Single-key operations stay Linearizable while Slots move, including Moves interrupted by crashes and Partitions at every step. A retry that crosses a Move takes effect once. The pause of a Move is reported.
+
+## §P8–§P9
 Each starts with its `.0` task: revisit the A§10 sketch with what the earlier Rungs taught, update ARCHITECTURE.md, and get approval. Tasks are broken down then.
 
 ## §P10 — Writeup

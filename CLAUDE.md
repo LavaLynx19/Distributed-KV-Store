@@ -23,7 +23,7 @@ The pure packages are `internal/core`, `internal/naive`, `internal/raft`, `inter
 - Each Rung ships its naive version first and records seeds that show it failing, before the fix (README → Success Criteria, "Exposed"). The Decision Log names the deliberate gaps: leave them until their Rung.
 - A failing Simulation run prints its seed. Record the seed in the retro, and keep it as a regression test once fixed.
 - Every run gets the three verdicts of A§8.2. A Rung is done only when all four README checks pass, including `retros/rung-N.md`.
-- Rungs 7–9 are sketches (A§10). Their `.0` task in `PLAN.md` confirms the design with the user before any code.
+- Rung 7's design is A§11, in three stages; each stage needs the user's approval before the next. Rungs 8–9 are sketches (A§10). Their `.0` task in `PLAN.md` confirms the design with the user before any code.
 
 ## Errors
 Client-facing errors come from the A§7.2 table: HTTP status plus `reason`. New reasons go into A§7.2 first.

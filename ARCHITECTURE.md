@@ -295,6 +295,9 @@ Requests carry `Session-Id` and `Request-Seq` headers so that a retry takes effe
 | 410 | `session_expired` | The Session was cleaned up | Open a new Session; the outcome of the last request is unknown |
 | 400 | `invalid` | Malformed request, or a Membership change that isn't one: the Node is already a Member, or isn't one, or is the last | Fix the request |
 | 409 | `change_in_progress` | Another Membership change is under way, or the Leader has only just been elected. Nothing changed | Retry later |
+| 421 | `wrong_group` | From Rung 7: no Group reachable from this Node owns the key's Slot by its own Log. Includes the table version the Node holds | Refresh the table, retry, same request number |
+| 503 | `moving` | From Rung 7: the key's Slot is frozen for a Move (§11.4). Nothing changed | Retry shortly, same request number |
+| 400 | `cross_group` | From Rung 7: a Transaction's keys are owned by more than one Group (§11.8) | Use keys in one Group, or wait for Rung 8 |
 | 503 | `member_unreachable` | The Node to be added didn't catch up with the Log. Nothing changed | Check the Node is running as a Spare, then retry |
 | 500 | `internal` | A bug in the store | Report it; the outcome is unknown |
 
@@ -357,11 +360,97 @@ These are hypotheses chosen by the user, to be confirmed or replaced when the Ru
 
 | Rung | Sketch |
 |---|---|
-| 7 | Keys hash to a fixed number of slots; a versioned table maps slots to **Groups**. Data moves one slot at a time. SWIM-style gossip spreads which Nodes are alive and the table's version; every change of ownership is Committed through a Raft Group, never decided by gossip. Range scans ask every Group and merge. |
+| 7 | Confirmed and replaced by §11. |
 | 8 | Two-phase commit where prepare, decision and commit are Entries in the Logs of the Groups involved, so a new Leader reads the decision and nothing stays undecided. |
 | 9 | The **Leaderless variant** first settles conflicts by last-write-wins, to expose Acknowledged writes disappearing, then by version vectors that keep both values. A convergence check replaces the linearizability check. |
 
 What earlier Rungs must leave room for: Entry kinds are extensible (§5.1); a Node can host more than one core; the state machine can refuse a key it doesn't own; the client API can carry a routing-table version.
+
+## 11. Rung 7: several Groups
+
+Confirmed with the user at P7.0. It replaces the Rung 7 row of §10. Details marked *to settle* are decided in the task that builds them.
+
+### 11.1 Stages
+Rung 7 is built in three stages. Each ships its naive version first, is measured, gets a section in `retros/rung-7.md`, and needs the user's approval before the next.
+
+| Stage | Adds | Shipped first, to be seen failing |
+|---|---|---|
+| 7a | Slots, the slot table, routing, slot moves started by command, store-wide Sessions and time, merged scans | A Group that doesn't check it owns a key; a table flipped with nobody confirming |
+| 7b | Gossip: which Nodes exist, where, and which seem dead; the table version and store time ride on it | A table spread and believed by gossip alone |
+| 7c | Automatic replacement of dead Nodes; automatic rebalancing by load | A Node replaced on one observer's word |
+
+### 11.2 Slots and the meta Group
+- A key hashes (FNV-1a, 64-bit) to one of a fixed number of **Slots**: 64 by default, set when the store is created and never changed. The Simulation uses 8.
+- One Group, the **Meta Group**, holds the **Slot table**: for each Slot, the Group that owns it, its **Epoch**, and whether a move is under way. It also holds the list of Groups, the Session registry (§11.6) and store time (§11.7).
+- The table's version is the index of the Meta Group Entry that last changed it. Every answer to a client carries the version the answering Node holds.
+- The Meta Group stores no keys and is on the path of no read or write. If it has no Majority, data Groups keep serving what they own; moves, new Sessions and store time stop.
+
+### 11.3 Routing
+- A client may ask any Node. A Node that hosts the owning Group's Leader handles the request. Otherwise it forwards it, once, to a Node that does, and passes the answer back.
+- The owning Group decides for itself whether it owns the Slot, from its own Log (§11.4), never from the forwarder's or the client's table. A Group that doesn't own it answers `wrong_group` with its table version.
+- Answers carry the table version and, when the request was forwarded, where it went, so a client can learn to go direct.
+
+### 11.4 Moving a Slot
+The Meta Group decides a move; the two data Groups carry it out and each records its part in its own Log. From Group A to Group B:
+
+| Step | Who commits it | After it |
+|---|---|---|
+| 1. Intent | Meta Group: "Slot s moves A → B, Epoch e+1" | Nothing has changed for clients |
+| 2. Copy | B commits what A sends as it arrives, held apart as incoming | A still owns and serves s. A sends the Slot as it stood at one Entry, while taking new writes |
+| 3. Freeze | A: "s is frozen at Epoch e" | A answers `moving` for s: neither reads nor writes. A sends what changed since the copy, and its Log time |
+| 4. Accept | B: "s is mine at Epoch e+1", with the final data | B owns and serves s |
+| 5. Done | Meta Group: table says B, Epoch e+1 | The table version moves; routing follows |
+| 6. Drop | A: removes the Slot's keys | |
+
+- **Exactly one owner.** A serves s only before its freeze Entry. B serves s only after its accept Entry. B can build its accept only from A's frozen data. So there is no moment when both serve, whatever the Meta Group, the forwarders or the clients believe.
+- **The pause** is from A's freeze to B's accept: the time to send what changed during the copy. It is measured.
+- **A crash at any step** leaves that step's Entry in a Log. A new Leader of A, B or the Meta Group reads its own Log and the intent, and carries on. Messages between Groups go Leader to Leader and are repeated until answered; every step may be applied twice without harm.
+- **To make a Slot cheap to send**, a Group's tree is keyed by Slot and then key, so a Slot is one contiguous range (*to settle*: this changes key order inside a Group, and scans then merge across Slots as they do across Groups).
+
+### 11.5 Versions
+A key's version is the Slot's Epoch and the index of the Entry that wrote it, in the Log of the Group that owned the Slot then, packed into one number with the Epoch in the high bits. It never repeats and always increases, across moves. Rungs 1–6 are the case Epoch 0.
+
+### 11.6 Sessions
+- A client opens a Session with the Meta Group, once, and gets an id that means the same in every Group.
+- A data Group must be told of a Session before it trusts it. The Node handling a request registers the Session with the Group on first use, with a floor: the request number the client is up to. The Group refuses anything below the floor. That way a Session it once cleaned up and is told of again can't be made to apply an old request a second time.
+- **Moving.** Each Session record notes the Slot of its last request. When a Slot moves, the Sessions whose last request was in it go too. If the target already knows the Session it keeps the higher request number.
+- A retry that reaches a Group which doesn't know the Session is answered `session_expired`, and the client treats the outcome as unknown, as now.
+
+### 11.7 Store time
+- The Meta Group's Leader commits a time Entry every so often, from its clock. That is **Store time**: the highest such stamp.
+- Store time spreads to every Node (directly in 7a, by gossip from 7b). A data Group's Leader stamps commands with the latest Store time it has heard, never with its own clock. A Group's Log time is still the highest stamp in its own Log, so its Members still agree exactly.
+- Groups differ only by how old their news is. A move carries deadlines unchanged, and the target first advances its Log time to at least the source's, so a key expires at the same Store time wherever it is.
+- If the Meta Group stops, time stops, and nothing expires anywhere.
+
+### 11.8 Scans and Transactions
+- A range scan asks every Group and merges the answers. Each Group's part is Linearizable. The whole is not one moment: a key that moves during the scan can be seen twice or not at all (*to settle*: whether to detect a table change during the scan and retry).
+- A Transaction whose keys are not all owned by one Group is refused with `cross_group`. Whether two keys share a Group can change when a Slot moves. Rung 8 removes the limit.
+
+### 11.9 Nodes and Groups
+- A Node hosts one core per Group it is a Member of, each with its own data directory. One event loop, one transport and one client API per Node; messages name their Group.
+- Topology for runs: about 5 Nodes, each Group on 3 of them, so a Node failure hits some Groups and not others. Fully separate Nodes per Group is tried once, and dropped if it is too heavy for one machine.
+
+### 11.10 Gossip (7b)
+- SWIM-style: each Node pings a few others, and passes on what it has heard. It carries which Nodes exist and their addresses, which are suspected dead, the newest table version and Store time.
+- A new Node needs one address to start. This removes Rung 6's limit that every address is fixed at start.
+- Gossip informs and never decides. Group membership and Slot ownership change only through Entries in a Raft Log.
+
+### 11.11 Automation (7c)
+- **Declaring a Node dead.** Each Meta Group Member reports the Nodes it has suspected for longer than a set time. The Meta Leader acts only when a Majority of Meta Members report the same Node. A minority side of a Partition can replace nobody.
+- **Replacing it.** For each Group the Node was in, the Meta Group asks that Group's Leader to add a Spare and then remove the dead Member, one change at a time (§6.5). With no Spare the Group stays short.
+- **A replaced Node that returns** learns from gossip that it is a Member of nothing, drops its data, and becomes a Spare.
+- **Rebalancing by load.** The Meta Group moves Slots off busy Groups by itself. What counts as load, the threshold and the damping are designed at the start of 7c, once 7a has measured what a move costs.
+
+### 11.12 Verification
+- **Linearizability** is checked per key over the whole store, as before: a History doesn't care which Group answered.
+- **One owner.** The Simulation samples every Group's own view and fails the run if two Groups would serve the same Slot at the same instant.
+- **End state.** Members of each Group are identical, and across Groups every key is held exactly once, by the Group the table names.
+- **Client signals** add: requests answered `wrong_group` or `moving`, forwarded requests, and the longest pause in writes to a moving Slot.
+
+### 11.13 Risks accepted
+- The Meta Group is one more thing to run, and moves, new Sessions and expiry all wait on it.
+- A merged scan is weaker than a scan in Rungs 5–6.
+- Automatic replacement and load balancing can cause churn. They can't break the one-owner rule, because they only ever ask for changes that go through Raft.
 
 ## Decision Log
 
@@ -394,3 +483,15 @@ A Member that finds damage on its disk drops what it can't verify and fetches it
 
 ### A Member that can't say how it voted doesn't start
 The first design let a Member that had lost its Term and vote adopt the Leader's Term and carry on. That is unsafe. The Member may have voted in a Term higher than the Leader has seen, for a candidate that was cut off and kept standing. When the Group reaches that Term, the Member would vote in it a second time, and two Leaders could be elected. Nothing the Member can learn from others tells it what it promised. So the Term and vote are stored twice, either copy is enough, and a Member with both copies damaged stays down until it can be replaced under a new identity (Rung 6).
+
+### The Meta Group decides a move and the data Groups confirm it
+A Slot's owner could be decided by the Meta Group alone, or agreed between the two data Groups with no Meta Group. The first leaves a gap in which the table says one Group and another is still serving; the second has no single order of moves and is two-phase commit arriving a Rung early. So the Meta Group commits the intent, the source commits that it has frozen, the target commits that it has taken over, and the Meta Group commits that it is done. Each Group serves a Slot by its own Log and nothing else. It costs an extra Group and more steps per move.
+
+### Versions are a Slot's Epoch and a Log index
+A version was the index of the Entry that wrote the key. With several Groups an index means nothing outside its Group, and a key that moves could get a lower version than it had, or one it had before for a different value, letting a stale compare-and-set succeed. A per-key counter would be simpler and repeats after a delete. The Meta Group already orders moves, so each move raises the Slot's Epoch and a version is the pair, Epoch first.
+
+### One Store time, issued by the Meta Group
+Rung 5 let each Group's Leader stamp Entries from its own clock. With several Groups a moved key's deadline would be judged against a different Leader's clock. Asking the Meta Group for the time on every write would put it in every write's path. So the Meta Group ticks time into its own Log, the value spreads, and data Leaders stamp with the latest they have heard. This narrows "Time enters only through the Leader's stamp": it now enters only through the Meta Group's Leader. If the Meta Group stops, nothing expires.
+
+### Sessions are store-wide and follow the Slot of their last request
+A Session per Group would be simplest and would forget a retry that lands on a new owner after a move. A single Session table in the Meta Group would put it in every write's path. So ids come from the Meta Group, each data Group keeps its own record of the Sessions it has served, and a record moves with the Slot its last request touched. A client sends one request at a time, so that is the only request a retry can be for.
