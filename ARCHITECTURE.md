@@ -471,10 +471,17 @@ Details confirmed with the user at P7b.0.
 - **Left for 7c.** Addresses learned by gossip are used for requests between Nodes. The Groups' replication still uses the addresses given at start.
 
 ### 11.11 Automation (7c)
-- **Declaring a Node dead.** Each Meta Group Member reports the Nodes it has suspected for longer than a set time. The Meta Leader acts only when a Majority of Meta Members report the same Node. A minority side of a Partition can replace nobody.
-- **Replacing it.** For each Group the Node was in, the Meta Group asks that Group's Leader to add a Spare and then remove the dead Member, one change at a time (§6.5). With no Spare the Group stays short.
-- **A replaced Node that returns** learns from gossip that it is a Member of nothing, drops its data, and becomes a Spare.
-- **Rebalancing by load.** The Meta Group moves Slots off busy Groups by itself. What counts as load, the threshold and the damping are designed at the start of 7c, once 7a has measured what a move costs.
+Details confirmed with the user at P7c.0.
+
+- **Who holds what.** The Slot table gains each Group's Member list and, for each Slot, the Store time of its last Move. A change of Members follows the pattern of a Move (§11.4): the Meta Group records the change it wants, the Group's Leader carries it out through its own Log (§6.5), and the Meta Group records it done. The placement rule of §11.9 only founds the store. A Node hosts a replica when the table says it should, and the Groups' replication takes addresses from gossip.
+- **Declaring a Node dead.** Each Meta Member reports, by gossip, the Nodes its detector has held dead for longer than a wait. The Meta Leader acts only when a Majority of Meta Members report the same Node, so a minority side of a Partition can replace nobody. The wait is one figure for every size of Group, sized by measurement to outlast a Node restart. A two-speed rule was considered and dropped: with three Members every loss leaves a Group one failure from stopping, so it would always take the fast path.
+- **Replacing it.** For each Group the Node was in, the Meta Group asks that Group's Leader to add a Spare and then remove the dead Member, one change at a time. One Spare takes over all of the dead Node's replicas. With no Spare the Group stays short. The Meta Group replaces its own dead Members by the same rule.
+- **A replaced Node that returns.** Gossip only prompts it to ask. It drops a Group's data once that Group's Leader shows a Committed Member list without it, and is a Spare when it is a Member of nothing. A Node that can't reach the Group keeps its data and waits.
+- **Load.** Each data Leader counts requests per Slot it owns: a write counts 1 and a read counts a fixed fraction, measured once on real processes and then built in. The count is smoothed over a window and rides on gossip. The Meta Leader decides from what it has heard; only the Move goes into a Log. A new Meta Leader has heard nothing and waits a window before it moves anything.
+- **Threshold.** Two lines. Rebalancing starts when the busiest Group carries more than the high line times the mean, and goes on, one Slot at a time from the busiest Group to the idlest, until it is under the low line. The lines start at 1.3 and 1.1 and are settled by measurement. A Slot is moved only if it is smaller than the gap between the two Groups.
+- **Damping.** One Move at a time across the store. A Slot that has moved rests for a set time. Decisions use the smoothed load. Nothing is rebalanced while a Node is suspected or a replacement is under way. The first two are read from the Slot table, so a change of Meta Leader forgets neither.
+- **A stuck Move** is never cancelled. If a Group in it loses its Majority, replacement brings the Group back and the Move finishes. With no Spare it stays stuck, blocks rebalancing, and shows in `kvctl table`.
+- **Naive versions, built first:** one Meta Member's word replaces a Node with no wait; a returned Node drops its data on gossip's say-so; rebalancing acts on the latest report with one line and no damping.
 
 ### 11.12 Verification
 - **Linearizability** is checked per key over the whole store, as before: a History doesn't care which Group answered.

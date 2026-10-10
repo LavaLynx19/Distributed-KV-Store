@@ -95,7 +95,15 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P7b.6 Detectors compared: time to notice a dead Node, false alarms under a slow Node, a one-way cut, a Partition and lost messages, and messages sent → §P7
 - [x] P7b.7 Joining with one address, leaving; real shell: gossip on the Nodes' network, addresses learned as they arrive; `kvnode -join`, `kvctl nodes` → §P7
 - [x] P7b.8 Stage 7b suite (the 7a suite with gossip carrying the table, plus gossip Faults), real runs, the 7b part of `retros/rung-7.md` → §P7
-- [>] P7c.0 Design load, threshold and damping for rebalancing; break stage 7c (A§11.11) into tasks → defer until: stage 7b is approved
+- [x] P7c.0 Design load, threshold and damping for rebalancing; break stage 7c (A§11.11) into tasks → §P7
+- [ ] P7c.1 The Slot table holds each Group's Member list; Meta records a change wanted and a change done; a Node starts or stops a replica as the table says; replication takes addresses from gossip → §P7
+- [ ] P7c.2 Naive replacement: one Meta Member's word, no wait; add a Spare, remove the dead Member; a returned Node drops its data when gossip says it was replaced. Expose: running Nodes replaced under a Partition, and an Acknowledged write lost to a wrong drop → §P7
+- [ ] P7c.3 Fix: a Majority of Meta Members and one wait; the Meta Group's own Members; a returned Node drops only on the Group's Committed Member list and becomes a Spare; a Move stuck on a lost Majority finishes after replacement → §P7
+- [ ] P7c.4 Load: per-Slot counts at each data Leader, smoothed, carried by gossip; the weight of a read measured on real processes and built in; `kvctl table` shows load → §P7
+- [ ] P7c.5 Naive rebalancing: latest report, one line, no damping. Expose: Slots moving back and forth under steady and under shifting load, counted in Moves and in time frozen → §P7
+- [ ] P7c.6 Fix: two lines, one Move at a time, rest per Slot, smoothed load, nothing while a Node is suspected or being replaced; lines, window and rest settled by measurement → §P7
+- [ ] P7c.7 Real shell: Spares take replicas, `kvctl` shows replacements, `kvbench` can skew load onto a few Slots, harness Faults `kill-for-good` and `skewed-load` → §P7
+- [ ] P7c.8 Stage 7c suite (the 7b suite with automation on, plus Nodes lost for good and skewed load), real runs, the 7c part and the Rung 7 verdict in `retros/rung-7.md` → §P7
 
 ### Phase 8 — Rung 8: transactions across Groups (§P8)
 - [>] P8.0 Confirm or replace the A§10 sketch → defer until: Rung 7 retro is done
@@ -166,6 +174,8 @@ P4.4 is a design decision inside the Rung: stop and get it approved before codin
 
 ## §P7 — Rung 7
 Design is A§11. Three stages (A§11.1), each ending with a retro section and the user's approval.
+**Verify (7c):** P7c.2's and P7c.5's seeds fail naive and can't be reproduced after. A Node lost for good is replaced in every Group it was in, the Meta Group included, with no hand on it, and the run stays Linearizable with one owner per Slot. A minority side of a Partition replaces nobody. A returned Node never drops data its Group still counts on. Under skewed load the busiest Group ends under the low line; under steady load nothing moves. Moves made and time frozen are reported, naive against damped.
+
 **Verify (7b):** P7b.3's and P7b.4's seeds fail with gossip deciding and can't be reproduced with it only informing. The 7a suite passes with the table carried by gossip and no timed reads of the Meta Group. After Faults stop, every live Node agrees on which Nodes are alive and on the table version. A Node started with one address is known to all. The two detectors' numbers are reported side by side.
 
 **Verify (7a):** P7a.4's and P7a.5's seeds fail before and pass after. No run ever has two Groups serving one Slot. Single-key operations stay Linearizable while Slots move, including Moves interrupted by crashes and Partitions at every step. A retry that crosses a Move takes effect once. The pause of a Move is reported.
