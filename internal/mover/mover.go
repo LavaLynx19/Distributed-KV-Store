@@ -64,6 +64,10 @@ type Agent struct {
 	// promised is when the table was first seen to give this Group a Slot
 	// it doesn't have.
 	promised map[moveKey]int64
+	// handed is the Epoch at which each Slot's handover was last reported,
+	// so that one handover is reported once however often its last step is
+	// sent again.
+	handed map[moveKey]uint32
 }
 
 type moveKey struct {
@@ -90,7 +94,7 @@ func (a *Agent) Reset() {
 	// New maps, not nil: an answer to something asked before the restart
 	// may still arrive and be recorded.
 	a.copying, a.waiting, a.frozen = map[moveKey]copyState{}, map[moveKey]int64{}, map[moveKey]int64{}
-	a.promised = map[moveKey]int64{}
+	a.promised, a.handed = map[moveKey]int64{}, map[moveKey]uint32{}
 }
 
 // Step moves each Move of Group g along by at most one step. It must be
@@ -206,7 +210,7 @@ func (a *Agent) slot(env Env, g shard.GroupID, term core.Term, slot shard.Slot, 
 			local(shardfsm.DropStep(slot, info.Epoch))
 			return
 		}
-		if _, seen := a.frozen[key]; !seen {
+		if _, seen := a.frozen[key]; !seen && a.handed[key] != info.Epoch+1 {
 			a.frozen[key] = env.Now()
 		}
 		// Send the rest. If this Leader made the copy it knows the target
@@ -225,6 +229,7 @@ func (a *Agent) slot(env Env, g shard.GroupID, term core.Term, slot shard.Slot, 
 				a.OnHandover(g, slot, env.Now()-since)
 			}
 			delete(a.frozen, key)
+			a.handed[key] = info.Epoch + 1
 			wait()
 			done := meta.Command{Op: meta.OpDone, Slot: slot, Epoch: info.Epoch + 1}.Encode()
 			env.Ask(shard.Meta, done, func(bool, []byte) { clear() })

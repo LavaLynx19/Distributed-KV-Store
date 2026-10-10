@@ -94,7 +94,7 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P7b.5 The SWIM detector: ping, ping through others, suspicion, answering a suspicion → §P7
 - [x] P7b.6 Detectors compared: time to notice a dead Node, false alarms under a slow Node, a one-way cut, a Partition and lost messages, and messages sent → §P7
 - [x] P7b.7 Joining with one address, leaving; real shell: gossip on the Nodes' network, addresses learned as they arrive; `kvnode -join`, `kvctl nodes` → §P7
-- [ ] P7b.8 Stage 7b suite (the 7a suite with gossip carrying the table, plus gossip Faults), real runs, the 7b part of `retros/rung-7.md` → §P7
+- [x] P7b.8 Stage 7b suite (the 7a suite with gossip carrying the table, plus gossip Faults), real runs, the 7b part of `retros/rung-7.md` → §P7
 - [>] P7c.0 Design load, threshold and damping for rebalancing; break stage 7c (A§11.11) into tasks → defer until: stage 7b is approved
 
 ### Phase 8 — Rung 8: transactions across Groups (§P8)

@@ -1,6 +1,6 @@
 # Rung 7 retro: several Groups
 
-Status: **stage 7a done and waiting for approval; 7b and 7c not started**. Rung 7 is built in three stages (A§11.1). This file gets a part per stage.
+Status: **stages 7a and 7b done; 7b waiting for approval; 7c not started**. Rung 7 is built in three stages (A§11.1). This file has a part per stage: 7a first, 7b after it.
 
 Stage 7a in one paragraph: several Groups share the keys by Slot, a Meta Group holds the table, and a Slot can be moved between Groups while clients carry on. 2,400 simulated runs with 10,224 Moves have no run with two owners and none that isn't Linearizable, and 13 real runs are clean. A moved Slot refuses its clients for about 80 ms. **Three Groups on one machine are slower than one Group, at 0.52× with the disk on**, which misses the 0.9× target; the reason is below.
 
@@ -19,11 +19,11 @@ The Move itself is done properly here. What is missing is the check: a Group ask
 | Faults | Not Linearizable |
 |---|---|
 | No Moves | 0 |
-| Moves | 47 |
-| Moves and crashes | 42 |
-| Moves and Partitions | 35 |
-| Moves interrupted at each step | 42 |
-| Moves, crashes and Partitions | 35 |
+| Moves | 44 |
+| Moves and crashes | 43 |
+| Moves and Partitions | 37 |
+| Moves interrupted at each step | 38 |
+| Moves, crashes and Partitions | 36 |
 
 Every Node caches the table and refreshes it every 20 units. For that long after a Move, some Node still sends the Slot's keys to the Group that used to own them. That Group has given the Slot away, and answers anyway: a read finds nothing, or a write lands where nobody will look for it.
 
@@ -36,15 +36,17 @@ Now every Group checks, by its own Log, that it owns what it serves. The Move is
 | Faults (50 seeds) | Two Groups serving one Slot | Not Linearizable |
 |---|---|---|
 | No Moves | 0 | 0 |
-| Moves | **50** | 11 |
-| Moves and crashes | **50** | 12 |
-| Moves and Partitions | **50** | 7 |
+| Moves | **50** | 15 |
+| Moves and crashes | **50** | 11 |
+| Moves and Partitions | **50** | 12 |
 | Moves interrupted at each step | **50** | 3 |
-| Moves, crashes and Partitions | **50** | 8 |
+| Moves, crashes and Partitions | **49** | 12 |
 
-Every run with a Move has two owners. Seed 1: Slot 0 is served by Groups 1 and 3 at t=380.
+Nearly every run with a Move has two owners. Seed 1: Slot 0 is served by two Groups within 400 units.
 
 The new owner starts when it is given the Slot. The old one stops when its own "let go" is Committed, a little later. In between both answer. Most runs get away with it, because the window is short and a client has to write to the old owner inside it. The ones that don't lose that write.
+
+(These two tables were measured again after stage 7b changed how a Node finds a Leader, which changes every run. The seed numbers quoted for the bugs below are from before that; the bugs have unit tests of their own.)
 
 The History catches this in a fifth of the runs. The one-owner verdict catches it in all of them, which is why it was worth adding.
 
@@ -211,3 +213,147 @@ DATA_GROUPS=3 harness/local.sh start 5 && harness/local.sh table && harness/loca
 4. **Helpful memory is still state.** The agent's copy progress was "only an optimisation" and froze a Slot for good. Anything remembered across two Moves needs to say which Move it is about.
 5. **A slow part hides the bug next to it.** The connection churn between Nodes was invisible behind a 30 ms disk sync. The run with the disk off was meant to explain a number and found a bug.
 6. **Sharding one disk is a loss.** I expected several Groups to at least hold their own. They halve throughput here, and the design is still right for the case it is for.
+
+# Stage 7b: gossip
+
+Status: **done, waiting for approval**. Nodes now learn the Slot table, and of each other, by gossip, and no Node asks the Meta Group for the table on a timer. Gossip decides nothing. Two stores where it does decide are shown failing. 2,400 simulated runs with gossip only informing are clean, and so are 6 real ones. Two ways of noticing a dead Node were built and measured; neither ever took a running Node for dead.
+
+Environment: the 7a Simulation with gossip between the Nodes. A gossip round is one tick. Each round a Node tells two others everything it knows: every Node's address and how it seems, and the whole Slot table. Nodes that host a Meta Group replica put that replica's table into their gossip, which is the only way it gets there.
+
+## Exposed: gossip decides who owns a Slot (P7b.3)
+
+No Meta Group is asked. The Node asked for a Move changes its own table, raises the version, and gossips it. Each Group does what the table it has heard says, as in 7a's second naive store. A Group named as owner that isn't sent the Slot takes it empty after a wait.
+
+50 seeds per cell.
+
+| Faults | Two Groups serving one Slot | Not Linearizable |
+|---|---|---|
+| No Moves | 0 | 0 |
+| Moves | 50 | 16 |
+| Long Partitions, no Moves | 0 | 0 |
+| Long Partitions, and a Move of the same Slot asked for on each side | **50** | **33** |
+
+`rival-moves`, seed 1: the Nodes split two against three. A Node on each side is asked to move the same Slot, to different Groups. Both raise the table to the same version with different contents. Each side believes its own, and neither ever replaces it, since "the higher version wins" has no answer for a tie. Two Groups serve the Slot, one of them from nothing.
+
+A version number orders things only if one party hands the numbers out.
+
+## Exposed, part two: gossip decides who is in a Group (P7b.4)
+
+Each replica takes for its Group's Members whichever of them its Node's gossip thinks are alive. There is no Entry and no agreement. It needed a switch in the consensus core that lets the shell set the Member list, which exists for this and nothing else.
+
+| Faults (50 seeds) | Unsafe | Not Linearizable | Two Leaders in one Term | Core's safety check tripped |
+|---|---|---|---|---|
+| No Moves | 0 | 0 | 0 | 0 |
+| Moves, nothing else | 0 | 0 | 0 | 0 |
+| Long Partitions | **50** | 43 | 16 | 50 |
+
+`long-partitions`, seed 1: replicas 201 and 301 of Group 1 both lead Term 2. A Partition lasts longer than it takes to give a Node up for dead. Each side drops the other. A lone replica is then a Majority of the one Member it has left, and elects itself.
+
+This is Rung 6's failure, two Majorities, arrived at by a different road. It is also what stage 7c must not do, which is why it is here first.
+
+### Reproduce
+```
+go test -run 'TestOwnershipByGossip|TestMembersByGossip' -v ./internal/rungtest/
+```
+
+## Fix: gossip informs (P7b.1–P7b.2)
+
+Nothing was fixed so much as not done. The table in gossip is a hint for routing. Each Group still serves a Slot by its own Log, and a Move is still decided by the Meta Group and confirmed by both Groups. The Member lists don't look at gossip at all.
+
+`TestRung7b`: 8 scenarios × 100 seeds × three stores (counters, SWIM, and SWIM with the busier workload) = **2,400 runs, none unsafe, 7,080 Moves finished**. The End-state verdict gained a part: once Faults stop, every running Node must think every running Node alive, know its address, and hold the Meta Group's table version. The two seeds above pass.
+
+### How fast news of a Move travels
+How long after the Meta Group first holds a new table version each Node has it, in units (a tick is 10):
+
+| | Median | 95% within | At most |
+|---|---|---|---|
+| 7a: every Node asks the Meta Group every 20 units | 12 | 26 | 41 |
+| 7b: gossip, two Nodes told per round | 11 | 21 | 41 |
+
+The same. Gossip didn't make the table arrive sooner. What it removed is every Node's standing dependence on reaching the Meta Group's Leader: a Node cut off from it still hears the table from whoever it can reach.
+
+### What a Move's pause is, measured properly
+While adding this I found the 7a harness counted a handover again each time the agent re-sent its last step. The count is now once per Move, and the figures barely moved: median 21 units simulated, and in the real runs a median of 52 ms over 3 Moves (at most 113 ms).
+
+## The two detectors (P7b.5–P7b.6)
+
+- **Counters.** Every Node bumps a counter each round and passes on everyone's. A Node whose counter hasn't risen for a while is suspected, then dead. Each Node judges alone.
+- **SWIM.** Each round a Node pings one other, and if that fails asks two more to ping for it. Failing that it tells everyone the Node is suspected. The Node, hearing so, raises its incarnation number, which outranks the suspicion. Unanswered, the suspicion becomes a verdict.
+
+Twelve Nodes, 20 trials, times in rounds. The two numbers after each name are the rounds before suspicion and before the verdict.
+
+| Detector | Dead Node suspected / taken for dead | Running Node wrongly suspected, per 1,000 rounds: quiet / 10% lost / 30% lost / slow Node / cut link | Wrongly taken for dead | All alive again after a Partition heals | Messages per Node per round |
+|---|---|---|---|---|---|
+| Counters 5/15 | 5.6 / 14.6 | 47 / 139 / 954 / 215 / 52 | 0 | 4.8 | 2.0 |
+| Counters 10/25 | 10.6 / 24.6 | 0 / 0 / 0.5 / 0 / 0 | 0 | 4.9 | 2.0 |
+| Counters 15/35 | 15.6 / 34.6 | 0 / 0 / 0 / 0 / 0 | 0 | 4.7 | 2.0 |
+| SWIM 3/9 | 5.7 / 13.9 | 0 / 1,940 / 17,916 / 0 / 0 | 0 | 8.3 | 4.0 |
+| SWIM 5/15 | 7.8 / 21.9 | 0 / 1,930 / 17,740 / 0 / 0 | 0 | 8.2 | 4.0 |
+| SWIM 8/24 | 10.8 / 34.1 | 0 / 1,905 / 17,339 / 0 / 0 | 0 | 8.3 | 4.0 |
+
+With five Nodes the pattern is the same.
+
+- **Neither ever took a running Node for dead**, at any setting, with 30% of Messages lost, a Node running at a third of the speed, or a link cut between two Nodes. That is the number 7c needs, and it is zero for both.
+- **Counters need a threshold above the time news takes to get round.** At 5 rounds they suspect healthy Nodes even when nothing is wrong, because a Node often goes 5 rounds without hearing a fresh count for some other. At 10 they don't.
+- **SWIM suspects easily when Messages are lost** and is always put right. One lost ping and a lost relay are enough to raise a suspicion, and no setting changes that: the patience is in the wait after the suspicion. With 30% loss every Node is under suspicion by someone most of the time.
+- **SWIM is unmoved by a slow Node or a cut link,** which is what asking others to ping is for. Counters at 10 or more are too.
+- **They notice a dead Node equally fast** when set to. SWIM sends twice the Messages.
+
+At this size counters at 10/25 are as good as SWIM on everything measured and cheaper. SWIM's known advantage, that its cost and speed don't grow with the number of Nodes, doesn't show at twelve. `kvnode` defaults to counters, and `-detector swim` selects the other.
+
+`go test -v -run TestCompareDetectors ./internal/gossip` prints the table.
+
+## Joining and leaving (P7b.7)
+
+A Node started with one other Node's address exchanges everything with it and is then known to all. It hosts no Group: it is a Spare. It learns the table by gossip and routes requests like any Node. On an orderly shutdown a Node says it is leaving and is marked so at once, without being suspected.
+
+On real processes: five Nodes and a sixth started with `local.sh join 6`, told only where Node 1 is. A second and a half later all six agreed on all six. A key written through the sixth was read through the third. Then one Node was killed and the sixth stopped with a signal: four seconds later the others had the first as dead and the sixth as left.
+
+**What this doesn't do yet.** Addresses learned by gossip are used for requests between Nodes. The Groups' own replication still uses the addresses given at start, because the Groups' Members are still the founding Nodes. Stage 7c, which gives a Spare something to host, has to finish that.
+
+## Real runs (P7b.8)
+
+M4 Pro, local processes, 10 s, five Nodes hosting three data Groups and the Meta Group, gossip carrying the table.
+
+| Clients | Fault | Requests/s | Rejected / lost | Longest pause in any write | Verdicts |
+|---|---|---|---|---|---|
+| 64 | None | 697 | 0 / 0 | — | Linearizable; one owner per Slot |
+| 8 | A Slot moved every half second | 206 | 0 / 0 | 68 ms | Linearizable; one owner per Slot |
+| 8 | A Node hosting three replicas killed and restarted | 204 | 0 / 0 | 139 ms | Linearizable; one owner per Slot |
+| 8 | Both at once | 204 | 0 / 0 | 117 ms | Linearizable; one owner per Slot |
+
+Throughput is what it was in 7a (700). Gossip costs nothing visible.
+
+**Not covered:** `kvbench` can't check that Nodes' gossip agrees at the end; the Simulation and the server tests do. Nothing ran in Docker.
+
+### Reproduce
+```
+go test -run 'TestRung7b|TestOwnershipByGossip|TestMembersByGossip' ./internal/rungtest/
+go test ./internal/gossip/ ./internal/cluster/
+RETRY=1 DATA_GROUPS=3 harness/run.sh local 5 move-and-kill
+DATA_GROUPS=3 harness/local.sh start 5 && harness/local.sh join 6 && harness/local.sh nodes
+```
+
+## Things decided while building stage 7b
+- **Gossip rides on the Nodes' HTTP network** in the real shell, not on a network of its own.
+- **The counters detector defaults to 10 and 25 rounds**, after 5 and 15 suspected healthy Nodes.
+- **A Node's answer to a suspicion, and its catching up with its own counter after a restart, use the same rule**: what others say about a Node tells it where it had got to.
+- **`kvnode -join` needs `-founders`**, the number of Nodes the store began with. Where the Groups' replicas live is worked out from it.
+- **The simulated Node now follows one Leader hint** after a wrong guess, as the real one does since 7a. That changed every run, so two exposure seeds were pinned again.
+
+## Verdict for stage 7b
+| Check | Result |
+|---|---|
+| Exposed | **Pass**: ownership decided by gossip (`TestOwnershipByGossipIsExposed`); Membership decided by gossip (`TestMembersByGossipIsExposed`) |
+| Those seeds can't be reproduced with gossip only informing | **Pass** |
+| The 7a guarantees with the table carried by gossip | **Pass**: 2,400 simulated runs, 6 real |
+| Every live Node agrees on who is alive and on the table once Faults stop | **Pass**: part of the End-state verdict in those runs |
+| A Node started with one address is known to all | **Pass**: in simulation, in the server tests and on real processes |
+| The two detectors side by side | **Done**: the table above |
+
+## Lessons from stage 7b
+1. **The naive version of this stage was to do more.** Both exposures are gossip being given a say. The correct store is the one where gossip is ignored for every decision, and the work was in making sure nothing quietly depended on it.
+2. **A version number means something only if one party issues it.** Two sides of a Partition each raised the table to version 2. Nothing was wrong with either side's arithmetic.
+3. **Suspicion and verdict are different measurements.** My first comparison counted any bad opinion as a false alarm and made SWIM look hopeless. What 7c will act on is the verdict, and both detectors' count of wrong ones is zero.
+4. **A tight threshold fails in good weather.** Counters at 5 rounds suspected healthy Nodes with nothing wrong at all. The cause was the time gossip itself takes, which a threshold has to clear before it measures anything.
+5. **A hint that sticks is worse than no hint.** Preferring Nodes thought alive, I first always picked the first of them, and a Node that wasn't the Leader got every retry. Picking at random among them fixed it.
