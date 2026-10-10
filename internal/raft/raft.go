@@ -135,6 +135,10 @@ type Config struct {
 	// before it holds any of the Log. It exists so that Rung 6's exposure of
 	// that stays reproducible.
 	AddWithoutCatchUp bool
+	// MembersByDecree makes the Member take its Member list from core.Decree
+	// events, as the shell sees fit, outside the Log. It exists so that Rung
+	// 7's exposure of gossip deciding who is in a Group stays reproducible.
+	MembersByDecree bool
 	// Volatile makes the Member store nothing, as before Rung 3. It exists so
 	// that Rung 3's exposure of a store with no disk stays reproducible.
 	Volatile bool
@@ -237,7 +241,7 @@ func New(cfg Config) *Node {
 		n.commit, n.applied = snap.Index, snap.Index
 		if snap.Members != nil {
 			n.members, n.changed = slices.Clone(snap.Members), true
-			n.lists = []memberList{{index: snap.Index, members: n.members}}
+			n.lists = []memberList{{index: snap.MembersAt, members: n.members}}
 		}
 	}
 	n.log.entries = slices.Clone(cfg.Stored.Entries)
@@ -289,7 +293,8 @@ func (n *Node) appendEntry(out *core.Output, e core.Entry) {
 }
 
 func (n *Node) Status() core.Status {
-	return core.Status{ID: n.id, Role: n.role, Term: n.term, Leader: n.leader, Commit: n.commit, Recovering: n.abstaining(), Members: slices.Clone(n.members)}
+	return core.Status{ID: n.id, Role: n.role, Term: n.term, Leader: n.leader, Commit: n.commit, Recovering: n.abstaining(), Members: slices.Clone(n.members),
+		MembersAt: n.lists[len(n.lists)-1].index, Changing: n.changing(), Learner: n.learner}
 }
 
 // abstaining reports whether the Member must stay out of elections.
@@ -321,6 +326,18 @@ func (n *Node) Step(ev core.Event) core.Output {
 		n.snapshotted(&out, ev)
 	case core.Reconfigure:
 		n.reconfigure(&out, ev)
+	case core.Decree:
+		if n.cfg.MembersByDecree && len(ev.Members) > 0 {
+			n.members = slices.Clone(ev.Members)
+			slices.Sort(n.members)
+			n.lists = []memberList{{index: n.lastIndex(), members: n.members}}
+			if n.role == core.LeaderRole {
+				for _, m := range n.members {
+					n.follow(m)
+				}
+				n.advanceCommit()
+			}
+		}
 	}
 	if n.role == core.LeaderRole {
 		n.promoteLearner(&out)
@@ -505,6 +522,9 @@ func (n *Node) snapshotted(out *core.Output, s core.Snapshotted) {
 		return // older than what we have, or of Entries never handed over
 	}
 	snap := &core.Snapshot{Index: s.Index, Term: n.termAt(s.Index), Data: s.Data, Members: n.snapshotMembers(s.Index)}
+	if snap.Members != nil {
+		snap.MembersAt = n.listAt(s.Index).index
+	}
 	n.log.compactTo(s.Index)
 	n.foldListsTo(s.Index)
 	n.snapshot = snap

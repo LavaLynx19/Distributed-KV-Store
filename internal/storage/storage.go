@@ -294,6 +294,50 @@ func ForceMembers(fs FS, dir string, members []core.NodeID, opts Options) (Recov
 	return rec, s.Close()
 }
 
+// DropData empties a Member's directory of its Log and Snapshot and keeps
+// its Term and vote. It is for a Node that is no longer a Member of the
+// Group (A§11.11). The Term and vote stay because the Node may one day be
+// added to the same Group again under the same id, and must not then vote a
+// second time in a Term it voted in before. The Member must not be running.
+func DropData(fs FS, dir string, opts Options) error {
+	// Opening first makes sure the Term and vote can be read back.
+	s, _, err := OpenWith(fs, dir, opts)
+	if err != nil {
+		return err
+	}
+	if err := s.Close(); err != nil {
+		return err
+	}
+	names, err := fs.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		if strings.HasPrefix(name, "state") {
+			continue
+		}
+		if err := removeAll(fs, filepath.Join(dir, name)); err != nil {
+			return err
+		}
+	}
+	return fs.SyncDir(dir)
+}
+
+// removeAll removes a file, or a directory and everything in it.
+func removeAll(fs FS, path string) error {
+	if names, err := fs.ReadDir(path); err == nil {
+		for _, name := range names {
+			if err := removeAll(fs, filepath.Join(path, name)); err != nil {
+				return err
+			}
+		}
+	}
+	if err := fs.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 // damageMark is the file whose presence says the directory was found
 // damaged and the Member hasn't recovered yet.
 const damageMark = "damaged"
@@ -803,12 +847,13 @@ const withMembers = 1 << 63
 // the Term's top bit is set and the list comes between the two: a 4-byte
 // count, then 8 bytes per Member.
 func encodeSnapshot(snap *core.Snapshot) []byte {
-	raw := make([]byte, 16, 16+4+8*len(snap.Members)+len(snap.Data))
+	raw := make([]byte, 16, 16+12+8*len(snap.Members)+len(snap.Data))
 	binary.BigEndian.PutUint64(raw[:8], uint64(snap.Index))
 	term := uint64(snap.Term)
 	if snap.Members != nil {
 		term |= withMembers
 		raw = binary.BigEndian.AppendUint32(raw, uint32(len(snap.Members)))
+		raw = binary.BigEndian.AppendUint64(raw, uint64(snap.MembersAt))
 		for _, m := range snap.Members {
 			raw = binary.BigEndian.AppendUint64(raw, uint64(m))
 		}
@@ -826,7 +871,7 @@ func readableSnapshot(raw []byte) bool {
 	if binary.BigEndian.Uint64(raw[8:16])&withMembers == 0 {
 		return true
 	}
-	return len(raw) >= 20 && uint64(len(raw)-20) >= 8*uint64(binary.BigEndian.Uint32(raw[16:20]))
+	return len(raw) >= 28 && uint64(len(raw)-28) >= 8*uint64(binary.BigEndian.Uint32(raw[16:20]))
 }
 
 func decodeSnapshot(raw []byte) *core.Snapshot {
@@ -835,7 +880,8 @@ func decodeSnapshot(raw []byte) *core.Snapshot {
 	rest := raw[16:]
 	if term&withMembers != 0 {
 		count := binary.BigEndian.Uint32(rest[:4])
-		rest = rest[4:]
+		snap.MembersAt = core.Index(binary.BigEndian.Uint64(rest[4:12]))
+		rest = rest[12:]
 		snap.Members = make([]core.NodeID, count)
 		for i := range snap.Members {
 			snap.Members[i] = core.NodeID(binary.BigEndian.Uint64(rest[:8]))

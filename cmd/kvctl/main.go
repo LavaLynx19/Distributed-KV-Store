@@ -4,6 +4,9 @@
 //	kvctl -nodes http://127.0.0.1:8001,http://127.0.0.1:8002 status
 //	kvctl -nodes … add 4
 //	kvctl -nodes … remove 2
+//	kvctl -nodes … table          (a store with several Groups, A§11)
+//	kvctl -nodes … move SLOT GROUP
+//	kvctl -nodes … nodes          (what each Node's gossip thinks of the others)
 //
 // -nodes lists the client API of any Nodes, Members or Spares. A change is
 // sent to whichever of them leads.
@@ -43,7 +46,7 @@ func main() {
 	nodes := flag.String("nodes", "", "client API URLs of some Nodes, comma-separated")
 	wait := flag.Duration("wait", 30*time.Second, "how long to keep trying a change that is refused for now")
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: kvctl -nodes URL[,URL…] status | add ID | remove ID")
+		fmt.Fprintln(os.Stderr, "usage: kvctl -nodes URL[,URL…] status | add ID | remove ID | table | move SLOT GROUP | nodes")
 		fmt.Fprintln(os.Stderr, "       kvctl unsafe-recover -data DIR -members ID[,ID…] [-confirm]")
 		flag.PrintDefaults()
 	}
@@ -66,6 +69,18 @@ func main() {
 			break
 		}
 		err = change(httpc, urls, cmd, id, *wait)
+	case cmd == "table" && flag.NArg() == 1:
+		err = table(httpc, urls)
+	case cmd == "nodes" && flag.NArg() == 1:
+		err = gossipView(httpc, urls)
+	case cmd == "move" && flag.NArg() == 3:
+		slot, err1 := strconv.ParseUint(flag.Arg(1), 10, 16)
+		group, err2 := strconv.ParseUint(flag.Arg(2), 10, 32)
+		if err1 != nil || err2 != nil {
+			err = errors.New("move takes a Slot and a Group, as numbers")
+			break
+		}
+		err = move(httpc, urls, slot, group, *wait)
 	default:
 		flag.Usage()
 		os.Exit(2)
@@ -277,4 +292,158 @@ func containsID(list []core.NodeID, id core.NodeID) bool {
 		}
 	}
 	return false
+}
+
+type tableAnswer struct {
+	Version uint64 `json:"version"`
+	Slots   []struct {
+		Slot     int    `json:"slot"`
+		Group    uint64 `json:"group"`
+		Epoch    uint64 `json:"epoch"`
+		MovingTo uint64 `json:"moving_to"`
+		Load     uint64 `json:"load"`
+	} `json:"slots"`
+	Groups []struct {
+		Group   uint64 `json:"group"`
+		Members []int  `json:"members"`
+		Add     int    `json:"add"`
+		Remove  int    `json:"remove"`
+		Load    uint64 `json:"load"`
+	} `json:"groups"`
+}
+
+// fetchTable asks the Nodes in turn for the Slot table until one answers.
+func fetchTable(httpc *http.Client, urls []string) (tableAnswer, error) {
+	for _, u := range urls {
+		resp, err := httpc.Get(u + "/v1/table")
+		if err != nil {
+			continue
+		}
+		var t tableAnswer
+		err = json.NewDecoder(resp.Body).Decode(&t)
+		resp.Body.Close()
+		if err == nil && resp.StatusCode == http.StatusOK {
+			return t, nil
+		}
+	}
+	return tableAnswer{}, errors.New("no Node gave the Slot table")
+}
+
+// table prints which Group owns each Slot.
+func table(httpc *http.Client, urls []string) error {
+	t, err := fetchTable(httpc, urls)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("table version %d\n", t.Version)
+	byGroup := map[uint64][]int{}
+	for _, row := range t.Slots {
+		byGroup[row.Group] = append(byGroup[row.Group], row.Slot)
+		if row.MovingTo != 0 {
+			fmt.Printf("  Slot %d is moving from Group %d to Group %d\n", row.Slot, row.Group, row.MovingTo)
+		}
+	}
+	// Load is as the Node asked has heard it by gossip, smoothed (A§11.11).
+	var total uint64
+	for _, g := range t.Groups {
+		total += g.Load
+	}
+	for _, g := range t.Groups {
+		line := fmt.Sprintf("  Group %d on Nodes %v", g.Group, g.Members)
+		if g.Group == 0 {
+			line = fmt.Sprintf("  Meta Group on Nodes %v", g.Members)
+		} else {
+			line += fmt.Sprintf(" owns %d Slots: %v", len(byGroup[g.Group]), byGroup[g.Group])
+			if total > 0 {
+				line += fmt.Sprintf("; %d%% of the load", (g.Load*100+total/2)/total)
+			}
+		}
+		if g.Add != 0 {
+			line += fmt.Sprintf("; Node %d is taking Node %d's place", g.Add, g.Remove)
+		}
+		fmt.Println(line)
+	}
+	return nil
+}
+
+// move asks for a Slot to be moved to a Group and waits until the table
+// shows it there.
+func move(httpc *http.Client, urls []string, slot, group uint64, wait time.Duration) error {
+	deadline := time.Now().Add(wait)
+	body := fmt.Sprintf(`{"slot":%d,"to":%d}`, slot, group)
+	began := time.Now()
+	for asked := false; ; time.Sleep(50 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("gave up after %s: run table to see where the Move stands", wait)
+		}
+		if !asked {
+			for _, u := range urls {
+				resp, err := httpc.Post(u+"/v1/admin/moves", "application/json", strings.NewReader(body))
+				if err != nil {
+					continue
+				}
+				var a changeAnswer
+				raw, _ := io.ReadAll(resp.Body) // an unreadable answer is retried like no answer
+				resp.Body.Close()
+				_ = json.Unmarshal(raw, &a)
+				if resp.StatusCode == http.StatusBadRequest {
+					return fmt.Errorf("%s: %s", a.Reason, a.Message)
+				}
+				if resp.StatusCode == http.StatusOK {
+					asked = true
+					break
+				}
+			}
+			continue
+		}
+		t, err := fetchTable(httpc, urls)
+		if err != nil || int(slot) >= len(t.Slots) {
+			continue
+		}
+		if row := t.Slots[slot]; row.Group == group && row.MovingTo == 0 {
+			fmt.Printf("done: Slot %d is owned by Group %d at Epoch %d, after %s\n", slot, group, row.Epoch, time.Since(began).Round(time.Millisecond))
+			return nil
+		}
+	}
+}
+
+// gossipView prints, for each Node asked, what its gossip thinks of every Node
+// (A§11.10). Nodes that agree are printed once.
+func gossipView(httpc *http.Client, urls []string) error {
+	type row struct {
+		ID     int    `json:"id"`
+		Client string `json:"client"`
+		Status string `json:"status"`
+	}
+	views := map[string][]string{}
+	var order []string
+	for _, u := range urls {
+		resp, err := httpc.Get(u + "/v1/nodes")
+		if err != nil {
+			fmt.Printf("%-28s down\n", u)
+			continue
+		}
+		var list []row
+		err = json.NewDecoder(resp.Body).Decode(&list)
+		resp.Body.Close()
+		if err != nil {
+			fmt.Printf("%-28s unreadable answer: %v\n", u, err)
+			continue
+		}
+		view := ""
+		for _, n := range list {
+			view += fmt.Sprintf("  node %d at %s: %s\n", n.ID, n.Client, n.Status)
+		}
+		if _, seen := views[view]; !seen {
+			order = append(order, view)
+		}
+		views[view] = append(views[view], u)
+	}
+	if len(order) == 0 {
+		return errors.New("no Node answered")
+	}
+	for _, view := range order {
+		fmt.Printf("as seen by %s:\n%s", strings.Join(views[view], ", "), view)
+	}
+	return nil
 }

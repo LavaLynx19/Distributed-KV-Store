@@ -32,6 +32,10 @@ type API struct {
 	// AdminTimeout bounds a Membership change, which can take far longer
 	// than a write: a Node being added must first be sent the whole Log.
 	AdminTimeout time.Duration
+	// Store, if set, makes this the API of a Node in a store with several
+	// Groups (A§11): requests are routed by key to the Group that owns it,
+	// and Node is unused.
+	Store *Store
 }
 
 func (a *API) now() int64 {
@@ -106,6 +110,23 @@ const maxBody = 1 << 20
 // Handler returns the routes.
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
+	if a.Store != nil {
+		mux.HandleFunc("GET /v1/kv/{key}", a.get)
+		mux.HandleFunc("PUT /v1/kv/{key}", a.put)
+		mux.HandleFunc("DELETE /v1/kv/{key}", a.delete)
+		mux.HandleFunc("GET /v1/kv", a.scan)
+		mux.HandleFunc("POST /v1/txn", a.txn)
+		mux.HandleFunc("POST /v1/sessions", a.openSession)
+		mux.HandleFunc("POST /v1/internal/group/{group}", a.Store.internal)
+		mux.HandleFunc("POST /v1/internal/gossip", a.Store.gossipReceive)
+		mux.HandleFunc("GET /v1/internal/members/{group}", a.Store.members)
+		mux.HandleFunc("GET /v1/nodes", a.Store.nodes)
+		mux.HandleFunc("GET /v1/status", a.Store.status)
+		mux.HandleFunc("GET /v1/table", a.Store.tableHandler)
+		mux.HandleFunc("POST /v1/admin/moves", a.Store.move)
+		mux.HandleFunc("GET /v1/debug/items", a.Store.debugItems)
+		return mux
+	}
 	mux.HandleFunc("GET /v1/kv/{key}", a.get)
 	mux.HandleFunc("PUT /v1/kv/{key}", a.put)
 	mux.HandleFunc("DELETE /v1/kv/{key}", a.delete)
@@ -216,6 +237,12 @@ func (a *API) txn(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, errorResponse{Reason: "version_mismatch", Failed: failed})
 	case fsm.StatusSessionExpired:
 		writeError(w, http.StatusGone, errorResponse{Reason: "session_expired"})
+	case fsm.StatusWrongGroup:
+		writeError(w, http.StatusMisdirectedRequest, errorResponse{Reason: "wrong_group", Message: "this Node's table was out of date; nothing changed"})
+	case fsm.StatusMoving:
+		writeError(w, http.StatusServiceUnavailable, errorResponse{Reason: "moving", Message: "the key's Slot is being moved; nothing changed"})
+	case fsm.StatusCrossGroup:
+		writeError(w, http.StatusBadRequest, errorResponse{Reason: "cross_group", Message: "the keys are owned by more than one Group"})
 	default:
 		writeError(w, http.StatusBadRequest, errorResponse{Reason: "invalid"})
 	}
@@ -238,12 +265,19 @@ func identify(r *http.Request, cmd *fsm.Command) bool {
 	var err1, err2 error
 	cmd.Session, err1 = strconv.ParseUint(id, 10, 64)
 	cmd.Seq, err2 = strconv.ParseUint(seq, 10, 64)
+	// A client sets this on a request no earlier attempt of which can have
+	// taken effect, to let a Group that doesn't know the Session start a
+	// record of it (A§11.6).
+	cmd.Register = r.Header.Get("Session-Register") != ""
 	return err1 == nil && err2 == nil && cmd.Session != 0 && cmd.Seq != 0
 }
 
 // propose submits cmd and handles every outcome that isn't the state
 // machine's own answer. It reports false if it has already written one.
 func (a *API) propose(w http.ResponseWriter, r *http.Request, cmd fsm.Command) (fsm.Response, bool) {
+	if a.Store != nil {
+		return a.Store.serve(w, r, cmd)
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), a.Timeout)
 	defer cancel()
 	var reply Reply
@@ -300,6 +334,12 @@ func (a *API) run(w http.ResponseWriter, r *http.Request, cmd fsm.Command) {
 		writeError(w, http.StatusConflict, errorResponse{Reason: "version_mismatch", Version: &resp.Version})
 	case fsm.StatusSessionExpired:
 		writeError(w, http.StatusGone, errorResponse{Reason: "session_expired"})
+	case fsm.StatusWrongGroup:
+		writeError(w, http.StatusMisdirectedRequest, errorResponse{Reason: "wrong_group", Message: "this Node's table was out of date; nothing changed"})
+	case fsm.StatusMoving:
+		writeError(w, http.StatusServiceUnavailable, errorResponse{Reason: "moving", Message: "the key's Slot is being moved; nothing changed"})
+	case fsm.StatusCrossGroup:
+		writeError(w, http.StatusBadRequest, errorResponse{Reason: "cross_group", Message: "the keys are owned by more than one Group"})
 	default:
 		writeError(w, http.StatusBadRequest, errorResponse{Reason: "invalid"})
 	}

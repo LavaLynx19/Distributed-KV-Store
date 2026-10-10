@@ -112,7 +112,7 @@ func (n *Node) handleInstallSnapshot(out *core.Output, from core.NodeID, m Insta
 	}
 	if snap.Members != nil {
 		// The Snapshot's list is the one in force at its last Entry.
-		n.lists[0] = memberList{index: snap.Index, members: slices.Clone(snap.Members)}
+		n.lists[0] = memberList{index: snap.MembersAt, members: slices.Clone(snap.Members)}
 		n.changed = true
 	}
 	n.members = n.lists[len(n.lists)-1].members

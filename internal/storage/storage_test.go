@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"testing"
 
 	"distributed-kv-store/internal/core"
@@ -346,5 +347,98 @@ func TestForceMembersClearsTheDamageMark(t *testing.T) {
 	}
 	if _, stored, err := OpenFS(fs, "d", 0); err != nil || stored.Damaged || stored.Forced == nil {
 		t.Fatalf("after forcing: %+v, %v; want no damage mark and the forced list", stored, err)
+	}
+}
+
+// Several Stores on one SharedSyncFS all get their syncs, and what they
+// stored is there after a restart.
+func TestSharedSyncFS(t *testing.T) {
+	root := t.TempDir()
+	fs, err := NewSharedSyncFS(filepath.Join(root, "barrier"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const stores, rounds = 4, 20
+	done := make(chan error, stores)
+	for i := range stores {
+		go func() {
+			s, _, err := OpenWith(fs, filepath.Join(root, strconv.Itoa(i)), Options{})
+			for r := 0; err == nil && r < rounds; r++ {
+				err = s.Save(&core.Persist{Entries: es(core.Index(r+1), core.Index(r+1), 1)})
+			}
+			if err == nil {
+				err = s.Close()
+			}
+			done <- err
+		}()
+	}
+	for range stores {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range stores {
+		_, stored, err := Open(filepath.Join(root, strconv.Itoa(i)), 0)
+		if err != nil || len(stored.Entries) != rounds {
+			t.Fatalf("store %d: %d Entries after reopening, %v; want %d", i, len(stored.Entries), err, rounds)
+		}
+	}
+}
+
+// A Node that stops being a Member drops the Group's data and keeps its
+// Term and vote.
+func TestDropDataKeepsTermAndVote(t *testing.T) {
+	fs := NewMemFS()
+	s, _, err := OpenWith(fs, "d", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hard := core.HardState{Term: 7, VotedFor: 3}
+	p := &core.Persist{HardState: &hard, Entries: []core.Entry{{Index: 1, Term: 7, Kind: core.EntryCommand, Payload: []byte("x")}}}
+	if err := s.Save(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(&core.Persist{Snapshot: &core.Snapshot{Index: 1, Term: 7, Data: []byte("s")}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := DropData(fs, "d", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	fs.Crash(nil, false)
+	_, stored, err := OpenWith(fs, "d", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.HardState != hard || stored.Snapshot != nil || len(stored.Entries) != 0 || stored.Damaged {
+		t.Fatalf("after dropping: %+v", stored)
+	}
+}
+
+// The same on a real directory, where the Log is a directory of its own.
+func TestDropDataOnARealDisk(t *testing.T) {
+	dir := t.TempDir()
+	s, _, err := Open(dir, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hard := core.HardState{Term: 3, VotedFor: 2}
+	if err := s.Save(&core.Persist{HardState: &hard, Entries: []core.Entry{{Index: 1, Term: 3, Kind: core.EntryCommand, Payload: []byte("x")}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := DropData(OSFS{}, dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	_, stored, err := Open(dir, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.HardState != hard || len(stored.Entries) != 0 {
+		t.Fatalf("after dropping: %+v", stored)
 	}
 }
