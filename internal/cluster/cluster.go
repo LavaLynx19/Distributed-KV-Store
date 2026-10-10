@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"slices"
 
+	"distributed-kv-store/internal/automation"
 	"distributed-kv-store/internal/core"
 	"distributed-kv-store/internal/fsm"
 	"distributed-kv-store/internal/gossip"
@@ -138,23 +139,19 @@ type node struct {
 	side     int
 	// gossip is this Node's gossip, if the store uses it.
 	gossip *gossip.Node
-	// deadSince is when this Node's gossip gave each Node up for dead, and
+	// watch is how long this Node's gossip has thought each Node dead, and
 	// report what it tells the others (replace.go). asking is when it last
 	// asked a Group whether a replica it holds is still wanted.
-	deadSince map[int]int64
-	report    shard.Report
-	asking    map[shard.GroupID]int64
+	watch  automation.Watch
+	report shard.Report
+	asking map[shard.GroupID]int64
 	// counts is the load each Slot has put on this Node since loadAt, and
-	// smooth its smoothed load (balance.go).
-	counts []uint32
-	smooth []float64
-	loadAt int64
-	// What the Meta Leader on this Node remembers between looks at the
-	// load: the Term it began in, when, and whether it is between the two
-	// lines on the way down.
-	balanceTerm  core.Term
-	balanceSince int64
-	balancing    bool
+	// meter smooths it (balance.go). balancer is what the Meta Leader on
+	// this Node remembers between looks at the load.
+	counts   []uint32
+	meter    automation.Meter
+	loadAt   int64
+	balancer automation.Balancer
 }
 
 // Cluster is one simulated store.

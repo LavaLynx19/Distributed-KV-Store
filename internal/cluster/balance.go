@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"distributed-kv-store/internal/automation"
 	"distributed-kv-store/internal/core"
 	"distributed-kv-store/internal/fsm"
 	"distributed-kv-store/internal/meta"
@@ -34,26 +35,22 @@ type Balancing struct {
 	Weight float64
 }
 
-func (b Balancing) lines() (high, low float64) {
-	high, low = b.High, b.Low
-	if high == 0 {
-		high = 1.5
+// rules fills in the defaults.
+func (b Balancing) rules() automation.Balancing {
+	r := automation.Balancing{Naive: b.Naive, High: b.High, Low: b.Low, Rest: b.Rest, Settle: b.Settle, Idle: idleLoad}
+	if r.High == 0 {
+		r.High = 1.5
 	}
-	if low == 0 {
-		low = 1.2
+	if r.Low == 0 {
+		r.Low = 1.2
 	}
-	return high, low
-}
-
-func (b Balancing) waits() (rest, settle int64) {
-	rest, settle = b.Rest, b.Settle
-	if rest == 0 {
-		rest = 1000
+	if r.Rest == 0 {
+		r.Rest = 1000
 	}
-	if settle == 0 {
-		settle = 500
+	if r.Settle == 0 {
+		r.Settle = 500
 	}
-	return rest, settle
+	return r
 }
 
 const (
@@ -74,7 +71,7 @@ func (c *Cluster) count(nd *node, cmd fsm.Command) {
 		return
 	}
 	if nd.counts == nil {
-		nd.counts, nd.smooth = make([]uint32, c.cfg.Slots), make([]float64, c.cfg.Slots)
+		nd.counts = make([]uint32, c.cfg.Slots)
 	}
 	cost := uint32(shard.WriteCost)
 	key := cmd.Key
@@ -92,7 +89,7 @@ func (c *Cluster) count(nd *node, cmd fsm.Command) {
 // nothing, like a Group's new Leader: its figures build up from zero.
 func (c *Cluster) measure(nd *node) {
 	if nd.counts == nil {
-		nd.counts, nd.smooth = make([]uint32, c.cfg.Slots), make([]float64, c.cfg.Slots)
+		nd.counts = make([]uint32, c.cfg.Slots)
 	}
 	now := c.S.Now()
 	if now-nd.loadAt < loadWindow {
@@ -103,173 +100,57 @@ func (c *Cluster) measure(nd *node) {
 	if weight == 0 {
 		weight = loadWeight
 	}
-	load := make([]uint32, c.cfg.Slots)
-	any := false
-	for s, n := range nd.counts {
-		nd.smooth[s] += weight * (float64(n) - nd.smooth[s])
-		nd.counts[s] = 0
-		r := Replica(nd.id, nd.table.Slots[s].Group)
-		if !c.hosts(nd.id, nd.table.Slots[s].Group) || !c.S.Up(r) || c.S.Status(r).Role != core.LeaderRole {
-			continue
-		}
-		load[s] = uint32(nd.smooth[s] + 0.5)
-		if c.cfg.Balancing.Naive {
-			load[s] = n
-		}
-		any = any || load[s] > 0
-	}
-	nd.report.Load = nil
-	if any {
-		nd.report.Load = load
-	}
+	nd.meter.Fold(nd.counts, weight)
+	clear(nd.counts)
+	nd.report.Load = nd.meter.Load(func(s int) bool {
+		g := nd.table.Slots[s].Group
+		r := Replica(nd.id, g)
+		return c.hosts(nd.id, g) && c.S.Up(r) && c.S.Status(r).Role == core.LeaderRole
+	}, c.cfg.Balancing.Naive)
 }
 
-// balance is the Meta Leader's part in evening out load (A§11.11). It
-// works out each Group's load from what gossip has brought, and may ask for
-// one Move. The request goes through the Meta Group's Log like any other, so
-// a wrong picture costs a Move that wasn't needed and nothing else.
-//
-// What damps it:
-//   - one Move at a time across the store, and none for a while after one
-//     finishes, until the figures have caught up with it;
-//   - a Slot that has moved rests;
-//   - the figures are smoothed, and a new Leader waits until it has heard
-//     enough of them;
-//   - nothing while a Node of some Group is suspected, or being replaced;
-//   - two lines, so that a Group near the line doesn't start and stop;
-//   - a Slot is moved only if it is no more than half the gap between the
-//     two Groups, so that they can't swap places.
-//
-// The first two are read from the table, so a new Leader forgets neither.
+// balance is the Meta Leader's part in evening out load (A§11.11): it asks
+// for the Move automation.Balancer picks, if any. The request goes through
+// the Meta Group's Log like any other.
 func (c *Cluster) balance(nd *node, r core.NodeID, st core.Status) {
-	b := c.cfg.Balancing
-	if !b.Move || nd.gossip == nil {
+	if !c.cfg.Balancing.Move || nd.gossip == nil {
 		return
 	}
 	table := c.S.Machine(r).(*meta.Machine).Table()
-	load := c.Load(nd.id)
-	sums := GroupLoad(table, load, c.cfg.Groups)
-	var total uint64
-	busiest, idlest := 1, 1
-	for g := 1; g <= c.cfg.Groups; g++ {
-		total += sums[g]
-		if sums[g] > sums[busiest] {
-			busiest = g
-		}
-		if sums[g] < sums[idlest] {
-			idlest = g
+	healthy := true
+	for _, row := range table.Groups {
+		for _, n := range row.Members {
+			healthy = healthy && nd.gossip.Alive(n)
 		}
 	}
-	mean := float64(total) / float64(c.cfg.Groups)
-	high, low := b.lines()
-	if total < uint64(c.cfg.Groups)*idleLoad || busiest == idlest {
-		return // nothing worth moving a Slot for
-	}
-	move := func(slot int) {
-		cmd := meta.Command{Op: meta.OpMove, Slot: shard.Slot(slot), To: shard.GroupID(idlest)}.Encode()
+	slot, to, ok := nd.balancer.Decide(c.cfg.Balancing.rules(), table, c.Load(nd.id), c.cfg.Groups, st.Term, c.S.Now(), healthy)
+	if ok {
+		cmd := meta.Command{Op: meta.OpMove, Slot: slot, To: to}.Encode()
 		c.S.Propose(r, cmd, func(sim.Reply) {})
 	}
-	if b.Naive {
-		if float64(sums[busiest]) <= high*mean {
-			return
-		}
-		slot := -1
-		for s, o := range table.Slots {
-			if int(o.Group) == busiest && o.MovingTo == 0 && (slot < 0 || load[s] > load[slot]) {
-				slot = s
-			}
-		}
-		if slot >= 0 {
-			move(slot)
-		}
-		return
-	}
-
-	rest, settle := b.waits()
-	if nd.balanceTerm != st.Term {
-		// A new Leader has heard nothing it can trust yet.
-		nd.balanceTerm, nd.balanceSince, nd.balancing = st.Term, c.S.Now(), false
-	}
-	if c.S.Now()-nd.balanceSince < settle {
-		return
-	}
-	for _, o := range table.Slots {
-		if o.MovingTo != 0 || o.MovedAt != 0 && table.StoreTime-o.MovedAt < settle {
-			return
-		}
-	}
-	for _, row := range table.Groups {
-		if row.Add != 0 {
-			return
-		}
-		for _, n := range row.Members {
-			if !nd.gossip.Alive(n) {
-				return
-			}
-		}
-	}
-	switch share := float64(sums[busiest]) / mean; {
-	case share > high:
-		nd.balancing = true
-	case share < low:
-		nd.balancing = false
-	}
-	if !nd.balancing {
-		return
-	}
-	// The Slot to move is the biggest that is no more than half the gap
-	// between the two Groups: it leaves the busier one still the busier, so
-	// no Move can undo another.
-	gap := sums[busiest] - sums[idlest]
-	slot := -1
-	for s, o := range table.Slots {
-		l := uint64(load[s])
-		if int(o.Group) != busiest || l == 0 || 2*l > gap || o.MovedAt != 0 && table.StoreTime-o.MovedAt < rest {
-			continue
-		}
-		if slot < 0 || load[s] > load[slot] {
-			slot = s
-		}
-	}
-	if slot >= 0 {
-		move(slot)
-	}
 }
 
-// Load is the load of each Slot as Node n has heard it by gossip: the most
-// any Node it thinks alive reports for the Slot. Only a Group's Leader
-// reports anything for a Slot, so this is the Leader's figure.
+// Load is the load of each Slot as Node n has heard it by gossip
+// (automation.MergeLoad). A Node it thinks is gone has no say.
 func (c *Cluster) Load(n int) []uint32 {
 	nd := c.nodes[n]
-	load := make([]uint32, c.cfg.Slots)
 	if nd.gossip == nil {
-		return load
+		return make([]uint32, c.cfg.Slots)
 	}
+	var reports []shard.Report
 	for _, m := range nd.gossip.Members() {
-		report := nd.report
-		if m.ID != nd.id {
-			if !nd.gossip.Alive(m.ID) {
-				continue
-			}
-			report, _ = shard.DecodeReport(m.Note)
-		}
-		for s, l := range report.Load {
-			if s < len(load) && l > load[s] {
-				load[s] = l
-			}
+		switch {
+		case m.ID == nd.id:
+			reports = append(reports, nd.report)
+		case nd.gossip.Alive(m.ID):
+			report, _ := shard.DecodeReport(m.Note)
+			reports = append(reports, report)
 		}
 	}
-	return load
+	return automation.MergeLoad(c.cfg.Slots, reports)
 }
 
-// GroupLoad adds a per-Slot load up by the Group the table gives each Slot
-// to. The Meta Group, at index 0, has none.
+// GroupLoad adds a per-Slot load up by Group (automation.GroupLoad).
 func GroupLoad(table shard.Table, load []uint32, groups int) []uint64 {
-	sums := make([]uint64, groups+1)
-	for s, o := range table.Slots {
-		if int(o.Group) < len(sums) && s < len(load) {
-			sums[o.Group] += uint64(load[s])
-		}
-	}
-	return sums
+	return automation.GroupLoad(table, load, groups)
 }

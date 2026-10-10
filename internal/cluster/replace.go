@@ -3,6 +3,7 @@ package cluster
 import (
 	"slices"
 
+	"distributed-kv-store/internal/automation"
 	"distributed-kv-store/internal/core"
 	"distributed-kv-store/internal/fsm"
 	"distributed-kv-store/internal/gossip"
@@ -109,22 +110,15 @@ func (c *Cluster) replaceDead(nd *node, r core.NodeID) {
 		return
 	}
 	table := c.S.Machine(r).(*meta.Machine).Table()
-	for _, out := range c.dead(nd, table) {
-		wanted := false
-		for _, row := range table.Groups {
-			in := slices.Contains(row.Members, out)
-			wanted = wanted || in && row.Add == 0 || !in && row.Add == out
+	var alive []int
+	for _, m := range nd.gossip.Members() {
+		if m.Status == gossip.Alive {
+			alive = append(alive, m.ID)
 		}
-		if !wanted {
-			continue
-		}
-		in := spare(nd, table)
-		if in == 0 {
-			return
-		}
+	}
+	if out, in, ok := automation.Replacement(table, c.dead(nd, table), alive); ok {
 		cmd := meta.Command{Op: meta.OpReplace, Out: out, In: in}.Encode()
 		c.S.Propose(r, cmd, func(sim.Reply) {})
-		return
 	}
 }
 
@@ -143,40 +137,33 @@ func (c *Cluster) noteReplacements(t shard.Table) {
 }
 
 // dead lists the Nodes the Meta Leader on Node nd may replace, ascending:
-// those that a Majority of the Meta Group's Members report having thought
-// dead for longer than the wait (A§11.11). A Meta Member this Node thinks is
-// gone has no say: what it last said is old.
+// those a Majority of the Meta Group's Members report (automation.Dead). A
+// Meta Member this Node thinks is gone has no say: what it last said is old.
 func (c *Cluster) dead(nd *node, table shard.Table) []int {
-	var out []int
 	if c.cfg.Replacing.OneWord {
-		for _, m := range nd.gossip.Members() {
-			if m.Status == gossip.Dead {
-				out = append(out, m.ID)
-			}
-		}
-		return out
+		return nd.detectorDead()
 	}
-	said := map[int]int{}
-	voters := table.Hosts(shard.Meta)
-	for _, m := range voters {
-		report := nd.report
-		if m != nd.id {
-			if !nd.gossip.Alive(m) {
-				continue
-			}
-			report, _ = shard.DecodeReport(nd.gossip.Note(m))
+	return automation.Dead(table.Hosts(shard.Meta), func(n int) (shard.Report, bool) {
+		if n == nd.id {
+			return nd.report, true
 		}
-		for _, n := range report.Dead {
-			said[n]++
+		if !nd.gossip.Alive(n) {
+			return shard.Report{}, false
 		}
-	}
-	for n, votes := range said {
-		if votes > len(voters)/2 {
-			out = append(out, n)
+		report, _ := shard.DecodeReport(nd.gossip.Note(n))
+		return report, true
+	})
+}
+
+// detectorDead lists the Nodes this Node's own gossip gives up for dead.
+func (nd *node) detectorDead() []int {
+	var dead []int
+	for _, m := range nd.gossip.Members() {
+		if m.Status == gossip.Dead {
+			dead = append(dead, m.ID)
 		}
 	}
-	slices.Sort(out)
-	return out
+	return dead
 }
 
 // report works out what Node nd tells the others about itself, and puts it
@@ -190,19 +177,7 @@ func (c *Cluster) report(nd *node) {
 		if wait == 0 {
 			wait = deadWait
 		}
-		now := c.S.Now()
-		nd.report.Dead = nil
-		for _, m := range nd.gossip.Members() {
-			since, held := nd.deadSince[m.ID]
-			switch {
-			case m.Status != gossip.Dead:
-				delete(nd.deadSince, m.ID)
-			case !held:
-				nd.deadSince[m.ID] = now
-			case now-since >= wait:
-				nd.report.Dead = append(nd.report.Dead, m.ID)
-			}
-		}
+		nd.report.Dead = nd.watch.Held(c.S.Now(), wait, nd.detectorDead())
 	}
 	if c.cfg.Balancing.On {
 		told = true
@@ -231,7 +206,7 @@ func (c *Cluster) askIfGone(nd *node, g shard.GroupID) {
 		if !nd.up || !c.hosts(nd.id, g) || !c.S.Up(me) {
 			return
 		}
-		if mine := c.S.Status(me); !slices.Contains(st.Members, me) && mine.MembersAt <= st.MembersAt {
+		if automation.Gone(me, c.S.Status(me), st) {
 			c.drop(nd, g)
 		}
 	}
@@ -277,22 +252,4 @@ func (c *Cluster) askIfGone(nd *node, g shard.GroupID) {
 		target = others[c.S.Rand().IntN(len(others))]
 	}
 	try(target, true)
-}
-
-// spare picks a Node to give replicas to: the lowest-numbered one that
-// seems alive and that the table has in no Group and on its way into none.
-func spare(nd *node, table shard.Table) int {
-	for _, m := range nd.gossip.Members() {
-		if m.Status != gossip.Alive {
-			continue
-		}
-		free := true
-		for _, row := range table.Groups {
-			free = free && !slices.Contains(row.Members, m.ID) && row.Add != m.ID
-		}
-		if free {
-			return m.ID
-		}
-	}
-	return 0
 }

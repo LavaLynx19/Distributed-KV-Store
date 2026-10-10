@@ -3,6 +3,7 @@ package cluster
 import (
 	"slices"
 
+	"distributed-kv-store/internal/automation"
 	"distributed-kv-store/internal/core"
 	"distributed-kv-store/internal/fsm"
 	"distributed-kv-store/internal/meta"
@@ -51,43 +52,19 @@ func (c *Cluster) agent(nd *node) {
 	}
 }
 
-// changeMembers is the part of a Group's Leader in a Membership change the
-// Meta Group wants (A§11.11). It adds the Node to add, then removes the Node
-// to remove, one change at a time (A§6.5), and tells the Meta Group whenever
-// the Group's Committed Member list isn't the one in the table. It acts on a
-// wish only when the table is up to date with the Group's list, so that a
-// table from before some later change can't make it repeat an old one.
+// changeMembers does what automation.Members says the Leader of Group g, on
+// Node nd, should do next about its Members.
 func (c *Cluster) changeMembers(nd *node, g shard.GroupID, st core.Status) {
-	if int(g) < len(nd.table.Groups) && st.Learner != 0 && st.Learner != Replica(nd.table.Groups[g].Add, g) && !c.cfg.GossipDecides.Members {
-		// The Node being brought up to date is no longer the one wanted:
-		// the Meta Group has since given it up for dead too. Call it off.
-		c.S.Reconfigure(Replica(nd.id, g), st.Members, func(sim.Reply) {})
-		return
-	}
-	if int(g) >= len(nd.table.Groups) || st.Changing || c.cfg.GossipDecides.Members {
+	if int(g) >= len(nd.table.Groups) || c.cfg.GossipDecides.Members {
 		return // in stage 7b's naive store no Log says who a Group's Members are
 	}
-	row := nd.table.Groups[g]
-	var now []int
-	for _, m := range st.Members {
-		now = append(now, NodeOf(m))
+	step := automation.Members(g, nd.table.Groups[g], st)
+	if step.Report != nil {
+		report := step.Report.Encode()
+		c.ask(nd.id, shard.Meta, false, func(int64) []byte { return report }, func(Outcome, []byte) {})
 	}
-	if !slices.Equal(now, row.Members) || uint64(st.MembersAt) != row.At {
-		if uint64(st.MembersAt) > row.At {
-			report := meta.Command{Op: meta.OpMembers, To: g, Members: now, At: uint64(st.MembersAt)}.Encode()
-			c.ask(nd.id, shard.Meta, false, func(int64) []byte { return report }, func(Outcome, []byte) {})
-		}
-		return
-	}
-	r := Replica(nd.id, g)
-	switch {
-	case row.Add != 0 && !slices.Contains(now, row.Add):
-		next := append(slices.Clone(st.Members), Replica(row.Add, g))
-		slices.Sort(next)
-		c.S.Reconfigure(r, next, func(sim.Reply) {})
-	case row.Add != 0 && slices.Contains(now, row.Remove):
-		next := slices.DeleteFunc(slices.Clone(st.Members), func(m core.NodeID) bool { return m == Replica(row.Remove, g) })
-		c.S.Reconfigure(r, next, func(sim.Reply) {})
+	if step.Reconfigure != nil {
+		c.S.Reconfigure(Replica(nd.id, g), step.Reconfigure, func(sim.Reply) {})
 	}
 }
 

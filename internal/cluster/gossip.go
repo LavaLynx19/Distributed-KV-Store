@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 
+	"distributed-kv-store/internal/automation"
 	"distributed-kv-store/internal/core"
 	"distributed-kv-store/internal/gossip"
 	"distributed-kv-store/internal/meta"
@@ -38,7 +39,7 @@ func (c *Cluster) newGossip(nd *node) {
 		cfg.Seeds = []gossip.Member{{ID: 1, Peer: address(1), Client: address(1)}}
 	}
 	nd.gossip = gossip.New(cfg)
-	nd.deadSince, nd.asking, nd.report = map[int]int64{}, map[shard.GroupID]int64{}, shard.Report{}
+	nd.watch, nd.asking, nd.report = automation.Watch{}, map[shard.GroupID]int64{}, shard.Report{}
 }
 
 // startGossip starts every Node's gossip rounds.
