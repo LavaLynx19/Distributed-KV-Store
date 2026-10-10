@@ -14,7 +14,7 @@ import (
 )
 
 // purePackages are checked when they exist. internal/core always does.
-var purePackages = []string{"core", "naive", "raft", "fsm", "tree"}
+var purePackages = []string{"core", "naive", "raft", "fsm", "tree", "shard", "meta", "shardfsm"}
 
 // forbidden import paths, and every package beneath them.
 var forbidden = []string{"time", "net", "os", "sync", "math/rand"}
