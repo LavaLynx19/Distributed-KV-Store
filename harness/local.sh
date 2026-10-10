@@ -25,6 +25,9 @@
 #
 # DATA_GROUPS=3 on "start" runs a store with that many data Groups and a Meta
 # Group, each on 3 of the Nodes (A§11). SLOTS sets the number of Slots.
+# A Spare for such a store is started with "join", and restarted the same way.
+# The store replaces dead Nodes and moves Slots off busy Groups by itself
+# unless KVNODE_FLAGS has -auto=false (A§11.11).
 #
 # Logs and pid files go to harness/out/local/.
 set -euo pipefail

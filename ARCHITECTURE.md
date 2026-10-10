@@ -321,10 +321,12 @@ In a store with several Groups (§11) the admin calls are instead:
 
 | Method and path | Purpose |
 |---|---|
-| `GET /v1/table` | The Slot table: for each Slot its Group, Epoch and, if a Move is under way, where it is going |
+| `GET /v1/table` | The Slot table: for each Slot its Group, Epoch, load as this Node has heard it and, if a Move is under way, where it is going; for each Group the Nodes its Members are on, its share of the load and, if a Node is being replaced, which and by which |
 | `POST /v1/admin/moves` | Ask for a Move: `{"slot": 3, "to": 2}`. Answers once the intent is Committed; the Move then proceeds by itself, and `GET /v1/table` shows when it is done |
 
-`kvctl table` and `kvctl move <slot> <group>` wrap these. Membership changes within a Group of such a store are not offered yet (stage 7c).
+`kvctl table` and `kvctl move <slot> <group>` wrap these. The Members of a Group of such a store are changed by the store itself (§11.11): there is no call to add or remove one.
+
+Between Nodes, `GET /v1/internal/members/{g}` asks a Node's replica of Group g who the Group's Members are. Only a Leader that has just confirmed it still leads answers with a list.
 
 ### 7.4 Debug (harness only)
 | Method and path | Purpose |
@@ -497,6 +499,13 @@ Details confirmed with the user at P7c.0.
   - A replica that joined a Group, or was dropped, is marked so on its disk and never starts out believing it is a Member, whatever table its Node holds.
   - A Node that restarts holds the table the store was founded with until gossip tells it more. The Simulation now models this; it is what exposed the naive store.
   - A Group whose Majority is on the far side of a Partition can't be changed until the network heals. A change still wanted for it then is carried out, even if the Node to be removed is back.
+  - A Node that says it is leaving counts as gone, like one given up for dead: after the wait it is replaced.
+- **As built (the real shell).**
+  - `kvnode -auto` (on by default) turns replacement and rebalancing on, and `-dead-wait` sets the wait (default 5 s). Gossip gives a Node up 2.5 s after it was last heard from, so a Node is replaced about 7.5 s after it stops.
+  - A Node keeps beside each replica's directory a mark saying whether the replica joined its Group late or was dropped. A dropped replica isn't started again when the Node restarts.
+  - Replication finds a Node that joined later by the address gossip brought (§11.10).
+  - The Node whose replica answers a request counts it. Load is folded every half second; a Move is followed by 2.5 s with no other, and a moved Slot rests 5 s: the Simulation's waits in the same proportion to the window.
+  - The decisions themselves are `internal/automation`, a pure package the Simulation and the real shell both call.
 
 ### 11.12 Verification
 - **Linearizability** is checked per key over the whole store, as before: a History doesn't care which Group answered.
