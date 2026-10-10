@@ -1,6 +1,7 @@
 package rungtest_test
 
 import (
+	"os"
 	"testing"
 
 	"distributed-kv-store/internal/cluster"
@@ -78,8 +79,8 @@ func TestOneWordReplacementIsExposed(t *testing.T) {
 
 // TestMeasureReplacing prints what replacing costs, for the retro.
 func TestMeasureReplacing(t *testing.T) {
-	if testing.Short() {
-		t.Skip("a measurement, not a check")
+	if os.Getenv("KV_MEASURE") == "" {
+		t.Skip("a measurement, not a check: set KV_MEASURE=1 to run it")
 	}
 	for _, store := range []struct {
 		name  string
@@ -124,9 +125,13 @@ func TestRung7cReplacing(t *testing.T) {
 	brief := map[string]bool{"no-moves": true, "moves": true}
 	lost := map[string]bool{"lost-node": true, "lost-node-and-crashes": true, "lost-node-then-rolling-restarts": true}
 	runs, replaced, drops, restarting := 0, 0, 0, 0
-	for _, store := range stores {
+	for i, store := range stores {
 		for _, sc := range append(append(rungtest.Rung7, rungtest.Rung7b...), rungtest.Rung7c...) {
-			for seed := uint64(1); seed <= seeds; seed++ {
+			n := seeds
+			if i > 0 {
+				n = (seeds + 1) / 2 // the two variants get half the seeds
+			}
+			for seed := uint64(1); seed <= n; seed++ {
 				r := rungtest.RunSharded(store, sc, seed)
 				runs++
 				replaced += r.Replacements

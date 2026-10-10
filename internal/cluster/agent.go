@@ -32,6 +32,7 @@ func (c *Cluster) agent(nd *node) {
 		c.changeMembers(nd, g, st)
 		if g == shard.Meta {
 			c.replaceDead(nd, r)
+			c.balance(nd, r, st)
 			// The Meta Leader's clock is the store's clock (A§11.7).
 			if now := c.S.Now(); now-nd.lastTick >= tickEvery {
 				nd.lastTick = now

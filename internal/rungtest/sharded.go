@@ -36,6 +36,8 @@ type ShardedStore struct {
 	GossipDecides struct{ Ownership, Members bool }
 	// Replacing is how dead Nodes are replaced (cluster.Config).
 	Replacing cluster.Replacing
+	// Balancing is how load is evened out (cluster.Config).
+	Balancing cluster.Balancing
 }
 
 // ShardedScenario injects Faults, and asks for Moves, between times from
@@ -56,7 +58,7 @@ func RunSharded(store ShardedStore, sc ShardedScenario, seed uint64) Report {
 		SessionTTL: store.SessionTTL, Unchecked: store.Unchecked, FlipAtOnce: store.FlipAtOnce,
 		Gossip: store.Gossip, Spares: store.Spares, GossipLoss: store.GossipLoss,
 		SuspectAfter: store.SuspectAfter, DeadAfter: store.DeadAfter,
-		GossipDecides: store.GossipDecides, Replacing: store.Replacing,
+		GossipDecides: store.GossipDecides, Replacing: store.Replacing, Balancing: store.Balancing,
 	})
 	h := &check.History{}
 	rep := Report{Scenario: sc.Name, Seed: seed, Members: store.Nodes, History: h}
@@ -70,6 +72,24 @@ func RunSharded(store ShardedStore, sc ShardedScenario, seed uint64) Report {
 			c.RestartNode(n)
 		}
 	})
+	if store.Balancing.On {
+		c.S.At(faultsEnd+cooldown/3-1, func() {
+			for _, n := range c.NodeIDs() {
+				if !c.NodeUp(n) {
+					continue
+				}
+				sums := cluster.GroupLoad(c.Table(n), c.Load(n), store.Groups)[1:]
+				var total uint64
+				for _, l := range sums {
+					total += l
+				}
+				if total > 0 {
+					rep.Busiest = float64(slices.Max(sums)) * float64(len(sums)) / float64(total)
+				}
+				return
+			}
+		})
+	}
 	watchOwners(c, &rep, faultsEnd+cooldown)
 	func() {
 		defer func() {
@@ -91,6 +111,7 @@ func RunSharded(store ShardedStore, sc ShardedScenario, seed uint64) Report {
 	rep.MovesAsked, rep.MovesTaken = c.MovesAsked, c.MovesTaken
 	rep.Diverged = append(rep.Diverged, c.GossipAgrees()...)
 	rep.TableLags, rep.GossipSent = c.TableLags, c.GossipSent
+	rep.MovedAt = c.MovedAt
 	rep.Replacements, rep.Drops = len(c.Replacements), len(c.Drops)
 	for _, r := range c.Replacements {
 		if r.Running {

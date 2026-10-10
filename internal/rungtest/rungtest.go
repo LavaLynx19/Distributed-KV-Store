@@ -119,6 +119,11 @@ type Report struct {
 	// replica as a Member (A§11.11).
 	Replacements, ReplacedRunning, Drops int
 	WrongDrop                            string
+	// MovedAt is when each Move finished. Busiest is the busiest Group's
+	// load over the mean of the Groups' loads, as the clients were about to
+	// stop, or 0 if load isn't measured (A§11.11).
+	MovedAt []int64
+	Busiest float64
 
 	verdict check.Verdict
 }

@@ -383,7 +383,7 @@ func TestLoadIsCountedAndGossiped(t *testing.T) {
 		Balancing: cluster.Balancing{On: true},
 	})
 	w := cluster.DefaultWorkload
-	w.Skew.Percent, w.Skew.Keys = 80, 2
+	w.Skew.Percent, w.Skew.Sets = 80, [][]string{{"k0", "k1"}}
 	w.Start(c, &check.History{}, 3000)
 	c.S.Run(3000)
 

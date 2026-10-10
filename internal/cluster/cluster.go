@@ -149,6 +149,12 @@ type node struct {
 	counts []uint32
 	smooth []float64
 	loadAt int64
+	// What the Meta Leader on this Node remembers between looks at the
+	// load: the Term it began in, when, and whether it is between the two
+	// lines on the way down.
+	balanceTerm  core.Term
+	balanceSince int64
+	balancing    bool
 }
 
 // Cluster is one simulated store.
@@ -185,6 +191,10 @@ type Cluster struct {
 	// joiner marks the replicas that didn't found their Group. It stands
 	// for a mark on the replica's disk: it outlives a crash.
 	joiner map[core.NodeID]bool
+
+	// MovedAt is when each Move that finished did so.
+	MovedAt []int64
+	moved   int
 
 	// sets is the Partition in force, by machine, or nil.
 	sets [][]int

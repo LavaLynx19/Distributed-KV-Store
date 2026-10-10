@@ -55,6 +55,13 @@ func (c *Cluster) applied(id core.NodeID, index core.Index, m sim.Machine) {
 			if _, seen := c.versionAt[t.Version]; !seen {
 				c.versionAt[t.Version] = c.S.Now()
 				c.noteReplacements(t)
+				moved := 0
+				for _, o := range t.Slots {
+					moved += int(o.Epoch)
+				}
+				for ; c.moved < moved; c.moved++ {
+					c.MovedAt = append(c.MovedAt, c.S.Now())
+				}
 			}
 		}
 		return
