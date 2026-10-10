@@ -207,6 +207,15 @@ func (n *Node) reconfigure(out *core.Output, ev core.Reconfigure) {
 		}
 	}
 	switch {
+	case len(added)+len(removed) == 0 && n.learner != 0:
+		// Asking for the list the Group already has, while a learner is
+		// catching up, calls the addition off. Nothing is in the Log yet,
+		// so there is nothing to undo.
+		out.Results = append(out.Results,
+			core.Result{Ref: n.learnerRef, Reason: core.NoCatchUp},
+			core.Result{Ref: ev.Ref, Reason: core.OK})
+		n.forget(n.learner)
+		n.learner, n.learnerRef = 0, 0
 	case len(want) == 0 || len(added)+len(removed) != 1:
 		refuse(core.Invalid)
 	case n.changing() || !n.ownTermCommitted():

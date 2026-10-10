@@ -38,6 +38,7 @@ func (c *Cluster) newGossip(nd *node) {
 		cfg.Seeds = []gossip.Member{{ID: 1, Peer: address(1), Client: address(1)}}
 	}
 	nd.gossip = gossip.New(cfg)
+	nd.deadSince, nd.asking, nd.report = map[int]int64{}, map[shard.GroupID]int64{}, shard.Report{}
 }
 
 // startGossip starts every Node's gossip rounds.
@@ -63,6 +64,7 @@ func (c *Cluster) gossipRound(nd *node) {
 	if r := Replica(nd.id, shard.Meta); c.hosts(nd.id, shard.Meta) && c.S.Up(r) {
 		nd.gossip.SetTable(c.S.Machine(r).(*meta.Machine).Table())
 	}
+	c.report(nd)
 	c.gossipSend(nd.gossip.Tick())
 	c.gossipLearn(nd)
 	if c.cfg.GossipDecides.Members {

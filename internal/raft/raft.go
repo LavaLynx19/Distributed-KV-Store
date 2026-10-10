@@ -241,7 +241,7 @@ func New(cfg Config) *Node {
 		n.commit, n.applied = snap.Index, snap.Index
 		if snap.Members != nil {
 			n.members, n.changed = slices.Clone(snap.Members), true
-			n.lists = []memberList{{index: snap.Index, members: n.members}}
+			n.lists = []memberList{{index: snap.MembersAt, members: n.members}}
 		}
 	}
 	n.log.entries = slices.Clone(cfg.Stored.Entries)
@@ -294,7 +294,7 @@ func (n *Node) appendEntry(out *core.Output, e core.Entry) {
 
 func (n *Node) Status() core.Status {
 	return core.Status{ID: n.id, Role: n.role, Term: n.term, Leader: n.leader, Commit: n.commit, Recovering: n.abstaining(), Members: slices.Clone(n.members),
-		MembersAt: n.lists[len(n.lists)-1].index, Changing: n.changing()}
+		MembersAt: n.lists[len(n.lists)-1].index, Changing: n.changing(), Learner: n.learner}
 }
 
 // abstaining reports whether the Member must stay out of elections.
@@ -522,6 +522,9 @@ func (n *Node) snapshotted(out *core.Output, s core.Snapshotted) {
 		return // older than what we have, or of Entries never handed over
 	}
 	snap := &core.Snapshot{Index: s.Index, Term: n.termAt(s.Index), Data: s.Data, Members: n.snapshotMembers(s.Index)}
+	if snap.Members != nil {
+		snap.MembersAt = n.listAt(s.Index).index
+	}
 	n.log.compactTo(s.Index)
 	n.foldListsTo(s.Index)
 	n.snapshot = snap

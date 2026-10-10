@@ -26,6 +26,7 @@
 package gossip
 
 import (
+	"bytes"
 	"slices"
 
 	"distributed-kv-store/internal/shard"
@@ -61,6 +62,11 @@ type Member struct {
 	Status      Status
 	// Counter is the Node's heartbeat, for the counters detector.
 	Counter uint64
+	// Note is whatever the Node wants every other Node to know about it,
+	// and NoteAt counts the times it has changed: the higher one is newer.
+	// Gossip carries it and makes nothing of it (A§11.11).
+	Note   []byte
+	NoteAt uint64
 }
 
 // Detector is how a Node notices that another has gone quiet.
@@ -241,6 +247,21 @@ func (n *Node) Alive(id int) bool {
 	return !known || n.status(e) == Alive
 }
 
+// SetNote replaces what this Node tells the others about itself.
+func (n *Node) SetNote(note []byte) {
+	if me := n.self(); !bytes.Equal(me.Note, note) {
+		me.Note, me.NoteAt = bytes.Clone(note), me.NoteAt+1
+	}
+}
+
+// Note is the latest Node id is known to have told the others, or nil.
+func (n *Node) Note(id int) []byte {
+	if e, known := n.members[id]; known {
+		return e.Note
+	}
+	return nil
+}
+
 // Table is the newest Slot table this Node has heard.
 func (n *Node) Table() shard.Table { return n.table.Clone() }
 
@@ -379,6 +400,11 @@ func (n *Node) merge(heard Member, direct bool) {
 		// badly of it, outrank them.
 		me := n.self()
 		me.Counter = max(me.Counter, heard.Counter)
+		// The same for its note: what it says now must outrank whatever it
+		// said before it restarted.
+		if heard.NoteAt > me.NoteAt || heard.NoteAt == me.NoteAt && !bytes.Equal(heard.Note, me.Note) {
+			me.NoteAt = heard.NoteAt + 1
+		}
 		if heard.Status != Alive && heard.Incarnation >= me.Incarnation {
 			me.Incarnation = heard.Incarnation + 1
 		} else if heard.Incarnation > me.Incarnation {
@@ -396,6 +422,9 @@ func (n *Node) merge(heard Member, direct bool) {
 	}
 	if heard.Counter > e.Counter {
 		e.Counter, e.heard = heard.Counter, n.round
+	}
+	if heard.NoteAt > e.NoteAt {
+		e.Note, e.NoteAt = heard.Note, heard.NoteAt
 	}
 	before := e.Status
 	switch {

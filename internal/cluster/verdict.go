@@ -49,10 +49,12 @@ type ownership struct {
 func (c *Cluster) applied(id core.NodeID, index core.Index, m sim.Machine) {
 	g := GroupOf(id)
 	if g == shard.Meta {
-		// Note when each table version first existed anywhere.
-		if v := m.(*meta.Machine).Table().Version; v != 0 {
-			if _, seen := c.versionAt[v]; !seen {
-				c.versionAt[v] = c.S.Now()
+		// Note when each table version first existed anywhere, and any
+		// replacement it was the first to want.
+		if t := m.(*meta.Machine).Table(); t.Version != 0 {
+			if _, seen := c.versionAt[t.Version]; !seen {
+				c.versionAt[t.Version] = c.S.Now()
+				c.noteReplacements(t)
 			}
 		}
 		return
@@ -215,6 +217,11 @@ func (c *Cluster) membersSettled(table shard.Table) []string {
 		var members []int
 		for _, r := range c.Members(g) {
 			members = append(members, NodeOf(r))
+			// Every Member knows the list by the same Entry, whatever
+			// Snapshots it has taken or been sent.
+			if at, want := c.S.Status(r).MembersAt, c.S.Status(c.Leader(g)).MembersAt; c.S.Up(r) && at != want {
+				diffs = append(diffs, fmt.Sprintf("Group %d: replica %d has the Member list as of Entry %d, the Leader as of %d", g, r, at, want))
+			}
 		}
 		if !slices.Equal(members, row.Members) {
 			diffs = append(diffs, fmt.Sprintf("Group %d: has Members %v, and the table says %v", g, members, row.Members))

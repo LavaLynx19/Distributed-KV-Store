@@ -229,6 +229,8 @@ One Member is added or removed per change, as a Log Entry that carries the whole
 
 **Adding.** A Node to be added runs first as a **Spare**: it knows the Group's Member list, isn't in it, and so never stands for election. Asked to add it, the Leader makes it a **Learner**: it is sent the Log (or the Snapshot) like a follower and counts toward nothing. When it holds everything Committed, the Leader appends the change. If it hasn't caught up within 20 election timeouts the Leader gives up, and nothing has changed.
 
+**Calling an addition off.** Asking the Leader for the list the Group already has, while a Learner is still catching up, ends the wait at once: nothing is in the Log yet, so there is nothing to undo. Rung 7c needs it when the Node being added is itself given up for dead (§11.11).
+
 **Removing.** The Leader appends the change and stops sending to the removed Member at once. A Leader may remove itself: it leads until the change is Committed, without counting itself toward the Majority, and then steps down.
 
 **A removed Member may never hear that it was removed**, and will then stand for election for ever. So a Member ignores a request for its vote from a Node that isn't in its list, and doesn't take that Node's Term either.
@@ -480,8 +482,15 @@ Details confirmed with the user at P7c.0.
 - **Load.** Each data Leader counts requests per Slot it owns: a write counts 1 and a read counts a fixed fraction, measured once on real processes and then built in. The count is smoothed over a window and rides on gossip. The Meta Leader decides from what it has heard; only the Move goes into a Log. A new Meta Leader has heard nothing and waits a window before it moves anything.
 - **Threshold.** Two lines. Rebalancing starts when the busiest Group carries more than the high line times the mean, and goes on, one Slot at a time from the busiest Group to the idlest, until it is under the low line. The lines start at 1.3 and 1.1 and are settled by measurement. A Slot is moved only if it is smaller than the gap between the two Groups.
 - **Damping.** One Move at a time across the store. A Slot that has moved rests for a set time. Decisions use the smoothed load. Nothing is rebalanced while a Node is suspected or a replacement is under way. The first two are read from the Slot table, so a change of Meta Leader forgets neither.
-- **A stuck Move** is never cancelled. If a Group in it loses its Majority, replacement brings the Group back and the Move finishes. With no Spare it stays stuck, blocks rebalancing, and shows in `kvctl table`.
+- **A stuck Move** is never cancelled. A Group that has lost a Member and kept its Majority carries on with the Move while the Member is replaced. A Group that has lost its Majority can do neither: it can't change its own Members, so replacement can't bring it back. The Move then waits until enough Members return or an operator runs Unsafe recovery (§6.6), blocks rebalancing meanwhile, and shows in `kvctl table`. As first written at P7c.0 this said replacement would bring such a Group back; that was wrong, and is to be confirmed with the user.
 - **Naive versions, built first:** one Meta Member's word replaces a Node with no wait; a returned Node drops its data on gossip's say-so; rebalancing acts on the latest report with one line and no damping.
+- **As built (replacing).**
+  - Each Group's row in the table carries the index, in the Group's own Log, of the Entry that set its Member list. A Group's Leader acts on a wish only when the table has caught up with the Group's list, and the Meta Group ignores a report older than the one it holds. Every replica must agree on that index, so a Snapshot now carries it.
+  - If the Node being added is given up for dead before it is a Member, the next Spare takes over the wish, and the Group's Leader calls the first addition off (§6.5).
+  - A Node drops a replica only when the Group's Leader, having confirmed it still leads, shows a Committed list without it that is no older than the list the replica holds. It keeps its Term and vote, so that if it is ever added to the same Group again it can't vote twice in one Term.
+  - A replica that joined a Group, or was dropped, is marked so on its disk and never starts out believing it is a Member, whatever table its Node holds.
+  - A Node that restarts holds the table the store was founded with until gossip tells it more. The Simulation now models this; it is what exposed the naive store.
+  - A Group whose Majority is on the far side of a Partition can't be changed until the network heals. A change still wanted for it then is carried out, even if the Node to be removed is back.
 
 ### 11.12 Verification
 - **Linearizability** is checked per key over the whole store, as before: a History doesn't care which Group answered.

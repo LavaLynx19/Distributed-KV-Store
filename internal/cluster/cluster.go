@@ -136,6 +136,12 @@ type node struct {
 	side     int
 	// gossip is this Node's gossip, if the store uses it.
 	gossip *gossip.Node
+	// deadSince is when this Node's gossip gave each Node up for dead, and
+	// report what it tells the others (replace.go). asking is when it last
+	// asked a Group whether a replica it holds is still wanted.
+	deadSince map[int]int64
+	report    shard.Report
+	asking    map[shard.GroupID]int64
 }
 
 // Cluster is one simulated store.
@@ -168,6 +174,10 @@ type Cluster struct {
 	// times a Node dropped a replica's data.
 	Replacements []Replaced
 	Drops        []Dropped
+	wanted       map[int][2]int // per Group, the change the newest table wants
+	// joiner marks the replicas that didn't found their Group. It stands
+	// for a mark on the replica's disk: it outlives a crash.
+	joiner map[core.NodeID]bool
 
 	// sets is the Partition in force, by machine, or nil.
 	sets [][]int
@@ -210,9 +220,19 @@ func (c *Cluster) Members(g shard.GroupID) []core.NodeID {
 // startMembers is the Member list a replica's core is started with: the one
 // in the table its Node holds. What the replica has in its own Log, once it
 // has anything, overrides it.
+//
+// A replica that was started to join a Group, or whose data was dropped, is
+// never in the list it starts with, whatever the table says. Its Node may
+// hold an old table that names it, and a replica with an empty Log that
+// took itself for a Member would stand for election and refuse the Leader
+// that is trying to bring it up to date.
 func (c *Cluster) startMembers(id core.NodeID) []core.NodeID {
 	g := GroupOf(id)
-	return replicasOn(g, c.nodes[NodeOf(id)].table.Hosts(g))
+	members := replicasOn(g, c.nodes[NodeOf(id)].table.Hosts(g))
+	if c.joiner[id] {
+		members = slices.DeleteFunc(members, func(m core.NodeID) bool { return m == id })
+	}
+	return members
 }
 
 // Groups lists every Group, the Meta Group first.
@@ -235,7 +255,7 @@ func (c *Cluster) NodeIDs() []int {
 
 // New builds the store and starts every Node's agent.
 func New(cfg Config) *Cluster {
-	c := &Cluster{cfg: cfg, nodes: map[int]*node{}, owned: map[shard.GroupID]ownership{}, versionAt: map[uint64]int64{}}
+	c := &Cluster{cfg: cfg, nodes: map[int]*node{}, owned: map[shard.GroupID]ownership{}, versionAt: map[uint64]int64{}, wanted: map[int][2]int{}, joiner: map[core.NodeID]bool{}}
 	start := meta.NewPlaced(cfg.Slots, cfg.Groups, cfg.Nodes, cfg.Replicas).Table()
 	var ids []core.NodeID
 	for n := 1; n <= cfg.Nodes+cfg.Spares; n++ {
@@ -350,6 +370,7 @@ func (c *Cluster) DestroyNode(n int) {
 func (c *Cluster) host(nd *node, g shard.GroupID) {
 	nd.groups = append(nd.groups, g)
 	slices.Sort(nd.groups)
+	c.joiner[Replica(nd.id, g)] = true
 	c.S.Add(Replica(nd.id, g))
 	if c.sets != nil {
 		c.PartitionNodes(c.sets...) // the new replica is on its Node's side

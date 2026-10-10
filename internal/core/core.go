@@ -56,8 +56,9 @@ type Snapshot struct {
 	Data  []byte
 	// Members is the Group's Member list as of Index, if a Membership
 	// change had been made by then. Nil means the list the Group started
-	// with.
-	Members []NodeID
+	// with. MembersAt is the Index of the Entry that set it.
+	Members   []NodeID
+	MembersAt Index
 }
 
 // Persist is the change a step makes to a Member's durable state. Its parts
@@ -314,9 +315,12 @@ type Status struct {
 	// the Group was founded with. Changing is set while a Membership change
 	// is under way: the list isn't Committed yet, or a Learner is catching
 	// up.
+	// Learner is the Node a Leader is bringing up to date before adding it,
+	// or 0.
 	Members   []NodeID
 	MembersAt Index
 	Changing  bool
+	Learner   NodeID
 }
 
 // Node is a consensus core. Step must be called from one goroutine at a

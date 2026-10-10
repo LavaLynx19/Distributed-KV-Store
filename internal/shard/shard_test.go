@@ -77,3 +77,15 @@ func TestHosts(t *testing.T) {
 		t.Errorf("replica id round trip gave Node %d, Group %d", n, g)
 	}
 }
+
+func TestReportRoundTrip(t *testing.T) {
+	for _, r := range []Report{{}, {Dead: []int{2, 5}}, {Load: []uint32{0, 7, 0, 300}}, {Dead: []int{1}, Load: []uint32{9}}} {
+		got, err := DecodeReport(r.Encode())
+		if err != nil || !reflect.DeepEqual(got, r) {
+			t.Errorf("round trip of %+v gave %+v, %v", r, got, err)
+		}
+	}
+	if _, err := DecodeReport([]byte{3, 1}); err == nil {
+		t.Error("accepted a Report cut short")
+	}
+}

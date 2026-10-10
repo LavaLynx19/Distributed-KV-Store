@@ -832,12 +832,13 @@ const withMembers = 1 << 63
 // the Term's top bit is set and the list comes between the two: a 4-byte
 // count, then 8 bytes per Member.
 func encodeSnapshot(snap *core.Snapshot) []byte {
-	raw := make([]byte, 16, 16+4+8*len(snap.Members)+len(snap.Data))
+	raw := make([]byte, 16, 16+12+8*len(snap.Members)+len(snap.Data))
 	binary.BigEndian.PutUint64(raw[:8], uint64(snap.Index))
 	term := uint64(snap.Term)
 	if snap.Members != nil {
 		term |= withMembers
 		raw = binary.BigEndian.AppendUint32(raw, uint32(len(snap.Members)))
+		raw = binary.BigEndian.AppendUint64(raw, uint64(snap.MembersAt))
 		for _, m := range snap.Members {
 			raw = binary.BigEndian.AppendUint64(raw, uint64(m))
 		}
@@ -855,7 +856,7 @@ func readableSnapshot(raw []byte) bool {
 	if binary.BigEndian.Uint64(raw[8:16])&withMembers == 0 {
 		return true
 	}
-	return len(raw) >= 20 && uint64(len(raw)-20) >= 8*uint64(binary.BigEndian.Uint32(raw[16:20]))
+	return len(raw) >= 28 && uint64(len(raw)-28) >= 8*uint64(binary.BigEndian.Uint32(raw[16:20]))
 }
 
 func decodeSnapshot(raw []byte) *core.Snapshot {
@@ -864,7 +865,8 @@ func decodeSnapshot(raw []byte) *core.Snapshot {
 	rest := raw[16:]
 	if term&withMembers != 0 {
 		count := binary.BigEndian.Uint32(rest[:4])
-		rest = rest[4:]
+		snap.MembersAt = core.Index(binary.BigEndian.Uint64(rest[4:12]))
+		rest = rest[12:]
 		snap.Members = make([]core.NodeID, count)
 		for i := range snap.Members {
 			snap.Members[i] = core.NodeID(binary.BigEndian.Uint64(rest[:8]))

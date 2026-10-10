@@ -237,3 +237,29 @@ func TestDeterministic(t *testing.T) {
 		t.Fatalf("two runs sent %d and %d Messages", a, b)
 	}
 }
+
+// A Node's note reaches every Node, the latest one wins, and a Node that
+// restarts and has lost count still outranks what it said before.
+func TestNotesSpreadAndSurviveARestart(t *testing.T) {
+	for _, d := range []Detector{Counters, SWIM} {
+		nw := newNet(5, d)
+		nw.rounds(10)
+		nw.nodes[3].SetNote([]byte("one"))
+		nw.nodes[3].SetNote([]byte("two"))
+		nw.rounds(10)
+		for id, n := range nw.nodes {
+			if got := string(n.Note(3)); got != "two" {
+				t.Fatalf("detector %d: node %d has node 3's note as %q", d, id, got)
+			}
+		}
+		nw.start(3, d, 1)
+		nw.rounds(3)
+		nw.nodes[3].SetNote([]byte("three"))
+		nw.rounds(10)
+		for id, n := range nw.nodes {
+			if got := string(n.Note(3)); got != "three" {
+				t.Fatalf("detector %d: after its restart, node %d has node 3's note as %q", d, id, got)
+			}
+		}
+	}
+}

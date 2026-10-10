@@ -230,3 +230,143 @@ func TestASpareTakesALostNodesPlace(t *testing.T) {
 		}
 	}
 }
+
+func newReplacingCluster(seed uint64) *cluster.Cluster {
+	transport.Register(raft.MessageBodies()...)
+	return cluster.New(cluster.Config{
+		Seed: seed, Nodes: 5, Groups: 3, Replicas: 3, Slots: 8, Spares: 2,
+		NewCore: newCore, Copy: transport.NewLoopback().Copy, Gossip: cluster.GossipCounters,
+		Replacing: cluster.Replacing{On: true},
+	})
+}
+
+// replicasHeld counts the replicas Node n holds.
+func replicasHeld(c *cluster.Cluster, n int) int {
+	held := 0
+	for _, g := range c.Groups() {
+		for _, r := range c.Replicas(g) {
+			if cluster.NodeOf(r) == n {
+				held++
+			}
+		}
+	}
+	return held
+}
+
+// Two Nodes are cut off for a long time, one of them a Member of the Meta
+// Group. Their side can replace nobody: it has no Majority of the Meta
+// Group. The other side replaces them both, in every Group that still has a
+// Majority there. When the network heals they find their places taken and
+// drop what they hold, once each Group confirms it. A Node left in no Group
+// is a Spare again (A§11.11).
+//
+// Group 3 is on Nodes 1, 4 and 5, so its Majority is on the cut-off side.
+// It can't be changed until the network heals, and by then only one of the
+// two changes wanted for it is still wanted.
+func TestTheMinoritySideIsReplacedAndReturnsAsSpares(t *testing.T) {
+	c := newReplacingCluster(7)
+	c.S.Run(300)
+	for i := range 24 {
+		key := fmt.Sprintf("k%d", i)
+		do(t, c, 2, fsm.Command{Op: fsm.OpPut, Key: key, Value: []byte(key)})
+	}
+	before := [2]int{replicasHeld(c, 1), replicasHeld(c, 4)}
+	c.PartitionNodes([]int{1, 4}, []int{2, 3, 5, 6, 7})
+	c.S.Run(c.S.Now() + 2500)
+	for _, r := range c.Replacements {
+		if r.Out != 1 && r.Out != 4 {
+			t.Fatalf("node %d was replaced, and it was on the side with the Majority", r.Out)
+		}
+	}
+	if len(c.Replacements) != 2 {
+		t.Fatalf("replacements while cut off: %+v, want nodes 1 and 4", c.Replacements)
+	}
+	if got := [2]int{replicasHeld(c, 1), replicasHeld(c, 4)}; got != before || len(c.Drops) != 0 {
+		t.Fatalf("while cut off, nodes 1 and 4 hold %v replicas, had %v; drops %+v", got, before, c.Drops)
+	}
+	for _, g := range c.Table(1).Groups {
+		if g.Add != 0 || slices.Contains(g.Members, 6) || slices.Contains(g.Members, 7) {
+			t.Fatalf("the cut-off side's table changed: %+v", g)
+		}
+	}
+	c.Heal()
+	c.S.Run(c.S.Now() + 1500)
+	for _, n := range []int{1, 4} {
+		in := 0
+		for _, g := range c.Table(2).Groups {
+			if slices.Contains(g.Members, n) {
+				in++
+			}
+		}
+		if held := replicasHeld(c, n); held != in || in > 1 {
+			t.Fatalf("after healing, node %d holds %d replicas and is a Member of %d Groups", n, held, in)
+		}
+	}
+	if len(c.Drops) == 0 {
+		t.Fatal("after healing, nothing was dropped")
+	}
+	for _, d := range c.Drops {
+		if d.Counted {
+			t.Fatalf("a replica was dropped while still a Member: %+v", d)
+		}
+	}
+	for i := range 24 {
+		key := fmt.Sprintf("k%d", i)
+		if r := do(t, c, 1, fsm.Command{Op: fsm.OpGet, Key: key}); string(r.Value) != key {
+			t.Fatalf("get %s through a returned Node: %+v", key, r)
+		}
+	}
+	if diffs := append(c.EndState(), c.GossipAgrees()...); len(diffs) > 0 {
+		t.Fatalf("end state: %v", diffs)
+	}
+	// Lose another Node: whichever of them is a Spare again takes over.
+	c.DestroyNode(5)
+	c.S.Run(c.S.Now() + 2500)
+	if last := c.Replacements[len(c.Replacements)-1]; last.Out != 5 || (last.In != 1 && last.In != 4) {
+		t.Fatalf("node 5 was lost, and the last replacement is %+v", last)
+	}
+	if diffs := c.EndState(); len(diffs) > 0 {
+		t.Fatalf("end state after losing node 5: %v", diffs)
+	}
+}
+
+// A Move is asked for when the Group it is going to has lost its Majority:
+// one Member for good, another down. Nothing can be done for that Group, by
+// the Move or by replacement, because a Group with no Majority can't change
+// its own Members. The Move waits. When the Member that was down returns
+// the Group has its Majority back, finishes the Move, and has its lost
+// Member replaced (A§11.11).
+func TestAMoveWaitsOutALostMajority(t *testing.T) {
+	c := newReplacingCluster(8)
+	c.S.Run(300)
+	target := shard.GroupID(2)
+	if c.Table(1).Slots[0].Group == target {
+		target = 3
+	}
+	hosts := c.Table(1).Hosts(target)
+	c.DestroyNode(hosts[0])
+	c.CrashNode(hosts[1])
+	asked := false
+	for !asked && c.S.Now() < 2000 {
+		c.Move(hosts[2], 0, target, func(ok bool) { asked = asked || ok })
+		c.S.Run(c.S.Now() + 100)
+	}
+	if !asked {
+		t.Fatal("the Meta Group didn't take the Move")
+	}
+	c.S.Run(c.S.Now() + 2000)
+	if row := c.Table(hosts[2]).Slots[0]; row.MovingTo != target {
+		t.Fatalf("with the target Group short of a Majority the Move should be waiting: %+v", row)
+	}
+	if got := c.Table(hosts[2]).Hosts(target); !slices.Equal(got, hosts) {
+		t.Fatalf("a Group with no Majority changed its Members from %v to %v", hosts, got)
+	}
+	c.RestartNode(hosts[1])
+	c.S.Run(c.S.Now() + 4000)
+	if row := c.Table(hosts[2]).Slots[0]; row.Group != target || row.MovingTo != 0 {
+		t.Fatalf("with its Majority back the Group should have finished the Move: %+v", row)
+	}
+	if diffs := c.EndState(); len(diffs) > 0 {
+		t.Fatalf("end state: %v", diffs)
+	}
+}

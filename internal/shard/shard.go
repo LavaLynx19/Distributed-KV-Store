@@ -226,3 +226,63 @@ func ReplicaID(n int, g GroupID) uint64 { return uint64(n*100 + int(g)) }
 
 // SplitReplicaID is the inverse of ReplicaID.
 func SplitReplicaID(id uint64) (n int, g GroupID) { return int(id) / 100, GroupID(id % 100) }
+
+// Report is what a Node tells the others about itself by gossip, for the
+// Meta Group's Leader to act on (A§11.11). It decides nothing.
+type Report struct {
+	// Dead lists the Nodes this Node has thought dead for longer than the
+	// wait, ascending.
+	Dead []int
+	// Load is the smoothed load of each Slot whose Group this Node leads,
+	// and 0 for every other Slot. It is empty if the Node leads none.
+	Load []uint32
+}
+
+// Encode lays the Report out as the number of dead Nodes and each one, then
+// the number of Slots and each load, all as varints.
+func (r Report) Encode() []byte {
+	b := binary.AppendUvarint(nil, uint64(len(r.Dead)))
+	for _, n := range r.Dead {
+		b = binary.AppendUvarint(b, uint64(n))
+	}
+	b = binary.AppendUvarint(b, uint64(len(r.Load)))
+	for _, l := range r.Load {
+		b = binary.AppendUvarint(b, uint64(l))
+	}
+	return b
+}
+
+// DecodeReport is the inverse of Encode. No bytes at all is an empty Report.
+func DecodeReport(b []byte) (Report, error) {
+	var r Report
+	if len(b) == 0 {
+		return r, nil
+	}
+	next := func() uint64 {
+		v, n := binary.Uvarint(b)
+		if n <= 0 {
+			b = nil
+			return 0
+		}
+		b = b[n:]
+		return v
+	}
+	dead := next()
+	if dead > uint64(len(b)) {
+		return Report{}, errMalformed
+	}
+	for range dead {
+		r.Dead = append(r.Dead, int(next()))
+	}
+	load := next()
+	if load > uint64(len(b)) {
+		return Report{}, errMalformed
+	}
+	for range load {
+		r.Load = append(r.Load, uint32(next()))
+	}
+	if b == nil || len(b) != 0 {
+		return Report{}, errMalformed
+	}
+	return r, nil
+}

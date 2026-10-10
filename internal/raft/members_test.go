@@ -320,3 +320,34 @@ func TestForcedMembers(t *testing.T) {
 		t.Fatalf("members = %v, want the later change [1 2 6]", grown.Status().Members)
 	}
 }
+
+// Asking for the list the Group already has calls off an addition that is
+// still catching up, and leaves the way clear for another.
+func TestAnAdditionCanBeCalledOff(t *testing.T) {
+	n := settledLeader(t)
+	n.Step(core.Reconfigure{Ref: 1, Members: ids(1, 2, 3, 4)})
+	if st := n.Status(); st.Learner != 4 || !st.Changing {
+		t.Fatalf("while node 4 catches up: %+v", st)
+	}
+	out := n.Step(core.Reconfigure{Ref: 2, Members: ids(1, 2, 3)})
+	if r := resultOf(t, out, 1); r.Reason != core.NoCatchUp {
+		t.Fatalf("the addition called off: %+v", r)
+	}
+	if r := resultOf(t, out, 2); r.Reason != core.OK {
+		t.Fatalf("the request that called it off: %+v", r)
+	}
+	if st := n.Status(); st.Learner != 0 || st.Changing || !slices.Equal(st.Members, ids(1, 2, 3)) {
+		t.Fatalf("afterwards: %+v", st)
+	}
+	if to := appendsTo(n.Step(core.Tick{})); slices.Contains(to, 4) {
+		t.Fatalf("still sending to node 4: %v", to)
+	}
+	if out := n.Step(core.Reconfigure{Ref: 3, Members: ids(1, 2, 3, 5)}); len(out.Results) != 0 || n.Status().Learner != 5 {
+		t.Fatalf("another addition afterwards: %+v", out.Results)
+	}
+	// With nothing under way the same request is as invalid as ever.
+	n = settledLeader(t)
+	if r := resultOf(t, n.Step(core.Reconfigure{Ref: 4, Members: ids(1, 2, 3)}), 4); r.Reason != core.Invalid {
+		t.Fatalf("asking for no change: %+v", r)
+	}
+}

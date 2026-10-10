@@ -57,6 +57,12 @@ func (c *Cluster) agent(nd *node) {
 // wish only when the table is up to date with the Group's list, so that a
 // table from before some later change can't make it repeat an old one.
 func (c *Cluster) changeMembers(nd *node, g shard.GroupID, st core.Status) {
+	if int(g) < len(nd.table.Groups) && st.Learner != 0 && st.Learner != Replica(nd.table.Groups[g].Add, g) && !c.cfg.GossipDecides.Members {
+		// The Node being brought up to date is no longer the one wanted:
+		// the Meta Group has since given it up for dead too. Call it off.
+		c.S.Reconfigure(Replica(nd.id, g), st.Members, func(sim.Reply) {})
+		return
+	}
 	if int(g) >= len(nd.table.Groups) || st.Changing || c.cfg.GossipDecides.Members {
 		return // in stage 7b's naive store no Log says who a Group's Members are
 	}
