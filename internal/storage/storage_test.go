@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"testing"
 
 	"distributed-kv-store/internal/core"
@@ -346,5 +347,40 @@ func TestForceMembersClearsTheDamageMark(t *testing.T) {
 	}
 	if _, stored, err := OpenFS(fs, "d", 0); err != nil || stored.Damaged || stored.Forced == nil {
 		t.Fatalf("after forcing: %+v, %v; want no damage mark and the forced list", stored, err)
+	}
+}
+
+// Several Stores on one SharedSyncFS all get their syncs, and what they
+// stored is there after a restart.
+func TestSharedSyncFS(t *testing.T) {
+	root := t.TempDir()
+	fs, err := NewSharedSyncFS(filepath.Join(root, "barrier"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const stores, rounds = 4, 20
+	done := make(chan error, stores)
+	for i := range stores {
+		go func() {
+			s, _, err := OpenWith(fs, filepath.Join(root, strconv.Itoa(i)), Options{})
+			for r := 0; err == nil && r < rounds; r++ {
+				err = s.Save(&core.Persist{Entries: es(core.Index(r+1), core.Index(r+1), 1)})
+			}
+			if err == nil {
+				err = s.Close()
+			}
+			done <- err
+		}()
+	}
+	for range stores {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range stores {
+		_, stored, err := Open(filepath.Join(root, strconv.Itoa(i)), 0)
+		if err != nil || len(stored.Entries) != rounds {
+			t.Fatalf("store %d: %d Entries after reopening, %v; want %d", i, len(stored.Entries), err, rounds)
+		}
 	}
 }

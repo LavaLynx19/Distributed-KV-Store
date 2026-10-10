@@ -447,6 +447,7 @@ A Transaction gives every key it writes one version, and its keys may be in Slot
 - **Placement** is one rule every Node works out for itself from the number of Nodes and of Members per Group. A Group gets Nodes to itself while there are enough: the Meta Group the first few, Group 1 the next, and so on. A Group there is no room for has its replicas on consecutive Nodes starting after Node g, overlapping others.
 - Topology for runs: 5 Nodes, each Group on 3 of them, so a Node failure hits some Groups and not others. Twelve Nodes, with every Group on its own three, was tried once in stage 7a and works.
 - On one machine every replica syncs to the same disk, so more Groups means more syncs queued behind each other (`retros/rung-7.md`). Several Groups pay off only where Nodes have disks of their own.
+- `kvnode -shared-sync` lets the replicas in one Node share each flush of the drive: each hands its file's data to the drive, and one flush then covers them all. It is off by default, and helps only where a flush covers the whole drive, as on macOS.
 
 ### 11.10 Gossip (7b)
 - SWIM-style: each Node pings a few others, and passes on what it has heard. It carries which Nodes exist and their addresses, which are suspected dead, the newest table version and Store time.

@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"net"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -37,6 +38,10 @@ type StoreConfig struct {
 	ElectionTicks, HeartbeatTicks int
 	SnapshotEvery                 int
 	SessionTTL, Timeout           time.Duration
+	// SharedSync makes this Node's replicas share each flush of the drive
+	// instead of each asking for its own (storage.SharedSyncFS). It helps
+	// where a flush covers the whole drive and they queue, as on macOS.
+	SharedSync bool
 }
 
 // OpenStore starts this Node's replicas and its Store, and runs them until
@@ -60,6 +65,17 @@ func OpenStore(ctx context.Context, cfg StoreConfig) (*Store, func(), error) {
 	send := func(m core.Message) { tr.Send(m) }
 	var stores []*storage.Store
 	start := meta.New(cfg.Slots, cfg.Groups).Table()
+	var fs storage.FS = storage.OSFS{}
+	if cfg.SharedSync && cfg.Data != "" {
+		if err := os.MkdirAll(cfg.Data, 0o755); err != nil {
+			return nil, nil, err
+		}
+		shared, err := storage.NewSharedSyncFS(filepath.Join(cfg.Data, "barrier"))
+		if err != nil {
+			return nil, nil, err
+		}
+		fs = shared
+	}
 
 	for g := shard.GroupID(0); int(g) <= cfg.Groups; g++ {
 		hosts := shard.Hosts(g, cfg.Nodes, cfg.Replicas)
@@ -93,7 +109,7 @@ func OpenStore(ctx context.Context, cfg StoreConfig) (*Store, func(), error) {
 		var stored core.Stored
 		if cfg.Data != "" {
 			var err error
-			if disk, stored, err = storage.Open(filepath.Join(cfg.Data, fmt.Sprintf("group%d", g)), 0); err != nil {
+			if disk, stored, err = storage.OpenWith(fs, filepath.Join(cfg.Data, fmt.Sprintf("group%d", g)), storage.Options{}); err != nil {
 				return nil, nil, fmt.Errorf("Group %d: %w", g, err)
 			}
 			stores = append(stores, disk)

@@ -135,6 +135,31 @@ One Group is unchanged from Rung 6 (0.97×). Three Groups are slower than one, w
 
 Several Groups are for machines that each have their own disk. On one laptop they can only cost. I can't show the gain here, and I'd rather report the loss than leave the number out.
 
+### The 0.52× looked into (after stage 7a was approved)
+
+A throwaway program measured this disk directly: writers that each append to their own file and sync it.
+
+| Writers | Each syncs its own file | They share one flush of the drive |
+|---|---|---|
+| 1 | 245 syncs/s | 112 |
+| 3 | 254 in total (85 each) | 318 in total (106 each) |
+| 12 | 377 in total (31 each) | 1,010 in total (84 each) |
+
+A sync on macOS flushes the whole drive, and the drive does one at a time. Three writers get no more syncs between them than one does. Twelve replicas therefore get 31 syncs a second each where three got 85, and a commit needs two of them, one on the Leader and one on a follower. That is the 88 ms.
+
+The right-hand column is the same writers handing their data to the drive and then all waiting on one shared flush. Twelve of them get nearly three times as much done.
+
+So `kvnode -shared-sync` does that for the replicas inside one Node: each hands its file to the drive, and they share the flush.
+
+| Three Groups, 5 Nodes, 64 clients | Requests/s | p50 | Against one Group |
+|---|---|---|---|
+| Each replica syncs for itself | 700 | 88 ms | 0.52× |
+| A Node's replicas share a flush | **899** | 68 ms | 0.67× |
+
+It helps by 28% and doesn't close the gap. Five Node processes still flush separately and still queue behind each other. Sharing across processes isn't something a real deployment would have, since there each Node has its own disk and none of this applies.
+
+It is off by default. It depends on one flush covering every file on the drive, which holds on macOS. Elsewhere it is still correct and gains nothing.
+
 ### A bug the first no-disk run found
 Three Groups with the disk off first ran at 5,268 requests/s and **lost 11,406 requests**: clients were told "outcome unknown". Nodes forward to each other over HTTP, and Go's client keeps two idle connections per host by default. With 64 clients nearly every forwarded request opened a connection and closed it, and the machine ran out. Keeping the connections brought it to 46,996 with none lost. With the disk on the bug was invisible, because the disk was slower than the connection churn.
 
@@ -176,7 +201,7 @@ DATA_GROUPS=3 harness/local.sh start 5 && harness/local.sh table && harness/loca
 | Single-key operations stay Linearizable while keys move | **Pass**: the same runs, and 13 real ones |
 | A retry that crosses a Move takes effect once | **Pass**: in the suite; breaking it fails 53 runs |
 | The pause of a Move reported | **Done**: about 2 ticks simulated; 80 ms real at 8 clients |
-| Numbers: at least 0.9× Rung 6 | **One Group: pass (0.97×). Three Groups on one machine: miss (0.52×)** |
+| Numbers: at least 0.9× Rung 6 | **One Group: pass (0.97×). Three Groups on one machine: miss (0.52×, or 0.67× with `-shared-sync`)**. The cause is one disk shared by twelve replicas, measured above |
 | Scans across Groups; Transactions across Groups refused | **Pass** in simulation and API tests |
 
 ## Lessons from stage 7a
