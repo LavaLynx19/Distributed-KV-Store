@@ -143,7 +143,7 @@ func TestBalancer(t *testing.T) {
 	if _, _, ok := b.Decide(cfg, table, load, 3, 1, 1600, false); ok {
 		t.Fatal("decided while a Node seemed not to be alive")
 	}
-	// The gap is 460: Slot 3 at 200 is the biggest no more than half of it.
+	// The gap is 460: Slot 3 at 200 is nearer half of it than Slot 0 at 300.
 	if slot, to, ok := b.Decide(cfg, table, load, 3, 1, 1600, true); !ok || slot != 3 || to != 2 {
 		t.Fatalf("picked Slot %d for Group %d, %v", slot, to, ok)
 	}
@@ -161,8 +161,12 @@ func TestBalancer(t *testing.T) {
 	// A Slot that moved lately rests: the next best goes.
 	rested := table.Clone()
 	rested.Slots[3].MovedAt = 4400
-	if _, _, ok := b.Decide(cfg, rested, load, 3, 1, 1700, true); ok {
-		t.Fatal("Slot 0 is more than half the gap and Slot 3 is resting: nothing should move")
+	if slot, _, ok := b.Decide(cfg, rested, load, 3, 1, 1700, true); !ok || slot != 0 {
+		t.Fatalf("Slot 3 is resting and Slot 0 is within three quarters of the gap: picked %d, %v", slot, ok)
+	}
+	// Slot 0 at 400 of a gap of 460 would only swap the two Groups round.
+	if _, _, ok := b.Decide(cfg, rested, []uint32{400, 20, 20, 100, 20, 20}, 3, 1, 1700, true); ok {
+		t.Fatal("moved a Slot that is nearly the whole gap")
 	}
 	// One Slot busier than everything else: no Move helps, so none is made.
 	if _, _, ok := b.Decide(cfg, table, []uint32{900, 20, 20, 0, 20, 20}, 3, 1, 1700, true); ok {

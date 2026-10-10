@@ -38,7 +38,10 @@ const (
 // milliseconds of Store time.
 var balancing = automation.Balancing{High: 1.5, Low: 1.2, Rest: 5_000, Settle: 2_500, Idle: 2 * shard.WriteCost}
 
-// leads reports which Groups this Node's replicas lead.
+// leads reports which Groups this Node's replicas lead. A replica too busy
+// to say in time is taken to be what it last said it was: a Leader held up
+// by its disk for a moment still leads, and its load must not vanish from
+// what this Node reports.
 func (s *Store) leads(ctx context.Context) map[shard.GroupID]bool {
 	if !s.Auto {
 		return nil
@@ -47,10 +50,13 @@ func (s *Store) leads(ctx context.Context) map[shard.GroupID]bool {
 	defer cancel()
 	leads := map[shard.GroupID]bool{}
 	for g, n := range s.replicas() {
-		if st, ok := n.Status(look); ok && st.Role == core.LeaderRole {
-			leads[g] = true
+		if st, ok := n.Status(look); ok {
+			leads[g] = st.Role == core.LeaderRole
+		} else {
+			leads[g] = s.led[g]
 		}
 	}
+	s.led = leads
 	return leads
 }
 

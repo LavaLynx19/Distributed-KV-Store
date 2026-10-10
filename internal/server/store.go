@@ -88,6 +88,7 @@ type Store struct {
 	report   shard.Report
 	loadAt   time.Time
 	balancer automation.Balancer
+	led      map[shard.GroupID]bool // touched only by the gossip goroutine
 }
 
 // replica is this Node's replica of Group g, if it has one.

@@ -269,9 +269,9 @@ type Balancer struct {
 //   - nothing while a Node is not healthy, or being replaced, or while the
 //     store is close to idle;
 //   - two lines, so that a Group near the line doesn't start and stop;
-//   - a Slot is moved only if it is no more than half the gap between the
-//     two Groups, so that the busier stays the busier and no Move can undo
-//     another.
+//   - a Slot is moved only if it is no more than three quarters of the gap
+//     between the two Groups, so that each Move brings them at least a
+//     quarter of the gap closer and none can undo another.
 //
 // The Move under way and when each Slot last moved are read from the table,
 // so a new Leader forgets neither.
@@ -330,15 +330,19 @@ func (b *Balancer) Decide(cfg Balancing, table shard.Table, load []uint32, group
 	if !b.balancing {
 		return 0, 0, false
 	}
+	// The Slot to move is the one nearest half the gap between the two
+	// Groups, which would leave them level. One over three quarters of the
+	// gap isn't moved at all: it would leave the two nearly as far apart as
+	// they were, the other way round.
 	gap := sums[busiest] - sums[idlest]
-	slot := -1
+	slot, best := -1, uint64(0)
 	for s, o := range table.Slots {
 		l := uint64(load[s])
-		if int(o.Group) != busiest || l == 0 || 2*l > gap || o.MovedAt != 0 && table.StoreTime-o.MovedAt < cfg.Rest {
+		if int(o.Group) != busiest || l == 0 || 4*l > 3*gap || o.MovedAt != 0 && table.StoreTime-o.MovedAt < cfg.Rest {
 			continue
 		}
-		if slot < 0 || load[s] > load[slot] {
-			slot = s
+		if off := max(2*l, gap) - min(2*l, gap); slot < 0 || off < best {
+			slot, best = s, off
 		}
 	}
 	return shard.Slot(max(slot, 0)), shard.GroupID(idlest), slot >= 0
