@@ -26,6 +26,14 @@ type ShardedStore struct {
 	// Unchecked and FlipAtOnce are the naive stores (cluster.Config).
 	Unchecked  bool
 	FlipAtOnce bool
+	// Gossip, Spares and GossipLoss are passed on (cluster.Config).
+	Gossip     cluster.GossipMode
+	Spares     int
+	GossipLoss float64
+	// SuspectAfter and DeadAfter override the detector's defaults.
+	SuspectAfter, DeadAfter int
+	// GossipDecides is the naive store of stage 7b (cluster.Config).
+	GossipDecides struct{ Ownership, Members bool }
 }
 
 // ShardedScenario injects Faults, and asks for Moves, between times from
@@ -44,6 +52,9 @@ func RunSharded(store ShardedStore, sc ShardedScenario, seed uint64) Report {
 		NewCore: store.NewCore, Copy: transport.NewLoopback().Copy,
 		DiskDelay: store.DiskDelay, SnapshotEvery: store.SnapshotEvery, TearWrites: store.TearWrites,
 		SessionTTL: store.SessionTTL, Unchecked: store.Unchecked, FlipAtOnce: store.FlipAtOnce,
+		Gossip: store.Gossip, Spares: store.Spares, GossipLoss: store.GossipLoss,
+		SuspectAfter: store.SuspectAfter, DeadAfter: store.DeadAfter,
+		GossipDecides: store.GossipDecides,
 	})
 	h := &check.History{}
 	rep := Report{Scenario: sc.Name, Seed: seed, Members: store.Nodes, History: h}
@@ -52,7 +63,7 @@ func RunSharded(store ShardedStore, sc ShardedScenario, seed uint64) Report {
 	store.Workload.Start(c, h, faultsEnd+cooldown/3)
 	sc.Faults(c, warmup, faultsEnd)
 	c.S.At(faultsEnd, func() {
-		c.S.Heal()
+		c.Heal()
 		for _, n := range c.NodeIDs() {
 			c.RestartNode(n)
 		}
@@ -75,6 +86,9 @@ func RunSharded(store ShardedStore, sc ShardedScenario, seed uint64) Report {
 	rep.Recovery = h.Signals.RecoveryAfter(faultsEnd)
 	rep.Routing = Routing{Forwarded: c.Forwarded, WrongGroup: c.WrongGroup, Moving: c.Moving}
 	rep.Pauses = c.Pauses
+	rep.MovesAsked, rep.MovesTaken = c.MovesAsked, c.MovesTaken
+	rep.Diverged = append(rep.Diverged, c.GossipAgrees()...)
+	rep.TableLags, rep.GossipSent = c.TableLags, c.GossipSent
 	for _, row := range c.Table(1).Slots {
 		rep.Moves += int(row.Epoch)
 	}
@@ -170,7 +184,7 @@ var Rung7 = []ShardedScenario{
 			c.S.Rand().Shuffle(len(nodes), func(i, j int) { nodes[i], nodes[j] = nodes[j], nodes[i] })
 			cut := 1 + c.S.Rand().IntN(2)
 			c.PartitionNodes(nodes[:cut], nodes[cut:])
-			c.S.After(150+c.S.Rand().Int64N(250), c.S.Heal)
+			c.S.After(150+c.S.Rand().Int64N(250), c.Heal)
 			c.S.After(400+c.S.Rand().Int64N(300), step)
 		}
 		c.S.At(from+50, step)
@@ -220,7 +234,7 @@ var Rung7 = []ShardedScenario{
 				cut := 1 + c.S.Rand().IntN(2)
 				c.PartitionNodes(nodes[:cut], nodes[cut:])
 			case 4:
-				c.S.Heal()
+				c.Heal()
 				for _, n := range nodes {
 					c.RestartNode(n)
 				}
@@ -228,5 +242,56 @@ var Rung7 = []ShardedScenario{
 			c.S.After(100+c.S.Rand().Int64N(250), step)
 		}
 		c.S.At(from+50, step)
+	}},
+}
+
+// Rung7b adds what gossip has to get through (A§11.10): Partitions long
+// enough for each side to give the other up for dead, and Moves asked for
+// on both sides of one.
+var Rung7b = []ShardedScenario{
+	// The Nodes split two against three for longer than it takes to give a
+	// Node up for dead, heal, and split again another way.
+	{"long-partitions", func(c *cluster.Cluster, from, to int64) {
+		var step func()
+		step = func() {
+			if c.S.Now() >= to-700 {
+				return
+			}
+			nodes := c.NodeIDs()
+			c.S.Rand().Shuffle(len(nodes), func(i, j int) { nodes[i], nodes[j] = nodes[j], nodes[i] })
+			c.PartitionNodes(nodes[:2], nodes[2:])
+			c.S.After(600, c.Heal)
+			c.S.After(900+c.S.Rand().Int64N(200), step)
+		}
+		c.S.At(from, step)
+	}},
+
+	// The same Partitions, and on each side a Node is asked to move the
+	// same Slot, to different Groups.
+	{"rival-moves", func(c *cluster.Cluster, from, to int64) {
+		var step func()
+		step = func() {
+			if c.S.Now() >= to-700 {
+				return
+			}
+			nodes := c.NodeIDs()
+			c.S.Rand().Shuffle(len(nodes), func(i, j int) { nodes[i], nodes[j] = nodes[j], nodes[i] })
+			c.PartitionNodes(nodes[:2], nodes[2:])
+			c.S.After(50, func() {
+				table := c.Table(nodes[0])
+				slot := shard.Slot(c.S.Rand().IntN(len(table.Slots)))
+				var others []shard.GroupID
+				for _, g := range c.Groups()[1:] {
+					if g != table.Slots[slot].Group {
+						others = append(others, g)
+					}
+				}
+				c.Move(nodes[0], slot, others[0], func(bool) {})
+				c.Move(nodes[2], slot, others[1], func(bool) {})
+			})
+			c.S.After(600, c.Heal)
+			c.S.After(900+c.S.Rand().Int64N(200), step)
+		}
+		c.S.At(from, step)
 	}},
 }

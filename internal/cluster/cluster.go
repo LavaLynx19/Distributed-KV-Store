@@ -21,6 +21,7 @@ import (
 
 	"distributed-kv-store/internal/core"
 	"distributed-kv-store/internal/fsm"
+	"distributed-kv-store/internal/gossip"
 	"distributed-kv-store/internal/meta"
 	"distributed-kv-store/internal/mover"
 	"distributed-kv-store/internal/shard"
@@ -51,6 +52,25 @@ type Config struct {
 	TearWrites    bool
 	SessionTTL    int64
 
+	// Gossip chooses how Nodes learn the table and of each other: by asking
+	// the Meta Group on a timer, as in stage 7a, or by gossip with one of
+	// its two detectors (A§11.10). Spares is how many extra Nodes run from
+	// the start hosting no Group, each knowing only Node 1. GossipLoss is
+	// the chance that any one gossip Message is lost.
+	Gossip     GossipMode
+	Spares     int
+	GossipLoss float64
+	// SuspectAfter and DeadAfter override the detector's defaults
+	// (gossip.Config), in rounds.
+	SuspectAfter, DeadAfter int
+
+	// GossipDecides is the naive store of stage 7b, in two parts. With
+	// Ownership, a Move is not put to the Meta Group: the Node asked changes
+	// its own table and gossips it, and each Group does what the table it
+	// has heard says. With Members, each replica takes for its Group's
+	// Members whichever of them its Node's gossip thinks are alive.
+	GossipDecides struct{ Ownership, Members bool }
+
 	// Unchecked makes data Groups answer for keys in Slots they don't own
 	// (shardfsm.Config.Unchecked), and FlipAtOnce makes a Move change the
 	// table at once with nobody confirming, after which the Groups follow
@@ -66,6 +86,18 @@ const (
 	rpcMin     = 1   // a request between Nodes takes this long, one way,
 	rpcMax     = 8   // to this long
 	patience   = 200 // how long the agent waits for an answer before asking again
+)
+
+// GossipMode is how a store's Nodes keep each other informed.
+type GossipMode uint8
+
+const (
+	// NoGossip: every Node asks the Meta Group for the table on a timer.
+	NoGossip GossipMode = iota
+	// GossipCounters and GossipSWIM: Nodes gossip, noticing quiet Nodes by
+	// heartbeat counters or by SWIM's pings.
+	GossipCounters
+	GossipSWIM
 )
 
 // Replica is the id of Node n's replica of Group g.
@@ -94,6 +126,12 @@ type node struct {
 	// mover carries out the Moves of the Groups this Node leads.
 	mover    *mover.Agent
 	lastTick int64
+	// up is whether the machine is running, and side which side of a
+	// Partition it is on. A Spare has no replica to ask.
+	up   bool
+	side int
+	// gossip is this Node's gossip, if the store uses it.
+	gossip *gossip.Node
 }
 
 // Cluster is one simulated store.
@@ -103,8 +141,15 @@ type Cluster struct {
 	nodes map[int]*node
 	// Signals count what the routing layer did.
 	Forwarded, WrongGroup, Moving int
-	// MovesAsked counts the Moves requested.
-	MovesAsked int
+	// MovesAsked counts the Moves requested, and MovesTaken those the Meta
+	// Group recorded the intent of.
+	MovesAsked, MovesTaken int
+	// GossipSent counts gossip Messages sent.
+	GossipSent int
+	// TableLags is, for each time a Node learned of a new table version,
+	// how long that was after the Meta Group first held it.
+	TableLags []int64
+	versionAt map[uint64]int64
 	// Pauses is how long each Slot that was handed over stayed frozen
 	// (mover.Agent.OnHandover).
 	Pauses []int64
@@ -136,7 +181,7 @@ func (c *Cluster) Groups() []shard.GroupID {
 
 // NodeIDs lists the machines.
 func (c *Cluster) NodeIDs() []int {
-	ids := make([]int, c.cfg.Nodes)
+	ids := make([]int, c.cfg.Nodes+c.cfg.Spares)
 	for i := range ids {
 		ids[i] = i + 1
 	}
@@ -145,13 +190,15 @@ func (c *Cluster) NodeIDs() []int {
 
 // New builds the store and starts every Node's agent.
 func New(cfg Config) *Cluster {
-	c := &Cluster{cfg: cfg, nodes: map[int]*node{}, owned: map[shard.GroupID]ownership{}}
+	c := &Cluster{cfg: cfg, nodes: map[int]*node{}, owned: map[shard.GroupID]ownership{}, versionAt: map[uint64]int64{}}
 	start := meta.New(cfg.Slots, cfg.Groups).Table()
 	var ids []core.NodeID
-	for n := 1; n <= cfg.Nodes; n++ {
-		c.nodes[n] = &node{id: n, table: start.Clone(), leader: map[shard.GroupID]core.NodeID{},
-			mover: &mover.Agent{Patience: patience, ChunkKeys: chunkKeys, FlipAtOnce: cfg.FlipAtOnce,
-				OnHandover: func(_ shard.GroupID, _ shard.Slot, frozenFor int64) { c.Pauses = append(c.Pauses, frozenFor) }}}
+	for n := 1; n <= cfg.Nodes+cfg.Spares; n++ {
+		c.nodes[n] = &node{id: n, up: true, table: start.Clone(), leader: map[shard.GroupID]core.NodeID{},
+			mover: &mover.Agent{Patience: patience, ChunkKeys: chunkKeys,
+				FlipAtOnce:            cfg.FlipAtOnce || cfg.GossipDecides.Ownership,
+				TakeWhatTheTableGives: cfg.GossipDecides.Ownership,
+				OnHandover:            func(_ shard.GroupID, _ shard.Slot, frozenFor int64) { c.Pauses = append(c.Pauses, frozenFor) }}}
 	}
 	for _, g := range c.Groups() {
 		for _, r := range c.Members(g) {
@@ -179,6 +226,7 @@ func New(cfg Config) *Cluster {
 	for _, n := range c.NodeIDs() {
 		c.S.After(1+c.S.Rand().Int64N(agentEvery), func() { c.agent(c.nodes[n]) })
 	}
+	c.startGossip()
 	return c
 }
 
@@ -205,9 +253,9 @@ func (c *Cluster) Table(n int) shard.Table { return c.nodes[n].table.Clone() }
 // hosts reports whether Node n has a replica of Group g.
 func (c *Cluster) hosts(n int, g shard.GroupID) bool { return slices.Contains(c.nodes[n].groups, g) }
 
-// NodeUp reports whether any of Node n's replicas is running. They are
-// crashed and restarted together.
-func (c *Cluster) NodeUp(n int) bool { return c.S.Up(Replica(n, c.nodes[n].groups[0])) }
+// NodeUp reports whether Node n is running. Its replicas are crashed and
+// restarted together.
+func (c *Cluster) NodeUp(n int) bool { return c.nodes[n].up }
 
 // replicasOf lists Node n's replicas.
 func (c *Cluster) replicasOf(n int) []core.NodeID {
@@ -224,6 +272,7 @@ func (c *Cluster) CrashNode(n int) {
 	for _, r := range c.replicasOf(n) {
 		c.S.Crash(r)
 	}
+	c.nodes[n].up = false
 	c.nodes[n].mover.Reset()
 }
 
@@ -231,14 +280,30 @@ func (c *Cluster) RestartNode(n int) {
 	for _, r := range c.replicasOf(n) {
 		c.S.Restart(r)
 	}
+	if nd := c.nodes[n]; !nd.up {
+		nd.up = true
+		c.newGossip(nd) // it comes back knowing only what it is started with
+	}
+}
+
+// Heal ends every Partition.
+func (c *Cluster) Heal() {
+	c.S.Heal()
+	for _, nd := range c.nodes {
+		nd.side = 0
+	}
 }
 
 // PartitionNodes cuts the network between the given sets of machines.
 func (c *Cluster) PartitionNodes(sets ...[]int) {
 	replicas := make([][]core.NodeID, len(sets))
+	for _, nd := range c.nodes {
+		nd.side = 0
+	}
 	for i, set := range sets {
 		for _, n := range set {
 			replicas[i] = append(replicas[i], c.replicasOf(n)...)
+			c.nodes[n].side = i + 1
 		}
 	}
 	c.S.Partition(replicas...)
@@ -246,7 +311,9 @@ func (c *Cluster) PartitionNodes(sets ...[]int) {
 
 // reachable reports whether a request from Node a can reach Node b.
 func (c *Cluster) reachable(a, b int) bool {
-	return a == b || c.S.Reachable(Replica(a, c.nodes[a].groups[0]), Replica(b, c.nodes[b].groups[0]))
+	sa, sb := c.nodes[a].side, c.nodes[b].side
+	// A Node that no Partition names is on every side.
+	return a == b || sa == 0 || sb == 0 || sa == sb
 }
 
 // Outcome is how a request to a Group ended, as the asking Node saw it.
@@ -262,16 +329,39 @@ const (
 	Unknown
 )
 
-// ask sends a request from Node n to Group g: to the replica n believes
+// ask sends a request from Node n to Group g. If n was only guessing where
+// the Leader is, and the Node it tried says it is elsewhere and that nothing
+// happened, n tries there, once (A§11.3).
+func (c *Cluster) ask(n int, g shard.GroupID, read bool, payload func(storeTime int64) []byte, back func(Outcome, []byte)) {
+	nd := c.nodes[n]
+	_, known := nd.leader[g]
+	c.askOnce(n, g, read, payload, func(o Outcome, raw []byte) {
+		if _, told := nd.leader[g]; o == Refused && !known && told && c.NodeUp(n) {
+			c.askOnce(n, g, read, payload, back)
+			return
+		}
+		back(o, raw)
+	})
+}
+
+// askOnce sends a request from Node n to Group g: to the replica n believes
 // leads it, on whichever machine that is. With read set it is answered
 // from the Leader's state without an Entry (A§6.2). payload is built on the
 // machine that handles it, which is given that machine's Store time. back is
 // called at most once: a reply lost on the way never arrives.
-func (c *Cluster) ask(n int, g shard.GroupID, read bool, payload func(storeTime int64) []byte, back func(Outcome, []byte)) {
+func (c *Cluster) askOnce(n int, g shard.GroupID, read bool, payload func(storeTime int64) []byte, back func(Outcome, []byte)) {
 	nd := c.nodes[n]
 	target, known := nd.leader[g]
 	if !known {
 		members := c.Members(g)
+		if nd.gossip != nil {
+			// With gossip, a Node thought dead isn't worth a guess, unless
+			// they all are.
+			alive := slices.DeleteFunc(slices.Clone(members), func(m core.NodeID) bool { return !nd.gossip.Alive(NodeOf(m)) })
+			if len(alive) > 0 {
+				members = alive
+			}
+		}
 		target = members[c.S.Rand().IntN(len(members))]
 		// A Node that hosts the Group asks its own replica first.
 		if c.hosts(n, g) {
@@ -480,10 +570,27 @@ func txnKeys(cmd fsm.Command) []string {
 // Move asks the Meta Group, through Node n, to move slot to Group to.
 func (c *Cluster) Move(n int, slot shard.Slot, to shard.GroupID, done func(ok bool)) {
 	c.MovesAsked++
+	if nd := c.nodes[n]; c.cfg.GossipDecides.Ownership {
+		// The naive store: say so, and let the news spread.
+		if nd.up && nd.table.Slots[slot].Group != to {
+			t := nd.table.Clone()
+			t.Slots[slot] = shard.Owner{Group: to, Epoch: t.Slots[slot].Epoch + 1}
+			t.Version++
+			nd.gossip.SetTable(t)
+			c.gossipLearn(nd)
+			c.MovesTaken++
+		}
+		done(nd.up)
+		return
+	}
 	cmd := func(int64) []byte { return meta.Command{Op: meta.OpMove, Slot: slot, To: to}.Encode() }
 	c.ask(n, shard.Meta, false, cmd, func(o Outcome, raw []byte) {
 		resp, err := meta.DecodeResponse(raw)
-		done(o == Answered && err == nil && resp.Status == meta.StatusOK)
+		ok := o == Answered && err == nil && resp.Status == meta.StatusOK
+		if ok {
+			c.MovesTaken++
+		}
+		done(ok)
 	})
 }
 
@@ -497,8 +604,19 @@ func (c *Cluster) refresh(nd *node) {
 		if err != nil {
 			panic(fmt.Sprintf("cluster: undecodable table: %v", err))
 		}
-		if t.Version > nd.table.Version || t.StoreTime > nd.table.StoreTime {
-			nd.table = t
-		}
+		c.learn(nd, t)
 	})
+}
+
+// learn makes t the table Node nd routes by, if it is newer, and notes how
+// long the news took to arrive.
+func (c *Cluster) learn(nd *node, t shard.Table) {
+	if t.Version > nd.table.Version {
+		if at, known := c.versionAt[t.Version]; known {
+			c.TableLags = append(c.TableLags, c.S.Now()-at)
+		}
+	}
+	if t.Version > nd.table.Version || t.StoreTime > nd.table.StoreTime {
+		nd.table = t
+	}
 }

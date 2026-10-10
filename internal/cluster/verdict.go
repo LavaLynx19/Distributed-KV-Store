@@ -7,6 +7,8 @@ import (
 	"distributed-kv-store/internal/check"
 	"distributed-kv-store/internal/core"
 	"distributed-kv-store/internal/fsm"
+	"distributed-kv-store/internal/gossip"
+	"distributed-kv-store/internal/meta"
 	"distributed-kv-store/internal/shard"
 	"distributed-kv-store/internal/shardfsm"
 	"distributed-kv-store/internal/sim"
@@ -46,7 +48,16 @@ type ownership struct {
 // wait for the source to stop (A§11.12).
 func (c *Cluster) applied(id core.NodeID, index core.Index, m sim.Machine) {
 	g := GroupOf(id)
-	if g == shard.Meta || index <= c.owned[g].index {
+	if g == shard.Meta {
+		// Note when each table version first existed anywhere.
+		if v := m.(*meta.Machine).Table().Version; v != 0 {
+			if _, seen := c.versionAt[v]; !seen {
+				c.versionAt[v] = c.S.Now()
+			}
+		}
+		return
+	}
+	if index <= c.owned[g].index {
 		return
 	}
 	now := ownership{index: index}
@@ -144,4 +155,41 @@ func (c *Cluster) MoveUnderWay() (source, target shard.GroupID, ok bool) {
 		}
 	}
 	return 0, 0, false
+}
+
+// GossipAgrees checks what gossip should have settled on once Faults have
+// stopped (A§11.10): every running Node thinks every running Node is alive,
+// knows its address, and holds the Meta Group's table version. It returns
+// one line per disagreement, or nil if the store doesn't gossip.
+func (c *Cluster) GossipAgrees() []string {
+	if c.cfg.Gossip == NoGossip {
+		return nil
+	}
+	var diffs []string
+	var version uint64
+	if l := c.Leader(shard.Meta); l != 0 {
+		version = c.S.Machine(l).(*meta.Machine).Table().Version
+	}
+	for _, n := range c.NodeIDs() {
+		nd := c.nodes[n]
+		if !nd.up {
+			continue
+		}
+		seen := map[int]gossip.Member{}
+		for _, m := range nd.gossip.Members() {
+			seen[m.ID] = m
+		}
+		for _, other := range c.NodeIDs() {
+			if !c.nodes[other].up {
+				continue
+			}
+			if m, known := seen[other]; !known || m.Status != gossip.Alive || m.Peer != address(other) {
+				diffs = append(diffs, fmt.Sprintf("node %d thinks node %d is %+v", n, other, m))
+			}
+		}
+		if got := nd.gossip.Table().Version; got != version {
+			diffs = append(diffs, fmt.Sprintf("node %d's gossip has table version %d, the Meta Group has %d", n, got, version))
+		}
+	}
+	return diffs
 }

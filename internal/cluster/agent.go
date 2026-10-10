@@ -17,7 +17,9 @@ func (c *Cluster) agent(nd *node) {
 	if !c.NodeUp(nd.id) {
 		return
 	}
-	c.refresh(nd)
+	if nd.gossip == nil {
+		c.refresh(nd) // with gossip the table arrives by itself
+	}
 	for _, g := range nd.groups {
 		r := Replica(nd.id, g)
 		st := c.S.Status(r)

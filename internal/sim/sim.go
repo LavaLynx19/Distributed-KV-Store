@@ -312,6 +312,15 @@ func (s *Sim) Reconfigure(to core.NodeID, members []core.NodeID, done func(Reply
 	s.step(m, core.Reconfigure{Ref: ref, Members: slices.Clone(members)})
 }
 
+// Inject hands a Member's core an event of the caller's choosing, as its
+// shell might. It is for events no client or other Member causes.
+func (s *Sim) Inject(to core.NodeID, ev core.Event) {
+	if m := s.members[to]; m.up {
+		s.mix('J', uint64(to), 0)
+		s.step(m, ev)
+	}
+}
+
 // Read asks one Member to answer a query from its own state, bypassing the
 // Log. done is called exactly once.
 func (s *Sim) Read(to core.NodeID, query []byte, done func(Reply)) {

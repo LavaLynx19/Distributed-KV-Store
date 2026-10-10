@@ -102,9 +102,16 @@ type Report struct {
 	// and Routing counts what the Nodes' routing did.
 	TwoOwners string
 	Moves     int
-	Routing   Routing
+	// MovesAsked and MovesTaken are how many Moves the scenario asked for
+	// and how many the Meta Group took.
+	MovesAsked, MovesTaken int
+	Routing                Routing
 	// Pauses is how long each Slot that moved stayed frozen, in units.
 	Pauses []int64
+	// TableLags is how long news of each new table version took to reach
+	// each Node, in units, and GossipSent how many gossip Messages went out.
+	TableLags  []int64
+	GossipSent int
 
 	verdict check.Verdict
 }

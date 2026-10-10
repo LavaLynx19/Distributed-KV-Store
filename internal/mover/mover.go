@@ -47,6 +47,11 @@ type Agent struct {
 	// Group hands a Slot over as it stands without freezing it first. It
 	// exists so that Rung 7's exposure of that stays reproducible.
 	FlipAtOnce bool
+	// TakeWhatTheTableGives goes further: a Group the table names as a
+	// Slot's owner, and which hasn't been sent the Slot after Patience,
+	// starts serving it empty. With FlipAtOnce it is the store in which
+	// whatever table a Node has heard decides who owns what (A§11.10).
+	TakeWhatTheTableGives bool
 	// OnHandover, if set, is told how long a Slot was frozen: from when
 	// this Agent first saw its Group had frozen it to when the other Group
 	// answered that it had taken over. That is the pause clients of the
@@ -56,6 +61,9 @@ type Agent struct {
 	copying map[moveKey]copyState
 	waiting map[moveKey]int64
 	frozen  map[moveKey]int64
+	// promised is when the table was first seen to give this Group a Slot
+	// it doesn't have.
+	promised map[moveKey]int64
 }
 
 type moveKey struct {
@@ -82,6 +90,7 @@ func (a *Agent) Reset() {
 	// New maps, not nil: an answer to something asked before the restart
 	// may still arrive and be recorded.
 	a.copying, a.waiting, a.frozen = map[moveKey]copyState{}, map[moveKey]int64{}, map[moveKey]int64{}
+	a.promised = map[moveKey]int64{}
 }
 
 // Step moves each Move of Group g along by at most one step. It must be
@@ -140,6 +149,19 @@ func (a *Agent) slot(env Env, g shard.GroupID, term core.Term, slot shard.Slot, 
 					env.Local(g, shardfsm.DropStep(slot, info.Epoch).Encode(), func() {})
 				})
 			}, nil)
+		}
+		if a.TakeWhatTheTableGives && row.Group == g && info.Status == shardfsm.Absent && row.Epoch > info.Epoch {
+			since, seen := a.promised[key]
+			switch {
+			case !seen:
+				a.promised[key] = env.Now()
+			case env.Now()-since >= a.Patience:
+				// Nobody sent it. The table says it is ours: take it.
+				delete(a.promised, key)
+				local(shardfsm.AcceptStep(slot, row.Epoch, 0, shardfsm.Transfer{Full: true}))
+			}
+		} else {
+			delete(a.promised, key)
 		}
 		return
 	}

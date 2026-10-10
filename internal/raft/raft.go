@@ -135,6 +135,10 @@ type Config struct {
 	// before it holds any of the Log. It exists so that Rung 6's exposure of
 	// that stays reproducible.
 	AddWithoutCatchUp bool
+	// MembersByDecree makes the Member take its Member list from core.Decree
+	// events, as the shell sees fit, outside the Log. It exists so that Rung
+	// 7's exposure of gossip deciding who is in a Group stays reproducible.
+	MembersByDecree bool
 	// Volatile makes the Member store nothing, as before Rung 3. It exists so
 	// that Rung 3's exposure of a store with no disk stays reproducible.
 	Volatile bool
@@ -321,6 +325,18 @@ func (n *Node) Step(ev core.Event) core.Output {
 		n.snapshotted(&out, ev)
 	case core.Reconfigure:
 		n.reconfigure(&out, ev)
+	case core.Decree:
+		if n.cfg.MembersByDecree && len(ev.Members) > 0 {
+			n.members = slices.Clone(ev.Members)
+			slices.Sort(n.members)
+			n.lists = []memberList{{index: n.lastIndex(), members: n.members}}
+			if n.role == core.LeaderRole {
+				for _, m := range n.members {
+					n.follow(m)
+				}
+				n.advanceCommit()
+			}
+		}
 	}
 	if n.role == core.LeaderRole {
 		n.promoteLearner(&out)

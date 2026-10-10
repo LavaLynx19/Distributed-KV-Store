@@ -87,8 +87,8 @@ func TestFlippedTableIsExposed(t *testing.T) {
 		t.Errorf("seed 1: expected two Groups serving one Slot, got %v", r)
 	}
 	// And writes the old owner took after it sent the Slot are gone.
-	if r := rungtest.RunSharded(flipping, shardedScenario(t, "moves-and-partitions"), 1); r.Linearizable {
-		t.Errorf("moves-and-partitions seed 1: expected a History that isn't Linearizable, got %v", r)
+	if r := rungtest.RunSharded(flipping, shardedScenario(t, "moves"), 2); r.Linearizable {
+		t.Errorf("moves seed 2: expected a History that isn't Linearizable, got %v", r)
 	}
 	for seed := uint64(1); seed <= 5; seed++ {
 		if r := rungtest.RunSharded(flipping, shardedScenario(t, "no-moves"), seed); !r.Passed() {
@@ -130,6 +130,110 @@ func TestRung7a(t *testing.T) {
 	}{{rung7Store, "moves", 1}, {rung7Store, "moves-and-partitions", 1}, {rung7Store, "moves", 7}, {rung7Store, "moves-and-everything", 39}, {busy, "moves-and-crashes", 79}} {
 		if r := rungtest.RunSharded(tt.store, shardedScenario(t, tt.scenario), tt.seed); !r.Passed() || r.Moves == 0 {
 			t.Errorf("a seed that failed before still fails: %v %v", r, r.Diverged)
+		}
+	}
+}
+
+// gossiping is a store whose Nodes learn the table, and of each other, by
+// gossip with the given detector, and never ask the Meta Group on a timer.
+func gossiping(mode cluster.GossipMode, tune func(*rungtest.ShardedStore)) rungtest.ShardedStore {
+	return sharded(func(s *rungtest.ShardedStore) {
+		s.Gossip = mode
+		tune(s)
+	})
+}
+
+// byGossip names a store by what gossip is allowed to decide in it.
+func byGossip(ownership, members bool) rungtest.ShardedStore {
+	return gossiping(cluster.GossipCounters, func(s *rungtest.ShardedStore) {
+		s.GossipDecides.Ownership, s.GossipDecides.Members = ownership, members
+		if members {
+			s.NewCore = func(id core.NodeID, ms []core.NodeID, rng core.Rand, stored core.Stored) core.Node {
+				cfg := raftConfig(id, ms, rng, raft.ReadsByIndex)
+				cfg.Stored, cfg.MembersByDecree = stored, true
+				return raft.New(cfg)
+			}
+		}
+	})
+}
+
+func shardedScenario7b(t *testing.T, name string) rungtest.ShardedScenario {
+	t.Helper()
+	for _, sc := range append(rungtest.Rung7, rungtest.Rung7b...) {
+		if sc.Name == name {
+			return sc
+		}
+	}
+	t.Fatalf("no scenario %q", name)
+	return rungtest.ShardedScenario{}
+}
+
+// Stage 7b, "Exposed": the table a Node has heard by gossip decides who
+// owns a Slot. Two Nodes on opposite sides of a Partition are each asked to
+// move the same Slot, to different Groups. Each side believes its own news.
+func TestOwnershipByGossipIsExposed(t *testing.T) {
+	r := rungtest.RunSharded(byGossip(true, false), shardedScenario7b(t, "rival-moves"), 1)
+	if r.TwoOwners == "" || r.Linearizable {
+		t.Errorf("seed 1: expected two Groups serving one Slot and a History that isn't Linearizable, got %v", r)
+	}
+	for seed := uint64(1); seed <= 5; seed++ {
+		if r := rungtest.RunSharded(byGossip(true, false), shardedScenario7b(t, "no-moves"), seed); !r.Passed() {
+			t.Errorf("no Moves: %v %v", r, r.Diverged)
+		}
+	}
+}
+
+// Stage 7b, "Exposed", part two: gossip decides who is in a Group. Each
+// replica drops the Members its Node thinks are dead. Across a long
+// Partition each side thinks the other dead, and each side's replicas are a
+// Majority of what they have left.
+func TestMembersByGossipIsExposed(t *testing.T) {
+	if r := rungtest.RunSharded(byGossip(false, true), shardedScenario7b(t, "long-partitions"), 1); r.TwoLeaders == "" {
+		t.Errorf("seed 1: expected two Leaders in one Term, got %v", r)
+	}
+	// With every Node reachable nobody is ever thought dead.
+	for seed := uint64(1); seed <= 5; seed++ {
+		if r := rungtest.RunSharded(byGossip(false, true), shardedScenario7b(t, "moves"), seed); !r.Passed() {
+			t.Errorf("Moves and no Faults: %v %v", r, r.Diverged)
+		}
+	}
+}
+
+// Stage 7b's promise (A§11.10): gossip carries the table and says who seems
+// alive, and decides nothing. The stage 7a guarantees hold with no Node
+// asking the Meta Group on a timer, and once Faults stop every Node agrees
+// on who is alive and on the table (part of the End-state verdict).
+func TestRung7b(t *testing.T) {
+	seeds := uint64(100)
+	if testing.Short() {
+		seeds = 5
+	}
+	stores := []rungtest.ShardedStore{
+		gossiping(cluster.GossipCounters, func(*rungtest.ShardedStore) {}),
+		gossiping(cluster.GossipSWIM, func(*rungtest.ShardedStore) {}),
+		gossiping(cluster.GossipSWIM, func(s *rungtest.ShardedStore) { s.Workload = busy.Workload; s.SessionTTL = busy.SessionTTL }),
+	}
+	runs, moved := 0, 0
+	for _, store := range stores {
+		for _, sc := range append(rungtest.Rung7, rungtest.Rung7b...) {
+			for seed := uint64(1); seed <= seeds; seed++ {
+				r := rungtest.RunSharded(store, sc, seed)
+				runs++
+				moved += r.Moves
+				if !r.Passed() || r.Recovery < 0 {
+					t.Errorf("%v\n  end state: %v", r, r.Diverged)
+				}
+			}
+		}
+	}
+	t.Logf("%d runs, %d Moves finished", runs, moved)
+
+	// The seeds that exposed gossip deciding.
+	for _, name := range []string{"rival-moves", "long-partitions"} {
+		for _, store := range stores[:2] {
+			if r := rungtest.RunSharded(store, shardedScenario7b(t, name), 1); !r.Passed() {
+				t.Errorf("a seed that exposed the naive store still fails: %v %v", r, r.Diverged)
+			}
 		}
 	}
 }

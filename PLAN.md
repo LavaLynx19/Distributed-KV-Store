@@ -87,10 +87,10 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P7a.12 Real shell: `kvnode` hosting several Groups, `kvctl move-slot`, harness → §P7
 - [x] P7a.13 Stage 7a suite, real runs with the pause of a Move measured, `retros/rung-7.md` → §P7
 - [x] P7b.0 Break stage 7b (gossip, A§11.10) into tasks → §P7
-- [ ] P7b.1 `internal/gossip`, a pure core: the Node list with addresses, the counters detector, exchanging everything with a Node on first contact; the Simulation carries its messages between Nodes → §P7
-- [ ] P7b.2 The whole table and Store time ride on gossip; Nodes stop asking the Meta Group on a timer; routing avoids Nodes thought dead; how long news of a Move takes to reach every Node, against 7a → §P7
-- [ ] P7b.3 Expose: ownership decided by gossip (a Move announced by gossip, highest version wins); two owners under a Partition → §P7
-- [ ] P7b.4 Expose: Membership decided by gossip (a Group drops a Member that gossip calls dead, with no Entry); two Leaders under a Partition → §P7
+- [x] P7b.1 `internal/gossip`, a pure core: the Node list with addresses, the counters detector, exchanging everything with a Node on first contact; the Simulation carries its messages between Nodes → §P7
+- [x] P7b.2 The whole table and Store time ride on gossip; Nodes stop asking the Meta Group on a timer; routing avoids Nodes thought dead; how long news of a Move takes to reach every Node, against 7a → §P7
+- [x] P7b.3 Expose: ownership decided by gossip (a Move announced by gossip, highest version wins); two owners under a Partition → §P7
+- [x] P7b.4 Expose: Membership decided by gossip (a Group drops a Member that gossip calls dead, with no Entry); two Leaders under a Partition → §P7
 - [ ] P7b.5 The SWIM detector: ping, ping through others, suspicion, answering a suspicion → §P7
 - [ ] P7b.6 Detectors compared: time to notice a dead Node, false alarms under a slow Node, a one-way cut, a Partition and lost messages, and messages sent → §P7
 - [ ] P7b.7 Joining with one address, leaving; real shell: gossip on the Nodes' network, addresses learned as they arrive; `kvnode -join`, `kvctl nodes` → §P7
