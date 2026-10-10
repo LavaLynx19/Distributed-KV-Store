@@ -12,9 +12,11 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"distributed-kv-store/internal/automation"
 	"distributed-kv-store/internal/core"
 	"distributed-kv-store/internal/fsm"
 	"distributed-kv-store/internal/gossip"
@@ -34,11 +36,21 @@ import (
 // idea of who leads are hints; each Group decides what it owns by its own
 // Log.
 type Store struct {
-	// Node is this Node's number. Nodes, Groups and Replicas place every
-	// Group's replicas (shard.Hosts).
-	Node, Nodes, Groups, Replicas int
-	// Local are the replicas this Node hosts, by Group.
+	// Node is this Node's number. Nodes, Groups and Replicas say where every
+	// Group's replicas were when the store was founded (shard.Hosts), and
+	// Slots how many Slots it has.
+	Node, Nodes, Groups, Replicas, Slots int
+	// Local are the replicas this Node hosts, by Group. Read it with
+	// replica: with Auto set, replicas come and go (A§11.11).
 	Local map[shard.GroupID]*Node
+	// Peers is the address, for other Nodes, of each Node this one knows
+	// of. Like Clients it grows as gossip brings more.
+	Peers map[int]string
+	// Auto makes this Node take its part in replacing dead Nodes and in
+	// moving Slots off busy Groups (auto.go). DeadWait is how long it must
+	// have thought a Node dead before it says so.
+	Auto     bool
+	DeadWait time.Duration
 	// Clients is the client API address of each Node this one knows of, as
 	// a URL. It starts with what the Node was told and grows as gossip
 	// brings more (A§11.10). Read it with clientURL.
@@ -52,17 +64,58 @@ type Store struct {
 	// Meta Leader here moves Store time on (A§11.7).
 	Tick, TimeEvery time.Duration
 
-	mu     sync.Mutex // guards table, leader, Clients and Gossip
+	mu     sync.Mutex // guards table, leader, Clients, Peers, Gossip, watch, meter and report
 	table  shard.Table
 	leader map[shard.GroupID]int // the Node last heard to host each Group's Leader
 	httpc  *http.Client
+
+	lmu     sync.RWMutex // guards Local and handles
+	handles map[shard.GroupID]*handle
+	// open starts a replica of a Group here and drop stops one and removes
+	// its data. role and setRole read and record whether a replica joined
+	// its Group late or was dropped (OpenStore).
+	open    func(g shard.GroupID, members []core.NodeID) error
+	drop    func(g shard.GroupID) error
+	role    func(g shard.GroupID) string
+	setRole func(g shard.GroupID, role string) error
+	roles   map[shard.GroupID]string
+
+	// counts is the load each Slot has put on this Node in the window now
+	// open. The rest is this Node's part in automation (auto.go).
+	counts   []atomic.Uint32
+	meter    automation.Meter
+	watch    automation.Watch
+	report   shard.Report
+	loadAt   time.Time
+	balancer automation.Balancer
+}
+
+// replica is this Node's replica of Group g, if it has one.
+func (s *Store) replica(g shard.GroupID) (*Node, bool) {
+	s.lmu.RLock()
+	defer s.lmu.RUnlock()
+	n, hosted := s.Local[g]
+	return n, hosted
+}
+
+// replicas lists the replicas this Node has, by Group.
+func (s *Store) replicas() map[shard.GroupID]*Node {
+	s.lmu.RLock()
+	defer s.lmu.RUnlock()
+	out := make(map[shard.GroupID]*Node, len(s.Local))
+	for g, n := range s.Local {
+		out[g] = n
+	}
+	return out
 }
 
 // Start gives the Store the table a store begins with and runs its agent
 // until ctx ends. The replicas in Local must be running.
 func (s *Store) Start(ctx context.Context, slots int) {
-	s.table = meta.New(slots, s.Groups).Table()
+	s.table = meta.NewPlaced(slots, s.Groups, s.Nodes, s.Replicas).Table()
 	s.leader = map[shard.GroupID]int{}
+	s.counts = make([]atomic.Uint32, slots)
+	s.loadAt = time.Now()
 	// Requests to other Nodes come as fast as clients send them, many at
 	// once. The default of two idle connections kept per Node would open
 	// and close a connection for nearly every one.
@@ -108,7 +161,7 @@ func (s *Store) gossip(ctx context.Context) {
 		case <-ticker.C:
 		}
 		var held *shard.Table
-		if n, hosted := s.Local[shard.Meta]; hosted {
+		if n, hosted := s.replica(shard.Meta); hosted {
 			look, cancel := context.WithTimeout(ctx, s.GossipEvery)
 			n.Inspect(look, func(m Machine) {
 				t := m.(*meta.Machine).Table()
@@ -116,10 +169,12 @@ func (s *Store) gossip(ctx context.Context) {
 			})
 			cancel()
 		}
+		leads := s.leads(ctx)
 		s.mu.Lock()
 		if held != nil {
 			s.Gossip.SetTable(*held)
 		}
+		s.tell(leads)
 		out := s.Gossip.Tick()
 		s.gossipLearn()
 		s.mu.Unlock()
@@ -136,6 +191,9 @@ func (s *Store) gossipLearn() {
 	for _, m := range s.Gossip.Members() {
 		if m.Client != "" {
 			s.Clients[m.ID] = "http://" + m.Client
+		}
+		if m.Peer != "" {
+			s.Peers[m.ID] = m.Peer
 		}
 	}
 }
@@ -228,9 +286,24 @@ const (
 	unknown                 // it may or may not have taken effect
 )
 
+// load says which Slot a request falls on and what it costs (A§11.11), so
+// that the Node whose replica answers it can count it. The zero value is a
+// request that isn't counted.
+type load struct {
+	slot int
+	cost uint32
+}
+
+func loadOf(slot shard.Slot, read bool) load {
+	if read {
+		return load{slot: int(slot) + 1, cost: shard.ReadCost}
+	}
+	return load{slot: int(slot) + 1, cost: shard.WriteCost}
+}
+
 // local hands a request to this Node's replica of Group g.
-func (s *Store) local(ctx context.Context, g shard.GroupID, read bool, payload []byte) (outcome, []byte, int) {
-	n, hosted := s.Local[g]
+func (s *Store) local(ctx context.Context, g shard.GroupID, read bool, payload []byte, l load) (outcome, []byte, int) {
+	n, hosted := s.replica(g)
 	if !hosted {
 		return refused, nil, 0
 	}
@@ -243,6 +316,9 @@ func (s *Store) local(ctx context.Context, g shard.GroupID, read bool, payload [
 	hint, _ := shard.SplitReplicaID(uint64(reply.Leader))
 	switch reply.Reason {
 	case core.OK:
+		if l.slot > 0 && l.slot <= len(s.counts) {
+			s.counts[l.slot-1].Add(l.cost)
+		}
 		return answered, reply.Response, s.Node
 	case core.NotLeader, core.NoMajority:
 		return refused, nil, hint
@@ -260,10 +336,15 @@ type internalReply struct {
 // ask sends a request to Group g. If the Node it tries says the Leader is
 // on another, and so that nothing happened, it tries that one, once.
 func (s *Store) ask(ctx context.Context, g shard.GroupID, read, stamp bool, payload []byte) (outcome, []byte) {
+	return s.askCounted(ctx, g, read, stamp, payload, load{})
+}
+
+// askCounted is ask for a client's request, which adds to its Slot's load.
+func (s *Store) askCounted(ctx context.Context, g shard.GroupID, read, stamp bool, payload []byte, l load) (outcome, []byte) {
 	s.mu.Lock()
 	_, known := s.leader[g]
 	s.mu.Unlock()
-	o, raw := s.askOnce(ctx, g, read, stamp, payload)
+	o, raw := s.askOnce(ctx, g, read, stamp, payload, l)
 	if o != refused || known {
 		return o, raw
 	}
@@ -275,18 +356,21 @@ func (s *Store) ask(ctx context.Context, g shard.GroupID, read, stamp bool, payl
 	if !told {
 		return o, raw
 	}
-	return s.askOnce(ctx, g, read, stamp, payload)
+	return s.askOnce(ctx, g, read, stamp, payload, l)
 }
 
 // askOnce sends a request to Group g: to this Node's replica if it may
 // lead, otherwise to the Node believed to host the Leader, which handles it
 // or refuses and never passes it on (A§11.3). With stamp, the Node that
 // proposes it puts its Store time in (A§11.7).
-func (s *Store) askOnce(ctx context.Context, g shard.GroupID, read, stamp bool, payload []byte) (outcome, []byte) {
+func (s *Store) askOnce(ctx context.Context, g shard.GroupID, read, stamp bool, payload []byte, l load) (outcome, []byte) {
 	s.mu.Lock()
 	target, known := s.leader[g]
+	hosts := slices.Clone(s.table.Hosts(g))
 	s.mu.Unlock()
-	hosts := shard.Hosts(g, s.Nodes, s.Replicas)
+	if len(hosts) == 0 {
+		return refused, nil
+	}
 	if !known {
 		// A guess. A Node gossip thinks is dead isn't worth one, unless
 		// they all are.
@@ -317,11 +401,11 @@ func (s *Store) askOnce(ctx context.Context, g shard.GroupID, read, stamp bool, 
 		if stamp {
 			payload = fsm.Stamp(payload, s.Table().StoreTime)
 		}
-		o, raw, hint := s.local(ctx, g, read, payload)
+		o, raw, hint := s.local(ctx, g, read, payload, l)
 		learn(o, hint)
 		return o, raw
 	}
-	url := fmt.Sprintf("%s/v1/internal/group/%d?read=%t&stamp=%t", s.clientURL(target), g, read, stamp)
+	url := fmt.Sprintf("%s/v1/internal/group/%d?read=%t&stamp=%t&slot=%d&cost=%d", s.clientURL(target), g, read, stamp, l.slot, l.cost)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		return refused, nil
@@ -359,7 +443,9 @@ func (s *Store) internal(w http.ResponseWriter, r *http.Request) {
 	if q.Get("stamp") == "true" {
 		payload = fsm.Stamp(payload, s.Table().StoreTime)
 	}
-	o, raw, hint := s.local(ctx, shard.GroupID(g), q.Get("read") == "true", payload)
+	slot, _ := strconv.Atoi(q.Get("slot"))
+	cost, _ := strconv.ParseUint(q.Get("cost"), 10, 32)
+	o, raw, hint := s.local(ctx, shard.GroupID(g), q.Get("read") == "true", payload, load{slot: slot, cost: uint32(cost)})
 	writeJSON(w, http.StatusOK, internalReply{Outcome: o, Response: raw, Leader: hint})
 }
 
@@ -393,6 +479,7 @@ func (s *Store) serve(w http.ResponseWriter, r *http.Request, cmd fsm.Command) (
 	}
 
 	g := table.OwnerOf(cmd.Key)
+	slot := shard.SlotOf(cmd.Key, len(table.Slots))
 	if cmd.Op == fsm.OpTxn {
 		keys := make([]string, 0, len(cmd.Conds)+len(cmd.Writes))
 		for _, c := range cmd.Conds {
@@ -404,7 +491,7 @@ func (s *Store) serve(w http.ResponseWriter, r *http.Request, cmd fsm.Command) (
 		if len(keys) == 0 {
 			return fsm.Response{Status: fsm.StatusInvalid}, true
 		}
-		g = table.OwnerOf(keys[0])
+		g, slot = table.OwnerOf(keys[0]), shard.SlotOf(keys[0], len(table.Slots))
 		for _, k := range keys {
 			if table.OwnerOf(k) != g {
 				return fsm.Response{Status: fsm.StatusCrossGroup}, true
@@ -412,7 +499,7 @@ func (s *Store) serve(w http.ResponseWriter, r *http.Request, cmd fsm.Command) (
 		}
 	}
 	read := cmd.Op == fsm.OpGet
-	o, raw := s.ask(ctx, g, read, !read, cmd.Encode())
+	o, raw := s.askCounted(ctx, g, read, !read, cmd.Encode(), loadOf(slot, read))
 	if o != answered {
 		return fail(o)
 	}
@@ -486,7 +573,8 @@ func (s *Store) agent(ctx context.Context) {
 			log.Printf("store: node %d: Slot %d handed over by Group %d after being frozen for %d ms", s.Node, slot, g, frozenFor)
 		}}
 	var lastTime time.Time
-	for {
+	auto := &automaton{s: s, e: e, asking: map[shard.GroupID]bool{}}
+	for round := 0; ; round++ {
 		select {
 		case <-ctx.Done():
 			return
@@ -498,12 +586,22 @@ func (s *Store) agent(ctx context.Context) {
 		// The table arrives by gossip. Nobody asks the Meta Group on a timer.
 		step, cancel := context.WithTimeout(ctx, s.Timeout)
 		table := s.Table()
-		for g, n := range s.Local {
+		slow := s.Auto && round%autoEvery == 0
+		if slow {
+			auto.replicasWanted(ctx, table)
+		}
+		for g, n := range s.replicas() {
 			st, ok := n.Status(step)
 			if !ok || st.Role != core.LeaderRole {
 				continue
 			}
+			if slow {
+				auto.changeMembers(ctx, g, n, st, table)
+			}
 			if g == shard.Meta {
+				if slow {
+					auto.steer(ctx, n, st)
+				}
 				// The Meta Leader's clock is the store's clock (A§11.7).
 				if time.Since(lastTime) >= s.TimeEvery {
 					lastTime = time.Now()
@@ -536,7 +634,9 @@ func (e storeEnv) Now() int64 { return time.Now().UnixMilli() }
 func (e storeEnv) WithMachine(g shard.GroupID, fn func(*shardfsm.Machine)) {
 	ctx, cancel := context.WithTimeout(e.ctx, e.s.Timeout)
 	defer cancel()
-	e.s.Local[g].Inspect(ctx, func(m Machine) { fn(m.(*shardfsm.Machine)) })
+	if n, hosted := e.s.replica(g); hosted {
+		n.Inspect(ctx, func(m Machine) { fn(m.(*shardfsm.Machine)) })
+	}
 }
 
 // back runs fn on the agent's goroutine, unless the Node is stopping.
@@ -551,7 +651,9 @@ func (e storeEnv) Local(g shard.GroupID, payload []byte, done func()) {
 	go func() {
 		ctx, cancel := context.WithTimeout(e.ctx, e.s.Timeout)
 		defer cancel()
-		e.s.Local[g].Propose(ctx, payload)
+		if n, hosted := e.s.replica(g); hosted {
+			n.Propose(ctx, payload)
+		}
 		e.back(done)
 	}()
 }
@@ -588,7 +690,7 @@ func (s *Store) status(w http.ResponseWriter, r *http.Request) {
 	out := storeStatus{ID: s.Node, TableVersion: table.Version, StoreTime: table.StoreTime}
 	roles := map[core.Role]string{core.Follower: "follower", core.Candidate: "candidate", core.LeaderRole: "leader"}
 	for g := 0; g <= s.Groups; g++ {
-		n, hosted := s.Local[shard.GroupID(g)]
+		n, hosted := s.replica(shard.GroupID(g))
 		if !hosted {
 			continue
 		}
@@ -604,6 +706,7 @@ type tableJSON struct {
 	Version   uint64      `json:"version"`
 	StoreTime int64       `json:"store_time"`
 	Slots     []ownerJSON `json:"slots"`
+	Groups    []groupJSON `json:"groups"`
 }
 
 type ownerJSON struct {
@@ -611,6 +714,18 @@ type ownerJSON struct {
 	Group    shard.GroupID `json:"group"`
 	Epoch    uint32        `json:"epoch"`
 	MovingTo shard.GroupID `json:"moving_to,omitempty"`
+	// Load is the Slot's smoothed load as this Node has heard it (A§11.11).
+	Load uint32 `json:"load"`
+}
+
+// groupJSON is one Group's Members as the table has them, and the change
+// the Meta Group wants made, if any.
+type groupJSON struct {
+	Group   shard.GroupID `json:"group"`
+	Members []int         `json:"members"`
+	Add     int           `json:"add,omitempty"`
+	Remove  int           `json:"remove,omitempty"`
+	Load    uint64        `json:"load"`
 }
 
 // tableHandler returns the table this Node holds, refreshed first.
@@ -620,8 +735,13 @@ func (s *Store) tableHandler(w http.ResponseWriter, r *http.Request) {
 	s.refresh(ctx)
 	t := s.Table()
 	out := tableJSON{Version: t.Version, StoreTime: t.StoreTime}
+	heard := s.heardLoad()
+	sums := automation.GroupLoad(t, heard, s.Groups)
 	for i, o := range t.Slots {
-		out.Slots = append(out.Slots, ownerJSON{Slot: i, Group: o.Group, Epoch: o.Epoch, MovingTo: o.MovingTo})
+		out.Slots = append(out.Slots, ownerJSON{Slot: i, Group: o.Group, Epoch: o.Epoch, MovingTo: o.MovingTo, Load: heard[i]})
+	}
+	for g, row := range t.Groups {
+		out.Groups = append(out.Groups, groupJSON{Group: shard.GroupID(g), Members: row.Members, Add: row.Add, Remove: row.Remove, Load: sums[g]})
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -674,7 +794,7 @@ func (s *Store) debugItems(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	out := []GroupItems{}
 	for g := 1; g <= s.Groups; g++ {
-		n, hosted := s.Local[shard.GroupID(g)]
+		n, hosted := s.replica(shard.GroupID(g))
 		if !hosted {
 			continue
 		}

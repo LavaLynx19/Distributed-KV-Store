@@ -416,3 +416,29 @@ func TestDropDataKeepsTermAndVote(t *testing.T) {
 		t.Fatalf("after dropping: %+v", stored)
 	}
 }
+
+// The same on a real directory, where the Log is a directory of its own.
+func TestDropDataOnARealDisk(t *testing.T) {
+	dir := t.TempDir()
+	s, _, err := Open(dir, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hard := core.HardState{Term: 3, VotedFor: 2}
+	if err := s.Save(&core.Persist{HardState: &hard, Entries: []core.Entry{{Index: 1, Term: 3, Kind: core.EntryCommand, Payload: []byte("x")}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := DropData(OSFS{}, dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	_, stored, err := Open(dir, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.HardState != hard || len(stored.Entries) != 0 {
+		t.Fatalf("after dropping: %+v", stored)
+	}
+}

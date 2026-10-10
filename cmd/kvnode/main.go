@@ -54,6 +54,8 @@ func main() {
 	founders := flag.Int("founders", 0, "with -join: how many Nodes the store was founded with")
 	detector := flag.String("detector", "counters", "with -data-groups: how quiet Nodes are noticed, counters or swim (A§11.10)")
 	sharedSync := flag.Bool("shared-sync", false, "with -data-groups: this Node's replicas share each flush of the drive rather than each asking for its own; helps on macOS, where a flush covers the whole drive")
+	auto := flag.Bool("auto", true, "with -data-groups: replace dead Nodes with Spares and move Slots off busy Groups without being asked (A§11.11)")
+	deadWait := flag.Duration("dead-wait", 5*time.Second, "with -auto: how long this Node must have thought a Node dead before it says so; replacing a Node copies every Group it was in, so make it longer than a restart")
 	reads := flag.String("reads", "index", "how gets are answered: index (read index, A§6.2), log (as Log Entries), or lease (from the Leader's memory under a lease: faster, and not Linearizable if clocks run at different speeds)")
 	flag.Parse()
 
@@ -69,7 +71,7 @@ func main() {
 		log.Fatalf("kvnode: -reads must be index, log or lease, not %q", *reads)
 	}
 	if *dataGroups > 0 {
-		if err := runStore(int(*id), *peersFlag, *clientsFlag, *listenPeer, *listenClient, *dataGroups, *replicas, *slots, *tick, *electionTicks, *heartbeatTicks, *timeout, *data, *snapshotEvery, *sessionTTL, *sharedSync, *join, *founders, *detector); err != nil {
+		if err := runStore(int(*id), *peersFlag, *clientsFlag, *listenPeer, *listenClient, *dataGroups, *replicas, *slots, *tick, *electionTicks, *heartbeatTicks, *timeout, *data, *snapshotEvery, *sessionTTL, *sharedSync, *join, *founders, *detector, *auto, *deadWait); err != nil {
 			log.Fatalf("kvnode: %v", err)
 		}
 		return
@@ -183,7 +185,7 @@ func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string
 }
 
 // runStore runs this process as one Node of a store with several Groups.
-func runStore(id int, peersFlag, clientsFlag, listenPeer, listenClient string, groups, replicas, slots int, tick time.Duration, electionTicks, heartbeatTicks int, timeout time.Duration, data string, snapshotEvery int, sessionTTL time.Duration, sharedSync bool, join string, founders int, detector string) error {
+func runStore(id int, peersFlag, clientsFlag, listenPeer, listenClient string, groups, replicas, slots int, tick time.Duration, electionTicks, heartbeatTicks int, timeout time.Duration, data string, snapshotEvery int, sessionTTL time.Duration, sharedSync bool, join string, founders int, detector string, auto bool, deadWait time.Duration) error {
 	peerAddrs, err := parseAddrs(peersFlag)
 	if err != nil {
 		return fmt.Errorf("-peers: %w", err)
@@ -244,6 +246,7 @@ func runStore(id int, peersFlag, clientsFlag, listenPeer, listenClient string, g
 		Peers: peers, Clients: clients, Listener: ln, Data: data,
 		Tick: tick, ElectionTicks: electionTicks, HeartbeatTicks: heartbeatTicks,
 		SnapshotEvery: snapshotEvery, SessionTTL: sessionTTL, Timeout: timeout, SharedSync: sharedSync,
+		Auto: auto, DeadWait: deadWait,
 	})
 	if err != nil {
 		return err

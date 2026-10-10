@@ -119,6 +119,7 @@ func (a *API) Handler() http.Handler {
 		mux.HandleFunc("POST /v1/sessions", a.openSession)
 		mux.HandleFunc("POST /v1/internal/group/{group}", a.Store.internal)
 		mux.HandleFunc("POST /v1/internal/gossip", a.Store.gossipReceive)
+		mux.HandleFunc("GET /v1/internal/members/{group}", a.Store.members)
 		mux.HandleFunc("GET /v1/nodes", a.Store.nodes)
 		mux.HandleFunc("GET /v1/status", a.Store.status)
 		mux.HandleFunc("GET /v1/table", a.Store.tableHandler)

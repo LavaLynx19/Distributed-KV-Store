@@ -316,11 +316,26 @@ func DropData(fs FS, dir string, opts Options) error {
 		if strings.HasPrefix(name, "state") {
 			continue
 		}
-		if err := fs.Remove(filepath.Join(dir, name)); err != nil {
+		if err := removeAll(fs, filepath.Join(dir, name)); err != nil {
 			return err
 		}
 	}
 	return fs.SyncDir(dir)
+}
+
+// removeAll removes a file, or a directory and everything in it.
+func removeAll(fs FS, path string) error {
+	if names, err := fs.ReadDir(path); err == nil {
+		for _, name := range names {
+			if err := removeAll(fs, filepath.Join(path, name)); err != nil {
+				return err
+			}
+		}
+	}
+	if err := fs.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // damageMark is the file whose presence says the directory was found

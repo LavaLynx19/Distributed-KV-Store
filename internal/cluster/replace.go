@@ -155,11 +155,12 @@ func (c *Cluster) dead(nd *node, table shard.Table) []int {
 	})
 }
 
-// detectorDead lists the Nodes this Node's own gossip gives up for dead.
+// detectorDead lists the Nodes this Node's own gossip gives up for dead, or
+// was told have left: either way they are gone.
 func (nd *node) detectorDead() []int {
 	var dead []int
 	for _, m := range nd.gossip.Members() {
-		if m.Status == gossip.Dead {
+		if m.Status == gossip.Dead || m.Status == gossip.Left {
 			dead = append(dead, m.ID)
 		}
 	}
