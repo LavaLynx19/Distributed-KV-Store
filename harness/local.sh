@@ -8,6 +8,8 @@
 #   harness/local.sh members           # what each Node says of the Group (kvctl)
 #   harness/local.sh table             # with DATA_GROUPS: which Group owns each Slot (kvctl)
 #   harness/local.sh move <slot> <group>   # with DATA_GROUPS: move a Slot (kvctl)
+#   harness/local.sh join <id>         # with DATA_GROUPS: start one more Node, told only where Node 1 is
+#   harness/local.sh nodes             # with DATA_GROUPS: what each Node's gossip thinks (kvctl)
 #   harness/local.sh status
 #   harness/local.sh pause <id>        # freeze one Member (SIGSTOP)
 #   harness/local.sh resume <id>       # let it continue (SIGCONT)
@@ -113,6 +115,20 @@ case "${1:-}" in
   table)
     "$ROOT/bin/kvctl" -nodes "$(urls)" table
     ;;
+  nodes)
+    "$ROOT/bin/kvctl" -nodes "$(urls)" nodes
+    ;;
+  join)
+    id="${2:?usage: local.sh join <id>}"
+    data=()
+    [[ -n "${NODATA:-}" ]] || data=(-data "$OUT/data$id")
+    "$BIN" -id "$id" -peers "$id=127.0.0.1:$((7000 + id))" -clients "$id=127.0.0.1:$((8000 + id))" \
+      -join "1=127.0.0.1:8001" -founders "$(founders)" -data-groups "$(cat "$OUT/groups")" -slots "$(cat "$OUT/slots")" \
+      ${data[@]+"${data[@]}"} ${KVNODE_FLAGS:-} >>"$OUT/node$id.log" 2>&1 &
+    echo $! >"$OUT/node$id.pid"
+    (( id <= $(nodes) )) || echo "$id" >"$OUT/nodes"
+    echo "node $id started, told only where node 1 is"
+    ;;
   move)
     "$ROOT/bin/kvctl" -nodes "$(urls)" move "${2:?usage: local.sh move <slot> <group>}" "${3:?usage: local.sh move <slot> <group>}"
     ;;
@@ -135,7 +151,7 @@ case "${1:-}" in
     echo "stopped"
     ;;
   *)
-    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

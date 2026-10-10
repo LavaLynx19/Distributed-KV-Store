@@ -7,6 +7,7 @@ import (
 	"distributed-kv-store/internal/cluster"
 	"distributed-kv-store/internal/core"
 	"distributed-kv-store/internal/fsm"
+	"distributed-kv-store/internal/gossip"
 	"distributed-kv-store/internal/raft"
 	"distributed-kv-store/internal/shard"
 	"distributed-kv-store/internal/transport"
@@ -99,5 +100,72 @@ func TestMoveASlot(t *testing.T) {
 	}
 	if diffs := c.EndState(); len(diffs) > 0 {
 		t.Fatalf("end state: %v", diffs)
+	}
+}
+
+func newGossipCluster(seed uint64, mode cluster.GossipMode, spares int) *cluster.Cluster {
+	transport.Register(raft.MessageBodies()...)
+	return cluster.New(cluster.Config{
+		Seed: seed, Nodes: 5, Groups: 3, Replicas: 3, Slots: 8, Spares: spares,
+		NewCore: newCore, Copy: transport.NewLoopback().Copy, Gossip: mode,
+	})
+}
+
+// A Node started knowing one other becomes known to all, address and all,
+// and can route requests though it hosts no Group (A§11.10).
+func TestASpareJoinsWithOneAddress(t *testing.T) {
+	for _, mode := range []cluster.GossipMode{cluster.GossipCounters, cluster.GossipSWIM} {
+		c := newGossipCluster(3, mode, 2)
+		c.S.Run(400)
+		if diffs := c.GossipAgrees(); len(diffs) > 0 {
+			t.Fatalf("mode %d: after 400 units: %v", mode, diffs)
+		}
+		if n := len(c.Gossip(7)); n != 7 {
+			t.Fatalf("mode %d: the second Spare knows %d Nodes, want 7", mode, n)
+		}
+		// Ask the Spare for a key: it knows the table and where to send it.
+		if r := do(t, c, 6, fsm.Command{Op: fsm.OpPut, Key: "k1", Value: []byte("via a Spare")}); r.Status != fsm.StatusOK {
+			t.Fatalf("mode %d: a put through a Spare: %+v", mode, r)
+		}
+		if r := do(t, c, 7, fsm.Command{Op: fsm.OpGet, Key: "k1"}); string(r.Value) != "via a Spare" {
+			t.Fatalf("mode %d: a get through the other Spare: %+v", mode, r)
+		}
+	}
+}
+
+// A Node that says it is leaving is marked as gone at once and never
+// suspected; one that just stops is suspected, then taken for dead.
+func TestLeavingAndDyingLookDifferent(t *testing.T) {
+	status := func(c *cluster.Cluster, at, about int) gossip.Status {
+		for _, m := range c.Gossip(at) {
+			if m.ID == about {
+				return m.Status
+			}
+		}
+		return 99
+	}
+	for _, mode := range []cluster.GossipMode{cluster.GossipCounters, cluster.GossipSWIM} {
+		c := newGossipCluster(4, mode, 0)
+		c.S.Run(300)
+		c.LeaveNode(4)
+		c.CrashNode(5)
+		c.S.Run(360)
+		if got := status(c, 1, 4); got != gossip.Left {
+			t.Fatalf("mode %d: 60 units after node 4 said it was leaving, node 1 thinks it is %v", mode, got)
+		}
+		if got := status(c, 1, 5); got == gossip.Dead || got == gossip.Left {
+			t.Fatalf("mode %d: 60 units after node 5 stopped, node 1 already thinks it is %v", mode, got)
+		}
+		c.S.Run(1200)
+		if a, b := status(c, 2, 4), status(c, 2, 5); a != gossip.Left || b != gossip.Dead {
+			t.Fatalf("mode %d: long after, node 2 thinks node 4 is %v and node 5 is %v; want left and dead", mode, a, b)
+		}
+		// Both come back and are taken back.
+		c.RestartNode(4)
+		c.RestartNode(5)
+		c.S.Run(2000)
+		if diffs := c.GossipAgrees(); len(diffs) > 0 {
+			t.Fatalf("mode %d: after both returned: %v", mode, diffs)
+		}
 	}
 }

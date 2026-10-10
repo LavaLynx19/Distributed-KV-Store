@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"distributed-kv-store/internal/core"
+	"distributed-kv-store/internal/gossip"
 	"distributed-kv-store/internal/meta"
 	"distributed-kv-store/internal/raft"
 	"distributed-kv-store/internal/shard"
@@ -21,13 +22,21 @@ import (
 
 // StoreConfig describes one Node of a store with several Groups.
 type StoreConfig struct {
-	// Node is this Node's number, from 1. Nodes, Groups and Replicas say
-	// where every Group's replicas are (shard.Hosts), and Slots how many
-	// Slots the store has. Every Node must be given the same four numbers.
+	// Node is this Node's number, from 1. Nodes is how many Nodes the store
+	// was founded with: with Groups and Replicas it says where every
+	// Group's replicas are (shard.Hosts). Slots is how many Slots the store
+	// has. Every Node must be given the same four numbers. A Node numbered
+	// above Nodes hosts no Group: it is a Spare (A§11.10).
 	Node, Nodes, Groups, Replicas, Slots int
-	// Peers is every Node's address for other Nodes, and Clients every
-	// Node's client API address, both as host:port.
+	// Peers and Clients are the addresses, for other Nodes and for clients,
+	// of this Node and of the Nodes it is told of at start, as host:port. A
+	// founder is told of every founder. A Node joining later needs only
+	// itself and one other in Clients; gossip brings the rest.
 	Peers, Clients map[int]string
+	// Detector is how quiet Nodes are noticed, and GossipEvery the length
+	// of a gossip round (default 10 ticks).
+	Detector    gossip.Detector
+	GossipEvery time.Duration
 	// Listener accepts other Nodes' connections.
 	Listener net.Listener
 	// Data is where this Node keeps its replicas' durable state, one
@@ -53,10 +62,21 @@ func OpenStore(ctx context.Context, cfg StoreConfig) (*Store, func(), error) {
 		Node: cfg.Node, Nodes: cfg.Nodes, Groups: cfg.Groups, Replicas: cfg.Replicas,
 		Local: map[shard.GroupID]*Node{}, Clients: map[int]string{},
 		Timeout: cfg.Timeout, Tick: 2 * cfg.Tick, TimeEvery: 10 * cfg.Tick,
+		GossipEvery: cfg.GossipEvery,
 	}
+	if s.GossipEvery == 0 {
+		s.GossipEvery = 10 * cfg.Tick
+	}
+	seeds := make([]gossip.Member, 0, len(cfg.Clients))
 	for n, addr := range cfg.Clients {
 		s.Clients[n] = "http://" + addr
+		seeds = append(seeds, gossip.Member{ID: n, Peer: cfg.Peers[n], Client: addr})
 	}
+	s.Gossip = gossip.New(gossip.Config{
+		ID: cfg.Node, Peer: cfg.Peers[cfg.Node], Client: cfg.Clients[cfg.Node], Seeds: seeds,
+		Rand:     rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), uint64(cfg.Node))),
+		Detector: cfg.Detector,
+	})
 
 	// One network carries every Group's messages: a replica's id says which
 	// Node it is on and which Group it belongs to.
@@ -84,14 +104,15 @@ func OpenStore(ctx context.Context, cfg StoreConfig) (*Store, func(), error) {
 		for _, n := range hosts {
 			id := core.NodeID(shard.ReplicaID(n, g))
 			members = append(members, id)
-			if n == cfg.Node {
-				hosted = true
-			} else {
-				remote[id] = cfg.Peers[n]
-			}
+			hosted = hosted || n == cfg.Node
 		}
 		if !hosted {
 			continue
+		}
+		for _, n := range hosts {
+			if n != cfg.Node {
+				remote[core.NodeID(shard.ReplicaID(n, g))] = cfg.Peers[n]
+			}
 		}
 		var machine Machine
 		if g == shard.Meta {

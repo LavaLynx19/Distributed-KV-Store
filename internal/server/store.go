@@ -17,6 +17,7 @@ import (
 
 	"distributed-kv-store/internal/core"
 	"distributed-kv-store/internal/fsm"
+	"distributed-kv-store/internal/gossip"
 	"distributed-kv-store/internal/meta"
 	"distributed-kv-store/internal/mover"
 	"distributed-kv-store/internal/shard"
@@ -38,15 +39,20 @@ type Store struct {
 	Node, Nodes, Groups, Replicas int
 	// Local are the replicas this Node hosts, by Group.
 	Local map[shard.GroupID]*Node
-	// Clients is every Node's client API address, as a URL.
+	// Clients is the client API address of each Node this one knows of, as
+	// a URL. It starts with what the Node was told and grows as gossip
+	// brings more (A§11.10). Read it with clientURL.
 	Clients map[int]string
+	// Gossip is this Node's gossip. GossipEvery is the length of a round.
+	Gossip      *gossip.Node
+	GossipEvery time.Duration
 	// Timeout bounds one request to a Group.
 	Timeout time.Duration
 	// Tick is how often the agent looks for work, and TimeEvery how often a
 	// Meta Leader here moves Store time on (A§11.7).
 	Tick, TimeEvery time.Duration
 
-	mu     sync.Mutex
+	mu     sync.Mutex // guards table, leader, Clients and Gossip
 	table  shard.Table
 	leader map[shard.GroupID]int // the Node last heard to host each Group's Leader
 	httpc  *http.Client
@@ -64,6 +70,146 @@ func (s *Store) Start(ctx context.Context, slots int) {
 		MaxIdleConns: 4096, MaxIdleConnsPerHost: 512, IdleConnTimeout: 30 * time.Second,
 	}}
 	go s.agent(ctx)
+	go s.gossip(ctx)
+}
+
+// clientURL is where Node n's client API is, or "" if this Node hasn't
+// heard.
+func (s *Store) clientURL(n int) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Clients[n]
+}
+
+// gossip runs this Node's gossip rounds until ctx ends, and then says it is
+// leaving. A Node that hosts a Meta Group replica puts that replica's table
+// into its gossip each round: that is how the table gets there (A§11.10).
+func (s *Store) gossip(ctx context.Context) {
+	ticker := time.NewTicker(s.GossipEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			s.mu.Lock()
+			bye := s.Gossip.Leave()
+			s.mu.Unlock()
+			farewell, cancel := context.WithTimeout(context.Background(), s.GossipEvery)
+			defer cancel()
+			var wg sync.WaitGroup
+			for _, m := range bye {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					s.gossipPost(farewell, m)
+				}()
+			}
+			wg.Wait()
+			return
+		case <-ticker.C:
+		}
+		var held *shard.Table
+		if n, hosted := s.Local[shard.Meta]; hosted {
+			look, cancel := context.WithTimeout(ctx, s.GossipEvery)
+			n.Inspect(look, func(m Machine) {
+				t := m.(*meta.Machine).Table()
+				held = &t
+			})
+			cancel()
+		}
+		s.mu.Lock()
+		if held != nil {
+			s.Gossip.SetTable(*held)
+		}
+		out := s.Gossip.Tick()
+		s.gossipLearn()
+		s.mu.Unlock()
+		s.gossipSend(ctx, out)
+	}
+}
+
+// gossipLearn takes what gossip now holds as what this Node routes by: the
+// table, and where every Node is. The caller holds mu.
+func (s *Store) gossipLearn() {
+	if t := s.Gossip.Table(); t.Version > s.table.Version || t.StoreTime > s.table.StoreTime {
+		s.table = t
+	}
+	for _, m := range s.Gossip.Members() {
+		if m.Client != "" {
+			s.Clients[m.ID] = "http://" + m.Client
+		}
+	}
+}
+
+// gossipSend sends gossip Messages, each on its own, and forgets them: a
+// lost one is made up for by the next round.
+func (s *Store) gossipSend(ctx context.Context, msgs []gossip.Message) {
+	for _, m := range msgs {
+		go func() {
+			send, cancel := context.WithTimeout(ctx, 2*s.GossipEvery)
+			defer cancel()
+			s.gossipPost(send, m)
+		}()
+	}
+}
+
+func (s *Store) gossipPost(ctx context.Context, m gossip.Message) {
+	url := s.clientURL(m.To)
+	if url == "" {
+		return
+	}
+	body, err := json.Marshal(m)
+	if err != nil {
+		return
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url+"/v1/internal/gossip", bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	if resp, err := s.httpc.Do(req); err == nil {
+		resp.Body.Close()
+	}
+}
+
+// gossipReceive takes a gossip Message from another Node.
+func (s *Store) gossipReceive(w http.ResponseWriter, r *http.Request) {
+	var m gossip.Message
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8<<20))
+	if err == nil {
+		err = json.Unmarshal(body, &m)
+	}
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	out := s.Gossip.Receive(m)
+	s.gossipLearn()
+	s.mu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
+	// The answers go out on their own, not on this connection: some are
+	// for Nodes other than the sender. They outlive this request.
+	s.gossipSend(context.WithoutCancel(r.Context()), out)
+}
+
+// NodeJSON is one Node as this Node's gossip has it.
+type NodeJSON struct {
+	ID          int    `json:"id"`
+	Peer        string `json:"peer"`
+	Client      string `json:"client"`
+	Status      string `json:"status"`
+	Incarnation uint64 `json:"incarnation"`
+}
+
+// nodes lists every Node this Node has heard of and what it thinks of each.
+func (s *Store) nodes(w http.ResponseWriter, _ *http.Request) {
+	s.mu.Lock()
+	members := s.Gossip.Members()
+	s.mu.Unlock()
+	out := make([]NodeJSON, 0, len(members))
+	for _, m := range members {
+		out = append(out, NodeJSON{ID: m.ID, Peer: m.Peer, Client: m.Client, Status: m.Status.String(), Incarnation: m.Incarnation})
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // Table is the latest Slot table this Node has heard.
@@ -142,6 +288,14 @@ func (s *Store) askOnce(ctx context.Context, g shard.GroupID, read, stamp bool, 
 	s.mu.Unlock()
 	hosts := shard.Hosts(g, s.Nodes, s.Replicas)
 	if !known {
+		// A guess. A Node gossip thinks is dead isn't worth one, unless
+		// they all are.
+		s.mu.Lock()
+		alive := slices.DeleteFunc(slices.Clone(hosts), func(n int) bool { return !s.Gossip.Alive(n) })
+		s.mu.Unlock()
+		if len(alive) > 0 {
+			hosts = alive
+		}
 		target = hosts[int(time.Now().UnixNano())%len(hosts)]
 		if slices.Contains(hosts, s.Node) {
 			target = s.Node
@@ -167,7 +321,7 @@ func (s *Store) askOnce(ctx context.Context, g shard.GroupID, read, stamp bool, 
 		learn(o, hint)
 		return o, raw
 	}
-	url := fmt.Sprintf("%s/v1/internal/group/%d?read=%t&stamp=%t", s.Clients[target], g, read, stamp)
+	url := fmt.Sprintf("%s/v1/internal/group/%d?read=%t&stamp=%t", s.clientURL(target), g, read, stamp)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		return refused, nil
@@ -341,8 +495,8 @@ func (s *Store) agent(ctx context.Context) {
 			continue
 		case <-ticker.C:
 		}
+		// The table arrives by gossip. Nobody asks the Meta Group on a timer.
 		step, cancel := context.WithTimeout(ctx, s.Timeout)
-		s.refresh(step)
 		table := s.Table()
 		for g, n := range s.Local {
 			st, ok := n.Status(step)

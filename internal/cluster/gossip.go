@@ -115,3 +115,12 @@ func (c *Cluster) Gossip(n int) []gossip.Member {
 	}
 	return nil
 }
+
+// LeaveNode shuts Node n down in an orderly way: it says it is leaving, and
+// then stops.
+func (c *Cluster) LeaveNode(n int) {
+	if nd := c.nodes[n]; nd.up && nd.gossip != nil {
+		c.gossipSend(nd.gossip.Leave())
+	}
+	c.CrashNode(n)
+}

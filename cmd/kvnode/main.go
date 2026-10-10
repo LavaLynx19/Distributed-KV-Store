@@ -25,6 +25,7 @@ import (
 
 	"distributed-kv-store/internal/core"
 	"distributed-kv-store/internal/fsm"
+	"distributed-kv-store/internal/gossip"
 	"distributed-kv-store/internal/raft"
 	"distributed-kv-store/internal/server"
 	"distributed-kv-store/internal/shard"
@@ -49,6 +50,9 @@ func main() {
 	dataGroups := flag.Int("data-groups", 0, "run as a Node of a store with this many data Groups and a Meta Group (A§11); 0 runs one Group, as in Rungs 1-6. -id is then the Node's number, and -peers and -clients list every Node")
 	replicas := flag.Int("replicas", 3, "with -data-groups: Members per Group")
 	slots := flag.Int("slots", shard.DefaultSlots, "with -data-groups: how many Slots the store has; never change it")
+	join := flag.String("join", "", "with -data-groups: start as a Spare and join the store through this Node's client address, id=host:port. -peers and -clients then need list only this Node, and -founders must be given")
+	founders := flag.Int("founders", 0, "with -join: how many Nodes the store was founded with")
+	detector := flag.String("detector", "counters", "with -data-groups: how quiet Nodes are noticed, counters or swim (A§11.10)")
 	sharedSync := flag.Bool("shared-sync", false, "with -data-groups: this Node's replicas share each flush of the drive rather than each asking for its own; helps on macOS, where a flush covers the whole drive")
 	reads := flag.String("reads", "index", "how gets are answered: index (read index, A§6.2), log (as Log Entries), or lease (from the Leader's memory under a lease: faster, and not Linearizable if clocks run at different speeds)")
 	flag.Parse()
@@ -65,7 +69,7 @@ func main() {
 		log.Fatalf("kvnode: -reads must be index, log or lease, not %q", *reads)
 	}
 	if *dataGroups > 0 {
-		if err := runStore(int(*id), *peersFlag, *clientsFlag, *listenPeer, *listenClient, *dataGroups, *replicas, *slots, *tick, *electionTicks, *heartbeatTicks, *timeout, *data, *snapshotEvery, *sessionTTL, *sharedSync); err != nil {
+		if err := runStore(int(*id), *peersFlag, *clientsFlag, *listenPeer, *listenClient, *dataGroups, *replicas, *slots, *tick, *electionTicks, *heartbeatTicks, *timeout, *data, *snapshotEvery, *sessionTTL, *sharedSync, *join, *founders, *detector); err != nil {
 			log.Fatalf("kvnode: %v", err)
 		}
 		return
@@ -179,7 +183,7 @@ func run(id core.NodeID, peersFlag, clientsFlag, listenPeer, listenClient string
 }
 
 // runStore runs this process as one Node of a store with several Groups.
-func runStore(id int, peersFlag, clientsFlag, listenPeer, listenClient string, groups, replicas, slots int, tick time.Duration, electionTicks, heartbeatTicks int, timeout time.Duration, data string, snapshotEvery int, sessionTTL time.Duration, sharedSync bool) error {
+func runStore(id int, peersFlag, clientsFlag, listenPeer, listenClient string, groups, replicas, slots int, tick time.Duration, electionTicks, heartbeatTicks int, timeout time.Duration, data string, snapshotEvery int, sessionTTL time.Duration, sharedSync bool, join string, founders int, detector string) error {
 	peerAddrs, err := parseAddrs(peersFlag)
 	if err != nil {
 		return fmt.Errorf("-peers: %w", err)
@@ -198,8 +202,30 @@ func runStore(id int, peersFlag, clientsFlag, listenPeer, listenClient string, g
 	if peers[id] == "" || clients[id] == "" || len(peers) != len(clients) {
 		return fmt.Errorf("-id %d must appear in both -peers and -clients, which must list the same Nodes", id)
 	}
-	if replicas > len(peers) || groups >= 100 {
+	nodes := len(peers)
+	if join != "" {
+		// A Spare: it is told of one Node and learns the rest by gossip.
+		seed, err := parseAddrs(join)
+		if err != nil || len(seed) != 1 {
+			return fmt.Errorf("-join: want one id=host:port")
+		}
+		for n, addr := range seed {
+			clients[int(n)] = addr
+		}
+		if nodes = founders; founders <= 0 || id <= founders {
+			return fmt.Errorf("-join needs -founders, and an -id above it")
+		}
+	}
+	if replicas > nodes || groups >= 100 {
 		return fmt.Errorf("%d Members per Group need at least that many Nodes, and a store has fewer than 100 Groups", replicas)
+	}
+	how := gossip.Counters
+	switch detector {
+	case "counters":
+	case "swim":
+		how = gossip.SWIM
+	default:
+		return fmt.Errorf("-detector must be counters or swim, not %q", detector)
 	}
 	if listenPeer == "" {
 		listenPeer = peers[id]
@@ -214,7 +240,7 @@ func runStore(id int, peersFlag, clientsFlag, listenPeer, listenClient string, g
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	store, wait, err := server.OpenStore(ctx, server.StoreConfig{
-		Node: id, Nodes: len(peers), Groups: groups, Replicas: replicas, Slots: slots,
+		Node: id, Nodes: nodes, Groups: groups, Replicas: replicas, Slots: slots, Detector: how,
 		Peers: peers, Clients: clients, Listener: ln, Data: data,
 		Tick: tick, ElectionTicks: electionTicks, HeartbeatTicks: heartbeatTicks,
 		SnapshotEvery: snapshotEvery, SessionTTL: sessionTTL, Timeout: timeout, SharedSync: sharedSync,
@@ -231,8 +257,8 @@ func runStore(id int, peersFlag, clientsFlag, listenPeer, listenClient string, g
 		defer cancel()
 		_ = srv.Shutdown(shutdown) // exiting anyway
 	}()
-	log.Printf("kvnode %d: a store of %d Nodes, %d data Groups of %d, %d Slots; Nodes on %s, clients on %s, data %q",
-		id, len(peers), groups, replicas, slots, listenPeer, listenClient, data)
+	log.Printf("kvnode %d: a store founded with %d Nodes, %d data Groups of %d, %d Slots; Nodes on %s, clients on %s, data %q",
+		id, nodes, groups, replicas, slots, listenPeer, listenClient, data)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("client API: %w", err)
 	}
