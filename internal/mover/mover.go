@@ -47,9 +47,15 @@ type Agent struct {
 	// Group hands a Slot over as it stands without freezing it first. It
 	// exists so that Rung 7's exposure of that stays reproducible.
 	FlipAtOnce bool
+	// OnHandover, if set, is told how long a Slot was frozen: from when
+	// this Agent first saw its Group had frozen it to when the other Group
+	// answered that it had taken over. That is the pause clients of the
+	// Slot see (A§11.4), to within how often the Agent looks.
+	OnHandover func(g shard.GroupID, slot shard.Slot, frozenFor int64)
 
 	copying map[moveKey]copyState
 	waiting map[moveKey]int64
+	frozen  map[moveKey]int64
 }
 
 type moveKey struct {
@@ -75,7 +81,7 @@ func (cp copyState) covers(term core.Term, epoch uint32) bool {
 func (a *Agent) Reset() {
 	// New maps, not nil: an answer to something asked before the restart
 	// may still arrive and be recorded.
-	a.copying, a.waiting = map[moveKey]copyState{}, map[moveKey]int64{}
+	a.copying, a.waiting, a.frozen = map[moveKey]copyState{}, map[moveKey]int64{}, map[moveKey]int64{}
 }
 
 // Step moves each Move of Group g along by at most one step. It must be
@@ -83,7 +89,7 @@ func (a *Agent) Reset() {
 // the latest table the Node has heard.
 func (a *Agent) Step(env Env, g shard.GroupID, term core.Term, table shard.Table) {
 	if a.copying == nil {
-		a.copying, a.waiting = map[moveKey]copyState{}, map[moveKey]int64{}
+		a.Reset()
 	}
 	var slots []shardfsm.SlotInfo
 	env.WithMachine(g, func(m *shardfsm.Machine) { slots = m.Slots() })
@@ -150,7 +156,17 @@ func (a *Agent) slot(env Env, g shard.GroupID, term core.Term, slot shard.Slot, 
 			cp = copyState{term: term, epoch: info.Epoch} // start from the beginning
 		}
 		if cp.done {
-			local(shardfsm.FreezeStep(slot, info.Epoch))
+			// Once the freeze is Committed the Slot is refusing its
+			// clients, so don't wait for the next look: send the rest now.
+			wait()
+			env.Local(g, shardfsm.FreezeStep(slot, info.Epoch).Encode(), func() {
+				clear()
+				var now []shardfsm.SlotInfo
+				env.WithMachine(g, func(m *shardfsm.Machine) { now = m.Slots() })
+				if int(slot) < len(now) && now[slot].Status == shardfsm.Frozen {
+					a.slot(env, g, term, slot, now[slot], row)
+				}
+			})
 			return
 		}
 		var chunk []fsm.Raw
@@ -168,6 +184,9 @@ func (a *Agent) slot(env Env, g shard.GroupID, term core.Term, slot shard.Slot, 
 			local(shardfsm.DropStep(slot, info.Epoch))
 			return
 		}
+		if _, seen := a.frozen[key]; !seen {
+			a.frozen[key] = env.Now()
+		}
 		// Send the rest. If this Leader made the copy it knows the target
 		// has everything but what changed since. If not, it sends it all.
 		cp := a.copying[key]
@@ -180,6 +199,10 @@ func (a *Agent) slot(env Env, g shard.GroupID, term core.Term, slot shard.Slot, 
 			return
 		}
 		toGroup(info.Peer, shardfsm.AcceptStep(slot, info.Epoch+1, g, final), func() {
+			if since, seen := a.frozen[key]; seen && a.OnHandover != nil {
+				a.OnHandover(g, slot, env.Now()-since)
+			}
+			delete(a.frozen, key)
 			wait()
 			done := meta.Command{Op: meta.OpDone, Slot: slot, Epoch: info.Epoch + 1}.Encode()
 			env.Ask(shard.Meta, done, func(bool, []byte) { clear() })

@@ -1,6 +1,8 @@
 # Rung 7 retro: several Groups
 
-Status: **stage 7a in progress**. Rung 7 is built in three stages (A§11.1). This file gets a part per stage.
+Status: **stage 7a done and waiting for approval; 7b and 7c not started**. Rung 7 is built in three stages (A§11.1). This file gets a part per stage.
+
+Stage 7a in one paragraph: several Groups share the keys by Slot, a Meta Group holds the table, and a Slot can be moved between Groups while clients carry on. 2,400 simulated runs with 10,224 Moves have no run with two owners and none that isn't Linearizable, and 13 real runs are clean. A moved Slot refuses its clients for about 80 ms. **Three Groups on one machine are slower than one Group, at 0.52× with the disk on**, which misses the 0.9× target; the reason is below.
 
 # Stage 7a: Slots, the table, and moving a Slot
 
@@ -59,7 +61,7 @@ A Group serves a Slot from its accept to its freeze, by its own Log. The accept 
 
 ### Same scenarios, same harness
 
-`TestRung7a`: 6 scenarios × 200 seeds × two workloads = **2,400 runs, none unsafe, 10,401 Moves finished**, every run ending with each Slot served by exactly the Group the table names. The second workload adds time-to-lives, Transactions over two keys, range scans merged from every Group, and Sessions that are cleaned up.
+`TestRung7a`: 6 scenarios × 200 seeds × two workloads = **2,400 runs, none unsafe, 10,224 Moves finished**, every run ending with each Slot served by exactly the Group the table names. The second workload adds time-to-lives, Transactions over two keys, range scans merged from every Group, and Sessions that are cleaned up.
 
 ### Two bugs the suite found in the fix
 
@@ -82,3 +84,105 @@ The check now runs at the moment each Entry is applied. For each Group it keeps 
 ### A bug in the test client
 
 Three runs in 200 weren't Linearizable with Transactions and crashes together (seed 79). The store was right. A Transaction's first attempt had timed out and then succeeded. A Move then put its two keys in different Groups, so the retry was refused as `cross_group`, and my client recorded "refused, nothing happened". A refusal on a retry says nothing about the earlier attempt. The rule is now in A§7.2.
+
+### Testing the tests
+
+Eight deliberate breaks of the Move, each run against the 2,400.
+
+| Break | Runs that fail | How |
+|---|---|---|
+| A Frozen Slot is still served | 2,000 | Two owners in every run with a Move; 1,519 not Linearizable |
+| Versions don't rise across a Move | 1,412 | Not Linearizable |
+| Writes during the copy aren't remembered | 1,077 | Not Linearizable |
+| The final part leaves out deletes | 239 | Not Linearizable |
+| Sessions don't move with the Slot | 53 | Not Linearizable: a retry applied twice |
+| A dropped Slot forgets its Epoch | 5 | Two owners; 1 not Linearizable |
+| Copy progress outlives its Move | **0** | Nothing wrong any more: the agent now recovers by sending everything. It costs a longer freeze |
+| The target doesn't catch up with the source's time first | **0** | No verdict can see it: a key living too long is allowed. `TestDeadlinesSurviveAMove` covers it |
+
+## The pause of a Move
+
+A Slot refuses its clients from its freeze being Committed in the Group it is leaving to its accept being Committed in the Group it goes to. In between is one request between Nodes and one commit.
+
+| | Slots handed over | Frozen for |
+|---|---|---|
+| Simulation, Moves only | 1,229 | median 21 units, 95% within 30, at most 43 (a tick is 10) |
+| Simulation, Moves interrupted at each step | 1,133 | median 20, 95% within 158, at most 415 |
+| Real, 8 clients | 3 | median 80 ms, at most 139 ms |
+| Real, 64 clients | 1 | 332 ms |
+
+The copy itself doesn't pause anything, which was the reason for copying before freezing. With the runs' handful of keys per Slot the copy is one step anyway, so this measures the floor: the freeze costs one commit however big the Slot is.
+
+The real figures are few. A Move under 64 clients took over a second from request to done, so only one fitted in the three seconds given. Each of its five or six steps is a commit, and a commit took 90 ms under that load.
+
+An interrupted Move can leave a Slot frozen for as long as the interruption lasts: up to 415 units above. Nothing times a Move out. If the Group a Slot is going to is lost for good, the Slot stays frozen. That is a gap.
+
+## Real runs (P7a.13)
+
+M4 Pro, local processes, 10 s each, default mix. Five Nodes host three data Groups and the Meta Group, each on three of them.
+
+### Throughput (64 clients, no Faults)
+| | Disk on | Disk off |
+|---|---|---|
+| One Group, 3 Nodes (Rung 6: 1,387) | 1,344 | 68,766 |
+| Three Groups, 5 Nodes | **704** | 46,996 |
+| Ratio | 0.52× | 0.68× |
+
+One Group is unchanged from Rung 6 (0.97×). Three Groups are slower than one, with or without the disk.
+
+- **Disk off, 0.68×:** most requests land on a Node that doesn't host the owning Group's Leader, and cost a second HTTP hop.
+- **Disk on, 0.52×:** twelve replicas now sync to one SSD where three did. A sync here takes about 30 ms and they queue behind each other, so each Group commits half as often: p50 went from 47 ms to 88 ms. Splitting the keys bought no parallel disks, because there is one disk.
+
+Several Groups are for machines that each have their own disk. On one laptop they can only cost. I can't show the gain here, and I'd rather report the loss than leave the number out.
+
+### A bug the first no-disk run found
+Three Groups with the disk off first ran at 5,268 requests/s and **lost 11,406 requests**: clients were told "outcome unknown". Nodes forward to each other over HTTP, and Go's client keeps two idle connections per host by default. With 64 clients nearly every forwarded request opened a connection and closed it, and the machine ran out. Keeping the connections brought it to 46,996 with none lost. With the disk on the bug was invisible, because the disk was slower than the connection churn.
+
+### Under Faults (clients retrying in Sessions)
+| Clients | Fault | Requests/s | Rejected / lost | Longest pause in any write | Verdicts |
+|---|---|---|---|---|---|
+| 8 | A Slot moved every half second | 185 | 0 / 0 | 57 ms | Linearizable; one owner per Slot |
+| 64 | The same | 720 | 0 / 0 | 40 ms | Linearizable; one owner per Slot |
+| 8 | A Node hosting three replicas killed and restarted | 192 | 0 / 0 | 203 ms | Linearizable; one owner per Slot |
+| 8 | Both at once | 184 | 0 / 0 | 265 ms | Linearizable; one owner per Slot |
+
+### Separate Nodes for every Group
+You asked for this to be tried once. Twelve Nodes, each Group on three of its own: it ran, 625 requests/s at 64 clients with Slots moving, Linearizable, one owner per Slot. It was no heavier on the machine than five Nodes, since there are the same twelve replicas either way. It is a little slower, because no Node now hosts two Groups and every request to another Group is a hop. The placement rule gives a Group Nodes to itself whenever there are enough.
+
+**Not covered by real runs:** scans and Transactions (`kvbench` doesn't send them; the API tests do), and anything in Docker (the Compose file has no multi-Group mode and I didn't change it).
+
+### Reproduce
+```
+go test -run 'TestRung7a|TestUncheckedGroup|TestFlippedTable' ./internal/rungtest/
+go test ./internal/shardfsm/ ./internal/meta/ ./internal/shard/ ./internal/cluster/
+CLIENTS=64 DATA_GROUPS=3 harness/run.sh local 5
+RETRY=1 DATA_GROUPS=3 harness/run.sh local 5 move-slots
+RETRY=1 DATA_GROUPS=3 harness/run.sh local 5 move-and-kill
+DATA_GROUPS=3 harness/local.sh start 5 && harness/local.sh table && harness/local.sh move 0 2
+```
+
+## Things decided while building, not at the design step
+- **Versions carry a "version Epoch" per Slot, not the table's Epoch alone.** A Transaction gives all its keys one version, and its keys can be in Slots with different Epochs. Each Group keeps a per-Slot number at least the Slot's Epoch; a Transaction raises its Slots to the highest among them, and a Move adds one. A§11.5.
+- **The client, not the Node, says when a Session may be registered.** The design had the Node register a Session on first use. A Node can't tell first use from a retry after cleanup. The request now carries a flag the client sets only while no earlier attempt can have taken effect. A§11.6.
+- **A Group remembers the Epoch of a Slot it gave up** (the seed 39 bug). A§11.4.
+- **A Node follows one Leader hint after a wrong first guess.** The design said "forwards once". The forwarded-to Node still never passes a request on. A§11.3.
+- **Store time reaches Nodes by each asking the Meta Group** every agent tick, until gossip carries it in 7b.
+
+## Verdict for stage 7a
+| Check | Result |
+|---|---|
+| Exposed | **Pass**: a Group that doesn't check (`TestUncheckedGroupIsExposed`), and a table flipped with nobody confirming (`TestFlippedTableIsExposed`) |
+| Each key owned by exactly one Group at any moment | **Pass**: 2,400 simulated runs, 10,224 Moves, with crashes and Partitions at every step |
+| Single-key operations stay Linearizable while keys move | **Pass**: the same runs, and 13 real ones |
+| A retry that crosses a Move takes effect once | **Pass**: in the suite; breaking it fails 53 runs |
+| The pause of a Move reported | **Done**: about 2 ticks simulated; 80 ms real at 8 clients |
+| Numbers: at least 0.9× Rung 6 | **One Group: pass (0.97×). Three Groups on one machine: miss (0.52×)** |
+| Scans across Groups; Transactions across Groups refused | **Pass** in simulation and API tests |
+
+## Lessons from stage 7a
+1. **The History isn't enough once ownership can move.** Two Groups serving one Slot produced a wrong answer in a fifth of the runs where it happened, and the late-accept bug in none. A verdict about the store's state caught both every time.
+2. **A verdict is code too.** The first one-owner check read a state the Group had already left, and cried wolf 13 times. I only trusted the one real failure after rewriting it to look at each Entry as it is applied.
+3. **Forgetting is a decision.** Dropping a Slot and wiping everything about it looked like tidiness. The Epoch was the one thing that had to outlive the data.
+4. **Helpful memory is still state.** The agent's copy progress was "only an optimisation" and froze a Slot for good. Anything remembered across two Moves needs to say which Move it is about.
+5. **A slow part hides the bug next to it.** The connection churn between Nodes was invisible behind a 30 ms disk sync. The run with the disk off was meant to explain a number and found a bug.
+6. **Sharding one disk is a loss.** I expected several Groups to at least hold their own. They halve throughput here, and the design is still right for the case it is for.

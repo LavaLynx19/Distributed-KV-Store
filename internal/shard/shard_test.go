@@ -55,3 +55,25 @@ func TestVersionOrdersByEpochFirst(t *testing.T) {
 		t.Fatalf("split gave %d, %d", e, i)
 	}
 }
+
+func TestHosts(t *testing.T) {
+	for _, tt := range []struct {
+		g               GroupID
+		nodes, replicas int
+		want            []int
+	}{
+		// Five Nodes, as the Simulation uses: Groups overlap.
+		{0, 5, 3, []int{1, 2, 3}}, {1, 5, 3, []int{2, 3, 4}}, {2, 5, 3, []int{3, 4, 5}}, {3, 5, 3, []int{1, 4, 5}},
+		// Twelve: every Group has Nodes to itself.
+		{0, 12, 3, []int{1, 2, 3}}, {1, 12, 3, []int{4, 5, 6}}, {2, 12, 3, []int{7, 8, 9}}, {3, 12, 3, []int{10, 11, 12}},
+		// Three: every Node hosts every Group.
+		{0, 3, 3, []int{1, 2, 3}}, {2, 3, 3, []int{1, 2, 3}},
+	} {
+		if got := Hosts(tt.g, tt.nodes, tt.replicas); !reflect.DeepEqual(got, tt.want) {
+			t.Errorf("Hosts(%d, %d, %d) = %v, want %v", tt.g, tt.nodes, tt.replicas, got, tt.want)
+		}
+	}
+	if n, g := SplitReplicaID(ReplicaID(12, 3)); n != 12 || g != 3 {
+		t.Errorf("replica id round trip gave Node %d, Group %d", n, g)
+	}
+}

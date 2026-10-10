@@ -153,6 +153,11 @@ log="$OUT/run-$BACKEND-$N-$FAULT${TAG:+-$TAG}.txt"
     wait "$pid"
     status=$?
     set -e
+    if [[ $FAULT == move* ]]; then
+      # How long each moved Slot refused its clients.
+      grep -h "handed over" "$OUT"/local/node*.log | sed -E 's/.*(Slot [0-9]+) handed over by (Group [0-9]+) after being frozen for ([0-9]+) ms/\3/' | sort -n |
+        awk '{ a[NR] = $1 } END { if (NR) printf "move pause:  %d Slots handed over; frozen for a median of %d ms, at most %d ms\n", NR, a[int((NR + 1) / 2)], a[NR] }'
+    fi
     if [[ $FAULT == corrupt-* ]]; then
       grep -h "found damage" "$OUT/local/node$target.log" || echo "node $target found no damage"
     fi

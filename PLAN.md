@@ -85,7 +85,7 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P7a.10 Store time from the Meta Group (A§11.7) → §P7
 - [x] P7a.11 Merged scans; `cross_group` for Transactions (A§11.8) → §P7
 - [x] P7a.12 Real shell: `kvnode` hosting several Groups, `kvctl move-slot`, harness → §P7
-- [ ] P7a.13 Stage 7a suite, real runs with the pause of a Move measured, `retros/rung-7.md` → §P7
+- [x] P7a.13 Stage 7a suite, real runs with the pause of a Move measured, `retros/rung-7.md` → §P7
 - [>] P7b.0 Break stage 7b (gossip, A§11.10) into tasks → defer until: stage 7a is approved
 - [>] P7c.0 Design load, threshold and damping for rebalancing; break stage 7c (A§11.11) into tasks → defer until: stage 7b is approved
 

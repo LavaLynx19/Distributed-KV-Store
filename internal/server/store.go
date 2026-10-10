@@ -57,7 +57,12 @@ type Store struct {
 func (s *Store) Start(ctx context.Context, slots int) {
 	s.table = meta.New(slots, s.Groups).Table()
 	s.leader = map[shard.GroupID]int{}
-	s.httpc = &http.Client{Timeout: s.Timeout}
+	// Requests to other Nodes come as fast as clients send them, many at
+	// once. The default of two idle connections kept per Node would open
+	// and close a connection for nearly every one.
+	s.httpc = &http.Client{Timeout: s.Timeout, Transport: &http.Transport{
+		MaxIdleConns: 4096, MaxIdleConnsPerHost: 512, IdleConnTimeout: 30 * time.Second,
+	}}
 	go s.agent(ctx)
 }
 
@@ -322,7 +327,10 @@ func (s *Store) agent(ctx context.Context) {
 	defer ticker.Stop()
 	calls := make(chan func(), 256)
 	e := storeEnv{s: s, ctx: ctx, calls: calls}
-	agent := &mover.Agent{Patience: (20 * s.Tick).Milliseconds(), ChunkKeys: 256}
+	agent := &mover.Agent{Patience: (20 * s.Tick).Milliseconds(), ChunkKeys: 256,
+		OnHandover: func(g shard.GroupID, slot shard.Slot, frozenFor int64) {
+			log.Printf("store: node %d: Slot %d handed over by Group %d after being frozen for %d ms", s.Node, slot, g, frozenFor)
+		}}
 	var lastTime time.Time
 	for {
 		select {

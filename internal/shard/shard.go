@@ -128,17 +128,23 @@ func SplitVersion(v uint64) (epoch uint32, index uint64) {
 }
 
 // A store's Groups are placed on its Nodes by one rule, so that every Node
-// can work out where everything is from four numbers (A§11.9). Nodes are
-// numbered from 1. Group g has its replicas on consecutive Nodes starting
-// after Node g, so Groups overlap and a Node's failure hits some of them
-// and not others.
+// can work out where everything is from a few numbers (A§11.9). Nodes are
+// numbered from 1. A Group gets Nodes to itself while there are enough: the
+// Meta Group the first few, Group 1 the next, and so on. A Group there is
+// no room left for has its replicas on consecutive Nodes starting after
+// Node g, so it overlaps others and a Node's failure hits some Groups and
+// not the rest.
 
 // Hosts lists the Nodes that hold a replica of Group g, ascending, in a
 // store of nodes Nodes with replicas Members per Group.
 func Hosts(g GroupID, nodes, replicas int) []int {
 	hosts := make([]int, 0, replicas)
 	for i := range replicas {
-		hosts = append(hosts, 1+(int(g)+i)%nodes)
+		if first := int(g) * replicas; first+replicas <= nodes {
+			hosts = append(hosts, first+1+i)
+		} else {
+			hosts = append(hosts, 1+(int(g)+i)%nodes)
+		}
 	}
 	// Three or five numbers: insertion sort.
 	for i := 1; i < len(hosts); i++ {

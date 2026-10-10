@@ -103,6 +103,8 @@ type Report struct {
 	TwoOwners string
 	Moves     int
 	Routing   Routing
+	// Pauses is how long each Slot that moved stayed frozen, in units.
+	Pauses []int64
 
 	verdict check.Verdict
 }

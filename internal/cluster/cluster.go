@@ -105,6 +105,9 @@ type Cluster struct {
 	Forwarded, WrongGroup, Moving int
 	// MovesAsked counts the Moves requested.
 	MovesAsked int
+	// Pauses is how long each Slot that was handed over stayed frozen
+	// (mover.Agent.OnHandover).
+	Pauses []int64
 
 	// owned is, per data Group, which Slots it serves as of the latest
 	// Entry any of its replicas has applied, and twoOwners the first moment
@@ -147,7 +150,8 @@ func New(cfg Config) *Cluster {
 	var ids []core.NodeID
 	for n := 1; n <= cfg.Nodes; n++ {
 		c.nodes[n] = &node{id: n, table: start.Clone(), leader: map[shard.GroupID]core.NodeID{},
-			mover: &mover.Agent{Patience: patience, ChunkKeys: chunkKeys, FlipAtOnce: cfg.FlipAtOnce}}
+			mover: &mover.Agent{Patience: patience, ChunkKeys: chunkKeys, FlipAtOnce: cfg.FlipAtOnce,
+				OnHandover: func(_ shard.GroupID, _ shard.Slot, frozenFor int64) { c.Pauses = append(c.Pauses, frozenFor) }}}
 	}
 	for _, g := range c.Groups() {
 		for _, r := range c.Members(g) {

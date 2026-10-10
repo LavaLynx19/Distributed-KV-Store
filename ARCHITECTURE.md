@@ -414,7 +414,8 @@ The Meta Group decides a move; the two data Groups carry it out and each records
 | 6. Drop | A: removes the Slot's keys | |
 
 - **Exactly one owner.** A serves s only before its freeze Entry. B serves s only after its accept Entry. B can build its accept only from A's frozen data. So there is no moment when both serve, whatever the Meta Group, the forwarders or the clients believe.
-- **The pause** is from A's freeze to B's accept: the time to send what changed during the copy. It is measured.
+- **The pause** is from A's freeze to B's accept: one request between Nodes and one commit in B, however big the Slot. The agent sends the final part the moment the freeze is Committed.
+- **Nothing times a Move out.** If the Group a Slot is going to is lost for good, the Slot stays frozen. Stage 7c, which replaces dead Nodes, is where that is dealt with.
 - **A step can arrive late**, after its Move has finished and the Slot has since come and gone again. So a Group keeps, for a Slot it no longer has, the Epoch at which it last had it, and takes the Slot back only at a higher one.
 - **Who carries it out.** On each Node an agent looks, for every Group whose Leader is there, at that Group's own state and the table, and proposes the next step. It keeps no state that matters. If the Leader that made the copy is replaced, the new one can't know what the target holds, and sends the whole Slot with the accept.
 - **A crash at any step** leaves that step's Entry in a Log. A new Leader of A, B or the Meta Group reads its own Log and the intent, and carries on. Messages between Groups go Leader to Leader and are repeated until answered; every step may be applied twice without harm.
@@ -443,7 +444,9 @@ A Transaction gives every key it writes one version, and its keys may be in Slot
 
 ### 11.9 Nodes and Groups
 - A Node hosts one core per Group it is a Member of, each with its own data directory. One event loop, one transport and one client API per Node; messages name their Group.
-- Topology for runs: about 5 Nodes, each Group on 3 of them, so a Node failure hits some Groups and not others. Fully separate Nodes per Group is tried once, and dropped if it is too heavy for one machine.
+- **Placement** is one rule every Node works out for itself from the number of Nodes and of Members per Group. A Group gets Nodes to itself while there are enough: the Meta Group the first few, Group 1 the next, and so on. A Group there is no room for has its replicas on consecutive Nodes starting after Node g, overlapping others.
+- Topology for runs: 5 Nodes, each Group on 3 of them, so a Node failure hits some Groups and not others. Twelve Nodes, with every Group on its own three, was tried once in stage 7a and works.
+- On one machine every replica syncs to the same disk, so more Groups means more syncs queued behind each other (`retros/rung-7.md`). Several Groups pay off only where Nodes have disks of their own.
 
 ### 11.10 Gossip (7b)
 - SWIM-style: each Node pings a few others, and passes on what it has heard. It carries which Nodes exist and their addresses, which are suspected dead, the newest table version and Store time.

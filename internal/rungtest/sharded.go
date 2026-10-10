@@ -74,6 +74,7 @@ func RunSharded(store ShardedStore, sc ShardedScenario, seed uint64) Report {
 	rep.Signals = h.Signals
 	rep.Recovery = h.Signals.RecoveryAfter(faultsEnd)
 	rep.Routing = Routing{Forwarded: c.Forwarded, WrongGroup: c.WrongGroup, Moving: c.Moving}
+	rep.Pauses = c.Pauses
 	for _, row := range c.Table(1).Slots {
 		rep.Moves += int(row.Epoch)
 	}
