@@ -99,10 +99,10 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P7c.1 The Slot table holds each Group's Member list; Meta records a change wanted and a change done; in the Simulation a Node starts a replica when the table says so and each Group's Leader makes the change → §P7
 - [x] P7c.2 Naive replacement: one Meta Member's word, no wait; add a Spare, remove the dead Member; a returned Node drops its data when gossip says it was replaced. Expose: running Nodes replaced under a Partition, and an Acknowledged write lost to a wrong drop → §P7
 - [x] P7c.3 Fix: a Majority of Meta Members and one wait; the Meta Group's own Members; a returned Node drops only on the Group's Committed Member list and becomes a Spare; a Move stuck on a lost Majority finishes after replacement → §P7
-- [ ] P7c.4 Load: per-Slot counts at each data Leader, smoothed, carried by gossip; the weight of a read measured on real processes and built in; `kvctl table` shows load → §P7
+- [x] P7c.4 Load: per-Slot counts at each data Leader, smoothed, carried by gossip; the weight of a read measured on real processes and built in → §P7
 - [ ] P7c.5 Naive rebalancing: latest report, one line, no damping. Expose: Slots moving back and forth under steady and under shifting load, counted in Moves and in time frozen → §P7
 - [ ] P7c.6 Fix: two lines, one Move at a time, rest per Slot, smoothed load, nothing while a Node is suspected or being replaced; lines, window and rest settled by measurement → §P7
-- [ ] P7c.7 Real shell: Nodes start and drop replicas as the table says, replication takes addresses from gossip, `kvctl` shows replacements, `kvbench` can skew load onto a few Slots, harness Faults `kill-for-good` and `skewed-load` → §P7
+- [ ] P7c.7 Real shell: Nodes start and drop replicas as the table says, replication takes addresses from gossip, `kvctl` shows replacements and load, `kvbench` can skew load onto a few Slots, harness Faults `kill-for-good` and `skewed-load` → §P7
 - [ ] P7c.8 Stage 7c suite (the 7b suite with automation on, plus Nodes lost for good and skewed load), real runs, the 7c part and the Rung 7 verdict in `retros/rung-7.md` → §P7
 
 ### Phase 8 — Rung 8: transactions across Groups (§P8)

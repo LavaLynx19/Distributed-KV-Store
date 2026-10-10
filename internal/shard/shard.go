@@ -227,6 +227,15 @@ func ReplicaID(n int, g GroupID) uint64 { return uint64(n*100 + int(g)) }
 // SplitReplicaID is the inverse of ReplicaID.
 func SplitReplicaID(id uint64) (n int, g GroupID) { return int(id) / 100, GroupID(id % 100) }
 
+// WriteCost and ReadCost are what one write and one read add to a Slot's
+// load (A§11.11). On real processes with every write flushed to disk, one
+// Group answered 1,371 writes a second or 90,712 reads: a read costs about
+// a sixty-sixth of a write (retros/rung-7.md).
+const (
+	WriteCost = 64
+	ReadCost  = 1
+)
+
 // Report is what a Node tells the others about itself by gossip, for the
 // Meta Group's Leader to act on (A§11.11). It decides nothing.
 type Report struct {

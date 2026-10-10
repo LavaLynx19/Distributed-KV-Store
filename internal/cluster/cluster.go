@@ -73,6 +73,8 @@ type Config struct {
 
 	// Replacing is how Nodes that die are replaced (replace.go).
 	Replacing Replacing
+	// Balancing is how load is measured and evened out (balance.go).
+	Balancing Balancing
 
 	// Unchecked makes data Groups answer for keys in Slots they don't own
 	// (shardfsm.Config.Unchecked), and FlipAtOnce makes a Move change the
@@ -142,6 +144,11 @@ type node struct {
 	deadSince map[int]int64
 	report    shard.Report
 	asking    map[shard.GroupID]int64
+	// counts is the load each Slot has put on this Node since loadAt, and
+	// smooth its smoothed load (balance.go).
+	counts []uint32
+	smooth []float64
+	loadAt int64
 }
 
 // Cluster is one simulated store.
@@ -570,6 +577,9 @@ func (c *Cluster) Request(n int, cmd fsm.Command, done func(Outcome, fsm.Respons
 			c.Moving++
 			done(Refused, resp)
 		default:
+			if l, known := nd.leader[g]; known {
+				c.count(c.nodes[NodeOf(l)], cmd)
+			}
 			done(Answered, resp)
 		}
 	})

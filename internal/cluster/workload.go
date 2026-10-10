@@ -26,6 +26,13 @@ type Workload struct {
 	// The History records each Group's part as a request of its own, since
 	// that is the unit the store promises is Linearizable.
 	ScanPercent int
+	// Skew sends Percent of requests to Keys of the keys, taken in a run
+	// from one place in the list. With ShiftEvery set, that place moves on
+	// every so many units, so the load shifts from Slot to Slot.
+	Skew struct {
+		Percent, Keys int
+		ShiftEvery    int64
+	}
 }
 
 // DefaultWorkload spreads a dozen keys over the Slots, few enough that
@@ -221,6 +228,13 @@ func (w Workload) scan(c *Cluster, h *check.History, cl *client, until int64) {
 func (w Workload) choose(c *Cluster, cl *client) fsm.Command {
 	rng := c.S.Rand()
 	key := fmt.Sprintf("k%d", rng.IntN(w.Keys))
+	if w.Skew.Percent > 0 && rng.IntN(100) < w.Skew.Percent {
+		first := 0
+		if w.Skew.ShiftEvery > 0 {
+			first = int(c.S.Now()/w.Skew.ShiftEvery) * w.Skew.Keys
+		}
+		key = fmt.Sprintf("k%d", (first+rng.IntN(w.Skew.Keys))%w.Keys)
+	}
 	cl.count++
 	value := []byte(fmt.Sprintf("c%d-%d", cl.id, cl.count))
 	if w.TxnPercent > 0 && rng.IntN(100) < w.TxnPercent {

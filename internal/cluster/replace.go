@@ -180,29 +180,37 @@ func (c *Cluster) dead(nd *node, table shard.Table) []int {
 }
 
 // report works out what Node nd tells the others about itself, and puts it
-// in its gossip.
+// in its gossip: the Nodes it has thought dead for longer than the wait,
+// and the load on the Slots it leads.
 func (c *Cluster) report(nd *node) {
-	if !c.cfg.Replacing.On || c.cfg.Replacing.OneWord {
-		return
-	}
-	wait := c.cfg.Replacing.Wait
-	if wait == 0 {
-		wait = deadWait
-	}
-	now := c.S.Now()
-	nd.report.Dead = nil
-	for _, m := range nd.gossip.Members() {
-		since, held := nd.deadSince[m.ID]
-		switch {
-		case m.Status != gossip.Dead:
-			delete(nd.deadSince, m.ID)
-		case !held:
-			nd.deadSince[m.ID] = now
-		case now-since >= wait:
-			nd.report.Dead = append(nd.report.Dead, m.ID)
+	told := false
+	if c.cfg.Replacing.On && !c.cfg.Replacing.OneWord {
+		told = true
+		wait := c.cfg.Replacing.Wait
+		if wait == 0 {
+			wait = deadWait
+		}
+		now := c.S.Now()
+		nd.report.Dead = nil
+		for _, m := range nd.gossip.Members() {
+			since, held := nd.deadSince[m.ID]
+			switch {
+			case m.Status != gossip.Dead:
+				delete(nd.deadSince, m.ID)
+			case !held:
+				nd.deadSince[m.ID] = now
+			case now-since >= wait:
+				nd.report.Dead = append(nd.report.Dead, m.ID)
+			}
 		}
 	}
-	nd.gossip.SetNote(nd.report.Encode())
+	if c.cfg.Balancing.On {
+		told = true
+		c.measure(nd)
+	}
+	if told {
+		nd.gossip.SetNote(nd.report.Encode())
+	}
 }
 
 // askIfGone is how a Node finds out that a replica it holds is no longer

@@ -5,6 +5,7 @@ import (
 	"slices"
 	"testing"
 
+	"distributed-kv-store/internal/check"
 	"distributed-kv-store/internal/cluster"
 	"distributed-kv-store/internal/core"
 	"distributed-kv-store/internal/fsm"
@@ -369,4 +370,52 @@ func TestAMoveWaitsOutALostMajority(t *testing.T) {
 	if diffs := c.EndState(); len(diffs) > 0 {
 		t.Fatalf("end state: %v", diffs)
 	}
+}
+
+// Each Group's Leader counts the load on its Slots and says so by gossip,
+// and every Node ends up with the same picture (A§11.11). Most requests
+// here go to two keys, so their Slots stand out.
+func TestLoadIsCountedAndGossiped(t *testing.T) {
+	transport.Register(raft.MessageBodies()...)
+	c := cluster.New(cluster.Config{
+		Seed: 9, Nodes: 5, Groups: 3, Replicas: 3, Slots: 8, Spares: 1,
+		NewCore: newCore, Copy: transport.NewLoopback().Copy, Gossip: cluster.GossipCounters,
+		Balancing: cluster.Balancing{On: true},
+	})
+	w := cluster.DefaultWorkload
+	w.Skew.Percent, w.Skew.Keys = 80, 2
+	w.Start(c, &check.History{}, 3000)
+	c.S.Run(3000)
+
+	hot := map[shard.Slot]bool{shard.SlotOf("k0", 8): true, shard.SlotOf("k1", 8): true}
+	keyed := map[shard.Slot]bool{}
+	for i := range w.Keys {
+		keyed[shard.SlotOf(fmt.Sprintf("k%d", i), 8)] = true
+	}
+	load := c.Load(6) // a Spare leads nothing: all it knows is hearsay
+	var hottest, coolest uint32
+	for s, l := range load {
+		switch s := shard.Slot(s); {
+		case hot[s]:
+			if hottest == 0 || l < hottest {
+				hottest = l
+			}
+		case !keyed[s] && l != 0:
+			t.Errorf("Slot %d has no keys and load %d", s, l)
+		case l > coolest:
+			coolest = l
+		}
+	}
+	if hottest < 3*coolest || coolest == 0 {
+		t.Fatalf("load by Slot %v: the Slots of k0 and k1 should carry several times any other's", load)
+	}
+	for _, n := range c.NodeIDs() {
+		for s, l := range c.Load(n) {
+			if diff := int64(l) - int64(load[s]); diff > int64(load[s])/2+shard.WriteCost || -diff > int64(load[s])/2+shard.WriteCost {
+				t.Errorf("node %d has Slot %d at load %d, node 6 has it at %d", n, s, l, load[s])
+			}
+		}
+	}
+	sums := cluster.GroupLoad(c.Table(6), load, 3)
+	t.Logf("load by Slot %v, by Group %v", load, sums[1:])
 }
