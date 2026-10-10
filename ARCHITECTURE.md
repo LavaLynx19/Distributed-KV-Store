@@ -385,7 +385,7 @@ Rung 7 is built in three stages. Each ships its naive version first, is measured
 | Stage | Adds | Shipped first, to be seen failing |
 |---|---|---|
 | 7a | Slots, the slot table, routing, slot moves started by command, store-wide Sessions and time, merged scans | A Group that doesn't check it owns a key; a table flipped with nobody confirming |
-| 7b | Gossip: which Nodes exist, where, and which seem dead; the table version and store time ride on it | A table spread and believed by gossip alone |
+| 7b | Gossip: which Nodes exist, where, and which seem dead; the whole table and Store time ride on it | Ownership decided by gossip; Membership decided by gossip |
 | 7c | Automatic replacement of dead Nodes; automatic rebalancing by load | A Node replaced on one observer's word |
 
 ### 11.2 Slots and the meta Group
@@ -450,9 +450,22 @@ A Transaction gives every key it writes one version, and its keys may be in Slot
 - `kvnode -shared-sync` lets the replicas in one Node share each flush of the drive: each hands its file's data to the drive, and one flush then covers them all. It is off by default, and helps only where a flush covers the whole drive, as on macOS.
 
 ### 11.10 Gossip (7b)
-- SWIM-style: each Node pings a few others, and passes on what it has heard. It carries which Nodes exist and their addresses, which are suspected dead, the newest table version and Store time.
-- A new Node needs one address to start. This removes Rung 6's limit that every address is fixed at start.
-- Gossip informs and never decides. Group membership and Slot ownership change only through Entries in a Raft Log.
+Details confirmed with the user at P7b.0.
+
+- **Gossip informs and never decides.** Group membership and Slot ownership change only through Entries in a Raft Log. What a Node learns by gossip it uses to route requests and, in 7c, to report to the Meta Group.
+- **What each Node holds and passes on:**
+  - every Node it has heard of: its two addresses, whether it seems alive, suspected or dead, and a number that settles which report about it is newer;
+  - the whole Slot table, with its version;
+  - Store time.
+- **Where the table comes from.** A Node that hosts a Meta Group replica puts that replica's applied table into its gossip. Every other Node takes the highest version it hears. No Node asks the Meta Group for the table on the way to routing a request any more. The table is still only a hint: each Group serves by its own Log (§11.3).
+- **A pure core.** Gossip is a step function like the consensus core: a tick or a message in, messages out, randomness from a seeded source. The same code runs in the Simulation and the real shell.
+- **Two detectors, built in turn and measured against each other:**
+  1. **Counters.** Every Node bumps a counter each round and gossips everyone's counters. A Node whose counter hasn't risen for a set number of rounds is suspected, then dead.
+  2. **SWIM.** Each round a Node pings one other. With no answer it asks a few others to ping for it. Still nothing: the Node is suspected, and dead after a wait unless it answers the suspicion by raising its own number.
+  
+  They are compared on time to notice a dead Node, false alarms (under a slow Node, a link cut one way, a Partition, lost messages) and messages sent. Stage 7c picks its wait from those numbers.
+- **Joining and leaving.** A new Node is started with one address of any Node. It exchanges everything with that Node and is then known to all. It hosts no Group: it is a Spare until 7c gives it something. A Node that is shut down says so, and is marked as having left without being suspected first. This removes Rung 6's limit that every address is fixed at start: the network between Nodes takes addresses as gossip brings them.
+- **What stays as in 7a.** The Groups' Members are still the founding Nodes, placed by the rule of §11.9. Changing them is 7c.
 
 ### 11.11 Automation (7c)
 - **Declaring a Node dead.** Each Meta Group Member reports the Nodes it has suspected for longer than a set time. The Meta Leader acts only when a Majority of Meta Members report the same Node. A minority side of a Partition can replace nobody.

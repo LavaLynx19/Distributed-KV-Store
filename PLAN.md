@@ -86,7 +86,15 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P7a.11 Merged scans; `cross_group` for Transactions (A§11.8) → §P7
 - [x] P7a.12 Real shell: `kvnode` hosting several Groups, `kvctl move-slot`, harness → §P7
 - [x] P7a.13 Stage 7a suite, real runs with the pause of a Move measured, `retros/rung-7.md` → §P7
-- [>] P7b.0 Break stage 7b (gossip, A§11.10) into tasks → defer until: stage 7a is approved
+- [x] P7b.0 Break stage 7b (gossip, A§11.10) into tasks → §P7
+- [ ] P7b.1 `internal/gossip`, a pure core: the Node list with addresses, the counters detector, exchanging everything with a Node on first contact; the Simulation carries its messages between Nodes → §P7
+- [ ] P7b.2 The whole table and Store time ride on gossip; Nodes stop asking the Meta Group on a timer; routing avoids Nodes thought dead; how long news of a Move takes to reach every Node, against 7a → §P7
+- [ ] P7b.3 Expose: ownership decided by gossip (a Move announced by gossip, highest version wins); two owners under a Partition → §P7
+- [ ] P7b.4 Expose: Membership decided by gossip (a Group drops a Member that gossip calls dead, with no Entry); two Leaders under a Partition → §P7
+- [ ] P7b.5 The SWIM detector: ping, ping through others, suspicion, answering a suspicion → §P7
+- [ ] P7b.6 Detectors compared: time to notice a dead Node, false alarms under a slow Node, a one-way cut, a Partition and lost messages, and messages sent → §P7
+- [ ] P7b.7 Joining with one address, leaving; real shell: gossip on the Nodes' network, addresses learned as they arrive; `kvnode -join`, `kvctl nodes` → §P7
+- [ ] P7b.8 Stage 7b suite (the 7a suite with gossip carrying the table, plus gossip Faults), real runs, the 7b part of `retros/rung-7.md` → §P7
 - [>] P7c.0 Design load, threshold and damping for rebalancing; break stage 7c (A§11.11) into tasks → defer until: stage 7b is approved
 
 ### Phase 8 — Rung 8: transactions across Groups (§P8)
@@ -158,6 +166,8 @@ P4.4 is a design decision inside the Rung: stop and get it approved before codin
 
 ## §P7 — Rung 7
 Design is A§11. Three stages (A§11.1), each ending with a retro section and the user's approval.
+**Verify (7b):** P7b.3's and P7b.4's seeds fail with gossip deciding and can't be reproduced with it only informing. The 7a suite passes with the table carried by gossip and no timed reads of the Meta Group. After Faults stop, every live Node agrees on which Nodes are alive and on the table version. A Node started with one address is known to all. The two detectors' numbers are reported side by side.
+
 **Verify (7a):** P7a.4's and P7a.5's seeds fail before and pass after. No run ever has two Groups serving one Slot. Single-key operations stay Linearizable while Slots move, including Moves interrupted by crashes and Partitions at every step. A retry that crosses a Move takes effect once. The pause of a Move is reported.
 
 ## §P8–§P9
