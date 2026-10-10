@@ -1,6 +1,6 @@
 # Rung 7 retro: several Groups
 
-Status: **all three stages done; 7c waiting for approval**. Rung 7 is built in three stages (A§11.1). This file has a part per stage, in order, and the verdict for the whole Rung at the end.
+Status: **all three stages done and approved**. Rung 7 is built in three stages (A§11.1). This file has a part per stage, in order, and the verdict for the whole Rung at the end.
 
 Stage 7a in one paragraph: several Groups share the keys by Slot, a Meta Group holds the table, and a Slot can be moved between Groups while clients carry on. 2,400 simulated runs with 10,224 Moves have no run with two owners and none that isn't Linearizable, and 13 real runs are clean. A moved Slot refuses its clients for about 80 ms. **Three Groups on one machine are slower than one Group, at 0.52× with the disk on**, which misses the 0.9× target; the reason is below.
 
@@ -360,7 +360,7 @@ DATA_GROUPS=3 harness/local.sh start 5 && harness/local.sh join 6 && harness/loc
 
 # Stage 7c: the store looks after itself
 
-Status: **done, waiting for approval**. A Node that dies is replaced by a Spare in every Group it was in, the Meta Group included, with nobody asking. A Node that was replaced and comes back drops its replicas and is a Spare again. Slots are moved off a Group that carries far more than its share. Three naive stores are shown failing first. 3,200 simulated runs with all of it on are clean, and so are 7 real ones. **Evening out load makes this machine slower**, for the reason 7a found: one disk.
+Status: **done and approved**. A Node that dies is replaced by a Spare in every Group it was in, the Meta Group included, with nobody asking. A Node that was replaced and comes back drops its replicas and is a Spare again. Slots are moved off a Group that carries far more than its share. Three naive stores are shown failing first. 3,200 simulated runs with all of it on are clean, and so are 7 real ones. **Evening out load makes this machine slower**, for the reason 7a found: one disk.
 
 Environment: the 7b Simulation with two Spares, counters detector unless said. Two things changed in the Simulation itself:
 - **A Node that restarts now forgets its table** and holds the one the store was founded with until gossip tells it more. A real Node always did. The Simulation had kept the table across a crash, and that kept the naive store looking correct.
@@ -430,7 +430,7 @@ What I didn't expect: **a Group whose Majority is on the cut-off side can't be c
 4. **On real processes a Spare had no address for the founders** and never answered them, **dropping a replica failed** because the Log is a directory there, and **a Leader held up by its disk reported no load**, so its Group looked idle and was given another Slot. The server test found the first two, a real run the third.
 
 ### One design statement that was wrong
-At the design step I offered "never cancel a Move; replacement gives the Group its Majority back", and it was chosen. **Replacement can't do that.** A Group that has lost its Majority can't change its own Members, so nothing can be added to it. The Move waits until enough Members return or an operator runs Unsafe recovery. A Group that has only lost one Member carries on with the Move while the Member is replaced. `TestAMoveWaitsOutALostMajority` shows both. This needs confirming, since the choice was made on my wrong description.
+At the design step I offered "never cancel a Move; replacement gives the Group its Majority back", and it was chosen. **Replacement can't do that.** A Group that has lost its Majority can't change its own Members, so nothing can be added to it. The Move waits until enough Members return or an operator runs Unsafe recovery. A Group that has only lost one Member carries on with the Move while the Member is replaced. `TestAMoveWaitsOutALostMajority` shows both. The choice had been made on my wrong description, so I put it to the user again: "never cancel" stands.
 
 ## Load, and moving Slots by it (P7c.4–P7c.6)
 **What a read costs.** One Group, 64 clients, 10 s, on real processes:
