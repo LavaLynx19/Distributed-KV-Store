@@ -141,6 +141,9 @@ func (c *Cluster) EndState() []string {
 			diffs = append(diffs, fmt.Sprintf("Slot %d: still moving to Group %d", s, row.MovingTo))
 		}
 	}
+	if c.cfg.Replacing.On {
+		diffs = append(diffs, c.membersSettled(table)...)
+	}
 	return diffs
 }
 
@@ -193,6 +196,38 @@ func (c *Cluster) GossipAgrees() []string {
 		}
 		if got := nd.gossip.Table().Version; got != version {
 			diffs = append(diffs, fmt.Sprintf("node %d's gossip has table version %d, the Meta Group has %d", n, got, version))
+		}
+	}
+	return diffs
+}
+
+// membersSettled checks what replacing dead Nodes should have settled on
+// (A§11.11): no change still wanted, the table's Member lists the ones the
+// Groups have, no Node lost for good still a Member, and no running Node
+// holding a replica of a Group it isn't a Member of.
+func (c *Cluster) membersSettled(table shard.Table) []string {
+	var diffs []string
+	for g, row := range table.Groups {
+		g := shard.GroupID(g)
+		if row.Add != 0 || row.Remove != 0 {
+			diffs = append(diffs, fmt.Sprintf("Group %d: still replacing node %d with node %d", g, row.Remove, row.Add))
+		}
+		var members []int
+		for _, r := range c.Members(g) {
+			members = append(members, NodeOf(r))
+		}
+		if !slices.Equal(members, row.Members) {
+			diffs = append(diffs, fmt.Sprintf("Group %d: has Members %v, and the table says %v", g, members, row.Members))
+		}
+		for _, n := range members {
+			if c.nodes[n].gone {
+				diffs = append(diffs, fmt.Sprintf("Group %d: node %d, lost for good, is still a Member", g, n))
+			}
+		}
+		for _, r := range c.Replicas(g) {
+			if n := NodeOf(r); c.nodes[n].up && !slices.Contains(members, n) {
+				diffs = append(diffs, fmt.Sprintf("Group %d: node %d isn't a Member and still holds a replica", g, n))
+			}
 		}
 	}
 	return diffs

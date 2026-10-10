@@ -34,6 +34,8 @@ type ShardedStore struct {
 	SuspectAfter, DeadAfter int
 	// GossipDecides is the naive store of stage 7b (cluster.Config).
 	GossipDecides struct{ Ownership, Members bool }
+	// Replacing is how dead Nodes are replaced (cluster.Config).
+	Replacing cluster.Replacing
 }
 
 // ShardedScenario injects Faults, and asks for Moves, between times from
@@ -54,7 +56,7 @@ func RunSharded(store ShardedStore, sc ShardedScenario, seed uint64) Report {
 		SessionTTL: store.SessionTTL, Unchecked: store.Unchecked, FlipAtOnce: store.FlipAtOnce,
 		Gossip: store.Gossip, Spares: store.Spares, GossipLoss: store.GossipLoss,
 		SuspectAfter: store.SuspectAfter, DeadAfter: store.DeadAfter,
-		GossipDecides: store.GossipDecides,
+		GossipDecides: store.GossipDecides, Replacing: store.Replacing,
 	})
 	h := &check.History{}
 	rep := Report{Scenario: sc.Name, Seed: seed, Members: store.Nodes, History: h}
@@ -89,6 +91,17 @@ func RunSharded(store ShardedStore, sc ShardedScenario, seed uint64) Report {
 	rep.MovesAsked, rep.MovesTaken = c.MovesAsked, c.MovesTaken
 	rep.Diverged = append(rep.Diverged, c.GossipAgrees()...)
 	rep.TableLags, rep.GossipSent = c.TableLags, c.GossipSent
+	rep.Replacements, rep.Drops = len(c.Replacements), len(c.Drops)
+	for _, r := range c.Replacements {
+		if r.Running {
+			rep.ReplacedRunning++
+		}
+	}
+	for _, d := range c.Drops {
+		if d.Counted && rep.WrongDrop == "" {
+			rep.WrongDrop = fmt.Sprintf("replica %d dropped its data at t=%d while still a Member", d.Replica, d.At)
+		}
+	}
 	for _, row := range c.Table(1).Slots {
 		rep.Moves += int(row.Epoch)
 	}
@@ -293,5 +306,92 @@ var Rung7b = []ShardedScenario{
 			c.S.After(900+c.S.Rand().Int64N(200), step)
 		}
 		c.S.At(from, step)
+	}},
+}
+
+// lose destroys one of the founding Nodes, chosen at random, at about when.
+func lose(c *cluster.Cluster, when int64) {
+	c.S.At(when+c.S.Rand().Int64N(300), func() {
+		for range 20 {
+			if n := 1 + c.S.Rand().IntN(5); c.NodeUp(n) {
+				c.DestroyNode(n)
+				return
+			}
+		}
+	})
+}
+
+// Rung7c adds what automation has to get through (A§11.11): Nodes lost for
+// good, Nodes that are away long enough to be replaced and then come back,
+// and Nodes that are only restarting.
+var Rung7c = []ShardedScenario{
+	// One Node is lost for good while Slots move.
+	{"lost-node", func(c *cluster.Cluster, from, to int64) {
+		moves(c, from, to, 400)
+		lose(c, from+200)
+	}},
+
+	// One Node is lost for good, and the others keep crashing and coming
+	// back within a few hundred units.
+	{"lost-node-and-crashes", func(c *cluster.Cluster, from, to int64) {
+		lose(c, from+200)
+		var step func()
+		step = func() {
+			if c.S.Now() >= to {
+				return
+			}
+			nodes := c.NodeIDs()
+			n := nodes[c.S.Rand().IntN(len(nodes))]
+			c.CrashNode(n)
+			c.S.After(100+c.S.Rand().Int64N(250), func() { c.RestartNode(n) })
+			c.S.After(250+c.S.Rand().Int64N(300), step)
+		}
+		c.S.At(from+50, step)
+	}},
+
+	// A Node is away for long enough to be given up on, and then comes
+	// back to find its place taken. Then another.
+	{"long-outages", func(c *cluster.Cluster, from, to int64) {
+		var step func()
+		step = func() {
+			if c.S.Now() >= to-900 {
+				return
+			}
+			nodes := c.NodeIDs()
+			n := nodes[c.S.Rand().IntN(len(nodes))]
+			c.CrashNode(n)
+			c.S.After(600+c.S.Rand().Int64N(200), func() { c.RestartNode(n) })
+			c.S.After(1000+c.S.Rand().Int64N(200), step)
+		}
+		c.S.At(from, step)
+	}},
+
+	// One Node is lost for good and replaced. After that the Nodes are
+	// restarted in overlapping turns, as in an upgrade done too fast: one
+	// goes down, a second is restarted while the first is away, and a third
+	// goes down as the first comes back.
+	{"lost-node-then-rolling-restarts", func(c *cluster.Cluster, from, to int64) {
+		lose(c, from+100)
+		var step func()
+		step = func() {
+			if c.S.Now() >= to-400 {
+				return
+			}
+			nodes := c.NodeIDs()
+			c.S.Rand().Shuffle(len(nodes), func(i, j int) { nodes[i], nodes[j] = nodes[j], nodes[i] })
+			first, second, third := nodes[0], nodes[1], nodes[2]
+			c.CrashNode(first)
+			c.S.After(60+c.S.Rand().Int64N(60), func() {
+				c.CrashNode(second)
+				c.S.After(10, func() { c.RestartNode(second) })
+			})
+			c.S.After(100+c.S.Rand().Int64N(40), func() {
+				c.RestartNode(first)
+				c.CrashNode(third)
+			})
+			c.S.After(300, func() { c.RestartNode(third) })
+			c.S.After(350+c.S.Rand().Int64N(100), step)
+		}
+		c.S.At(from+1000, step)
 	}},
 }

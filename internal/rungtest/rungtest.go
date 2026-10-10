@@ -112,6 +112,13 @@ type Report struct {
 	// each Node, in units, and GossipSent how many gossip Messages went out.
 	TableLags  []int64
 	GossipSent int
+	// Replacements is how many times a Node was replaced, and
+	// ReplacedRunning how many of those Nodes were running at the time.
+	// Drops is how many times a Node dropped a replica's data, and
+	// WrongDrop the first time one did so while its Group still had the
+	// replica as a Member (A§11.11).
+	Replacements, ReplacedRunning, Drops int
+	WrongDrop                            string
 
 	verdict check.Verdict
 }
@@ -119,7 +126,7 @@ type Report struct {
 // Safe is true when nothing false was ever said or done: the History is
 // Linearizable, no Term had two Leaders, and no core tripped its own check.
 func (r Report) Safe() bool {
-	return r.Linearizable && !r.TimedOut && r.TwoLeaders == "" && r.Panic == "" && r.TwoOwners == ""
+	return r.Linearizable && !r.TimedOut && r.TwoLeaders == "" && r.Panic == "" && r.TwoOwners == "" && r.WrongDrop == ""
 }
 
 // Routing counts what happened to requests on their way to a Group in a
@@ -155,6 +162,9 @@ func (r Report) String() string {
 	}
 	if r.TwoOwners != "" {
 		s += " two-owners: " + r.TwoOwners
+	}
+	if r.WrongDrop != "" {
+		s += " wrong-drop: " + r.WrongDrop
 	}
 	if r.Panic != "" {
 		s += " panic: " + r.Panic

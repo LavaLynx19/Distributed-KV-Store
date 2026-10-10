@@ -97,7 +97,7 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P7b.8 Stage 7b suite (the 7a suite with gossip carrying the table, plus gossip Faults), real runs, the 7b part of `retros/rung-7.md` → §P7
 - [x] P7c.0 Design load, threshold and damping for rebalancing; break stage 7c (A§11.11) into tasks → §P7
 - [x] P7c.1 The Slot table holds each Group's Member list; Meta records a change wanted and a change done; in the Simulation a Node starts a replica when the table says so and each Group's Leader makes the change → §P7
-- [ ] P7c.2 Naive replacement: one Meta Member's word, no wait; add a Spare, remove the dead Member; a returned Node drops its data when gossip says it was replaced. Expose: running Nodes replaced under a Partition, and an Acknowledged write lost to a wrong drop → §P7
+- [x] P7c.2 Naive replacement: one Meta Member's word, no wait; add a Spare, remove the dead Member; a returned Node drops its data when gossip says it was replaced. Expose: running Nodes replaced under a Partition, and an Acknowledged write lost to a wrong drop → §P7
 - [ ] P7c.3 Fix: a Majority of Meta Members and one wait; the Meta Group's own Members; a returned Node drops only on the Group's Committed Member list and becomes a Spare; a Move stuck on a lost Majority finishes after replacement → §P7
 - [ ] P7c.4 Load: per-Slot counts at each data Leader, smoothed, carried by gossip; the weight of a read measured on real processes and built in; `kvctl table` shows load → §P7
 - [ ] P7c.5 Naive rebalancing: latest report, one line, no damping. Expose: Slots moving back and forth under steady and under shifting load, counted in Moves and in time frozen → §P7

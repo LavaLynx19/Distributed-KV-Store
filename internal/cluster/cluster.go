@@ -71,6 +71,9 @@ type Config struct {
 	// Members whichever of them its Node's gossip thinks are alive.
 	GossipDecides struct{ Ownership, Members bool }
 
+	// Replacing is how Nodes that die are replaced (replace.go).
+	Replacing Replacing
+
 	// Unchecked makes data Groups answer for keys in Slots they don't own
 	// (shardfsm.Config.Unchecked), and FlipAtOnce makes a Move change the
 	// table at once with nobody confirming, after which the Groups follow
@@ -160,6 +163,11 @@ type Cluster struct {
 	// two Groups served the same Slot by that measure (verdict.go).
 	owned     map[shard.GroupID]ownership
 	twoOwners string
+
+	// Replacements are the replacements the Meta Group took, and Drops the
+	// times a Node dropped a replica's data.
+	Replacements []Replaced
+	Drops        []Dropped
 
 	// sets is the Partition in force, by machine, or nil.
 	sets [][]int
@@ -322,8 +330,12 @@ func (c *Cluster) RestartNode(n int) {
 		c.S.Restart(r)
 	}
 	if nd := c.nodes[n]; !nd.up {
+		// It comes back knowing only what a Node is started with: the table
+		// the store was founded with, and nothing of where the Leaders are.
 		nd.up = true
-		c.newGossip(nd) // it comes back knowing only what it is started with
+		nd.table = meta.NewPlaced(c.cfg.Slots, c.cfg.Groups, c.cfg.Nodes, c.cfg.Replicas).Table()
+		clear(nd.leader)
+		c.newGossip(nd)
 	}
 }
 

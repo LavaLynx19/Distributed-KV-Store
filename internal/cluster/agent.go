@@ -22,12 +22,7 @@ func (c *Cluster) agent(nd *node) {
 	if nd.gossip == nil {
 		c.refresh(nd) // with gossip the table arrives by itself
 	}
-	for g, row := range nd.table.Groups {
-		// The table wants this Node in a Group it has no replica of.
-		if g := shard.GroupID(g); row.Add == nd.id && !c.hosts(nd.id, g) {
-			c.host(nd, g)
-		}
-	}
+	c.replicasWanted(nd)
 	for _, g := range slices.Clone(nd.groups) {
 		r := Replica(nd.id, g)
 		st := c.S.Status(r)
@@ -36,6 +31,7 @@ func (c *Cluster) agent(nd *node) {
 		}
 		c.changeMembers(nd, g, st)
 		if g == shard.Meta {
+			c.replaceDead(nd, r)
 			// The Meta Leader's clock is the store's clock (A§11.7).
 			if now := c.S.Now(); now-nd.lastTick >= tickEvery {
 				nd.lastTick = now
