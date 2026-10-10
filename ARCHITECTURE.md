@@ -315,6 +315,15 @@ A Node is started as a Spare by leaving it out of `kvnode -members`, which names
 
 Unsafe recovery is a command-line action on a stopped Member, not an API call.
 
+In a store with several Groups (§11) the admin calls are instead:
+
+| Method and path | Purpose |
+|---|---|
+| `GET /v1/table` | The Slot table: for each Slot its Group, Epoch and, if a Move is under way, where it is going |
+| `POST /v1/admin/moves` | Ask for a Move: `{"slot": 3, "to": 2}`. Answers once the intent is Committed; the Move then proceeds by itself, and `GET /v1/table` shows when it is done |
+
+`kvctl table` and `kvctl move <slot> <group>` wrap these. Membership changes within a Group of such a store are not offered yet (stage 7c).
+
 ### 7.4 Debug (harness only)
 | Method and path | Purpose |
 |---|---|
@@ -386,9 +395,11 @@ Rung 7 is built in three stages. Each ships its naive version first, is measured
 - The Meta Group stores no keys and is on the path of no read or write. If it has no Majority, data Groups keep serving what they own; moves, new Sessions and store time stop.
 
 ### 11.3 Routing
-- A client may ask any Node. A Node that hosts the owning Group's Leader handles the request. Otherwise it forwards it, once, to a Node that does, and passes the answer back.
+- A client may ask any Node. A Node that hosts the owning Group's Leader handles the request. Otherwise it forwards it to the Node it believes does, and passes the answer back. The Node it is forwarded to handles it or refuses: a request is never passed on a second time. If the first Node was only guessing, and is told the Leader is elsewhere and that nothing happened, it tries that Node, once.
 - The owning Group decides for itself whether it owns the Slot, from its own Log (§11.4), never from the forwarder's or the client's table. A Group that doesn't own it answers `wrong_group` with its table version.
-- Answers carry the table version and, when the request was forwarded, where it went, so a client can learn to go direct.
+- Answers carry the table version the Node holds, in a `Table-Version` header. `GET /v1/table` gives the table itself, so a client can work out the owner and go direct.
+
+**In the real shell** a Node is one process hosting a replica of each of its Groups, with one address for other Nodes and one for clients. A replica's id among its Group's Members gives both its Node and its Group, so every Group's messages share the Nodes' connections. Requests between Nodes use `POST /v1/internal/group/{g}`. `kvnode -data-groups N` runs a Node of such a store; every Node is given the same number of Groups, Members per Group and Slots.
 
 ### 11.4 Moving a Slot
 The Meta Group decides a move; the two data Groups carry it out and each records its part in its own Log. From Group A to Group B:

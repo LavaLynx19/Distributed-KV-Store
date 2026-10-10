@@ -39,6 +39,7 @@ type config struct {
 	nodes    []string
 	clients  int
 	keys     int
+	groups   int
 	duration time.Duration
 	timeout  time.Duration
 	mark     time.Duration
@@ -56,6 +57,7 @@ func main() {
 	nodes := flag.String("nodes", "", "client API URLs of every Member, comma-separated")
 	flag.IntVar(&cfg.clients, "clients", 8, "concurrent clients, each sending one request at a time")
 	flag.IntVar(&cfg.keys, "keys", 50, "number of distinct keys")
+	flag.IntVar(&cfg.groups, "groups", 0, "the store has this many data Groups (A§11); 0 means one Group, as in Rungs 1-6")
 	flag.DurationVar(&cfg.duration, "duration", 10*time.Second, "how long clients run")
 	flag.DurationVar(&cfg.timeout, "timeout", 2*time.Second, "how long a client waits for one answer")
 	flag.DurationVar(&cfg.mark, "mark", 0, "report the longest pause in successful writes after this point (set it to just before a Fault is injected)")
@@ -186,16 +188,25 @@ func run(cfg config) bool {
 	// Members that fell behind need a moment to catch up. Divergence only
 	// counts if it is still there when the settle time runs out.
 	settleBy := time.Now().Add(cfg.settle)
-	diffs, unreachable := compare(httpc, cfg.nodes)
+	endState := func() ([]string, int) {
+		if cfg.groups > 0 {
+			return compareGroups(httpc, cfg.nodes)
+		}
+		return compare(httpc, cfg.nodes)
+	}
+	diffs, unreachable := endState()
 	for (len(diffs) > 0 || unreachable > 0) && time.Now().Before(settleBy) {
 		time.Sleep(100 * time.Millisecond)
-		diffs, unreachable = compare(httpc, cfg.nodes)
+		diffs, unreachable = endState()
 	}
 	if waited := cfg.settle - time.Until(settleBy); waited > 200*time.Millisecond {
 		fmt.Printf("settle:      Members took %s to converge\n", waited.Round(100*time.Millisecond))
 	}
 	current := members(httpc, cfg.nodes)
 	switch {
+	case cfg.groups > 0 && len(diffs) == 0 && unreachable == 0:
+		fmt.Printf("end state:   each of %d Groups identical on its Members; every Slot served by the Group the table names\n", cfg.groups)
+		return ok
 	case len(diffs) > 0:
 		ok = false
 		fmt.Printf("end state:   %d differences between Members\n", len(diffs))
@@ -265,9 +276,16 @@ func (c *client) request() {
 		c.seq++
 		cmd.Session, cmd.Seq = c.session, c.seq
 	}
+	// In a store with several Groups, a Group that hasn't seen this Session
+	// may start a record of it at this request, as long as no earlier
+	// attempt can have taken effect (A§11.6).
+	cmd.Register = c.cfg.groups > 0 && cmd.Session != 0
 	id, began := c.rec.begin(c.id, cmd)
 	result, resp := c.send(cmd)
 	for giveUp := began.Add(4 * c.cfg.timeout); c.cfg.retry && c.session != 0 && result != check.Answered && time.Now().Before(giveUp); {
+		if result == check.Lost {
+			cmd.Register = false
+		}
 		time.Sleep(2 * time.Millisecond)
 		result, resp = c.send(cmd)
 	}
@@ -350,6 +368,9 @@ func (c *client) send(cmd fsm.Command) (check.Result, fsm.Response) {
 	if cmd.Session != 0 {
 		req.Header.Set("Session-Id", strconv.FormatUint(cmd.Session, 10))
 		req.Header.Set("Request-Seq", strconv.FormatUint(cmd.Seq, 10))
+		if cmd.Register {
+			req.Header.Set("Session-Register", "1")
+		}
 	}
 
 	resp, err := c.http.Do(req)
@@ -430,6 +451,76 @@ func members(httpc *http.Client, nodes []string) []core.NodeID {
 		}
 	}
 	return list
+}
+
+// compareGroups is compare for a store with several Groups (A§11.12): the
+// Members of each Group must hold the same data, and each Slot must be
+// served by exactly the Group the table names.
+func compareGroups(httpc *http.Client, nodes []string) (diffs []string, unreachable int) {
+	items := map[uint32]map[core.NodeID][]fsm.Item{}
+	serves := map[int]map[uint32]bool{}
+	for i, n := range nodes {
+		resp, err := httpc.Get(n + "/v1/debug/items")
+		if err != nil {
+			unreachable++
+			continue
+		}
+		var dump []server.GroupItems
+		err = json.NewDecoder(resp.Body).Decode(&dump)
+		resp.Body.Close()
+		if err != nil {
+			unreachable++
+			continue
+		}
+		for _, g := range dump {
+			list := make([]fsm.Item, len(g.Items))
+			for j, it := range g.Items {
+				list[j] = fsm.Item{Key: it.Key, Value: []byte(it.Value), Version: it.Version}
+			}
+			if items[uint32(g.Group)] == nil {
+				items[uint32(g.Group)] = map[core.NodeID][]fsm.Item{}
+			}
+			items[uint32(g.Group)][core.NodeID(i+1)] = list
+			for _, slot := range g.Serves {
+				if serves[slot] == nil {
+					serves[slot] = map[uint32]bool{}
+				}
+				serves[slot][uint32(g.Group)] = true
+			}
+		}
+	}
+	for g, byNode := range items {
+		for _, d := range check.Diverged(byNode) {
+			diffs = append(diffs, fmt.Sprintf("Group %d: %s", g, d))
+		}
+	}
+	var table struct {
+		Slots []struct {
+			Slot     int    `json:"slot"`
+			Group    uint32 `json:"group"`
+			MovingTo uint32 `json:"moving_to"`
+		} `json:"slots"`
+	}
+	for _, n := range nodes {
+		resp, err := httpc.Get(n + "/v1/table")
+		if err != nil {
+			continue
+		}
+		err = json.NewDecoder(resp.Body).Decode(&table)
+		resp.Body.Close()
+		if err == nil && len(table.Slots) > 0 {
+			break
+		}
+	}
+	if len(table.Slots) == 0 {
+		return append(diffs, "no Node gave the Slot table"), unreachable
+	}
+	for _, row := range table.Slots {
+		if got := serves[row.Slot]; len(got) != 1 || !got[row.Group] || row.MovingTo != 0 {
+			diffs = append(diffs, fmt.Sprintf("Slot %d: the table says Group %d (moving to %d), and it is served by %v", row.Slot, row.Group, row.MovingTo, got))
+		}
+	}
+	return diffs, unreachable
 }
 
 // compare fetches every Member's own data and lists the differences. Nodes

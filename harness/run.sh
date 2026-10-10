@@ -18,6 +18,15 @@
 #   replace-follower kill -9 a follower for good, add a Spare in its place and
 #                    remove the dead Member (local only; A§6.5)
 #
+# With DATA_GROUPS set the run is of a store with several Groups (local only;
+# A§11), and the Faults are instead:
+#   none             no Fault
+#   move-slots       move a Slot to the next Group every half second for
+#                    FAULT_FOR seconds, waiting for each to finish
+#   kill-node        kill -9 Node 1, which hosts replicas of several Groups,
+#                    then start it again
+#   move-and-kill    both at once
+#
 # Environment:
 #   CLIENTS=8  DURATION=10s  FAULT_AT=3  FAULT_FOR=3   (seconds for the last two)
 #   RETRY=1    clients open a Session and retry unanswered requests (A§6.3)
@@ -26,6 +35,7 @@
 #   READS=index|log|lease   how gets are answered (default index, A§6.2)
 #   TTL_PCT=0  percentage of puts given a time-to-live (A§6.7)
 #   NODATA=1   Members keep nothing on disk, as before Rung 3
+#   DATA_GROUPS=3  SLOTS=64   a store with several Groups (see above)
 #
 # Output is also saved to harness/out/run-<backend>-<members>-<fault>.txt.
 set -euo pipefail
@@ -45,6 +55,8 @@ case "$BACKEND" in
   *) echo "backend must be local or docker" >&2; exit 2 ;;
 esac
 case "$FAULT" in
+  move-slots | kill-node | move-and-kill)
+    [[ -n "${DATA_GROUPS:-}" && $BACKEND == local ]] || { echo "$FAULT needs DATA_GROUPS and the local backend" >&2; exit 2; } ;;
   none | pause-leader | kill-leader | restart-all) ;;
   corrupt-follower | corrupt-leader | replace-follower) [[ $BACKEND == local ]] || { echo "$FAULT needs the local backend" >&2; exit 2; } ;;
   isolate-leader) [[ $BACKEND == docker ]] || { echo "isolate-leader needs the docker backend" >&2; exit 2; } ;;
@@ -80,16 +92,19 @@ leader() {
 
 log="$OUT/run-$BACKEND-$N-$FAULT${TAG:+-$TAG}.txt"
 {
-  echo "== $BACKEND, $N Members, fault $FAULT, $CLIENTS clients for $DURATION, reads by ${READS:-index}, ${READ_PCT:-35}% gets${RETRY:+, retrying in Sessions}"
+  echo "== $BACKEND, $N Members${DATA_GROUPS:+ hosting $DATA_GROUPS data Groups and the Meta Group}, fault $FAULT, $CLIENTS clients for $DURATION, reads by ${READS:-index}, ${READ_PCT:-35}% gets${RETRY:+, retrying in Sessions}"
   "$ctl" "${start[@]}" | tail -1
   trap '"$ctl" "$stop" >/dev/null 2>&1 || true' EXIT
   for _ in $(seq 1 100); do [[ -n "$(leader)" ]] && break; sleep 0.1; done
   [[ -n "$(leader)" ]] || { echo "no Leader after 10s" >&2; exit 1; }
+  # In a store with several Groups every Group needs its Leader.
+  [[ -z "${DATA_GROUPS:-}" ]] || sleep 1
 
   bench=("$ROOT/bin/kvbench" -nodes "$(IFS=,; echo "${nodes[*]}")" -clients "$CLIENTS" -duration "$DURATION")
   [[ -n "${RETRY:-}" ]] && bench+=(-retry)
   [[ -n "${READ_PCT:-}" ]] && bench+=(-read-pct "$READ_PCT")
   [[ -n "${TTL_PCT:-}" ]] && bench+=(-ttl-pct "$TTL_PCT")
+  [[ -n "${DATA_GROUPS:-}" ]] && bench+=(-groups "$DATA_GROUPS")
   if [[ $FAULT == none ]]; then
     "${bench[@]}"
     status=$?
@@ -100,6 +115,19 @@ log="$OUT/run-$BACKEND-$N-$FAULT${TAG:+-$TAG}.txt"
     pid=$!
     sleep "$FAULT_AT"
     target="$(leader)"
+    # moves asks for one Move every half second until time is up, each to the
+    # Group after the Slot's present one, and prints how long each took.
+    moves() {
+      local until=$((SECONDS + FAULT_FOR)) slot=0 round=1
+      while ((SECONDS < until)); do
+        # Slot s starts in Group s mod DATA_GROUPS + 1, so this is never
+        # the Group that has it.
+        "$ctl" move "$slot" "$(((slot + round) % DATA_GROUPS + 1))" || true
+        slot=$(((slot + 1) % ${SLOTS:-64}))
+        ((slot != 0)) || round=$((round + 1))
+        sleep 0.5
+      done
+    }
     [[ $FAULT == corrupt-follower || $FAULT == replace-follower ]] && target=$((target % N + 1))
     case "$FAULT" in
       pause-leader)   "$ctl" pause "$target";   sleep "$FAULT_FOR"; "$ctl" resume "$target" ;;
@@ -109,6 +137,13 @@ log="$OUT/run-$BACKEND-$N-$FAULT${TAG:+-$TAG}.txt"
         "$ctl" kill "$target"; "$ctl" corrupt "$target"; sleep "$FAULT_FOR"; "$ctl" restart "$target" ;;
       replace-follower)
         "$ctl" kill "$target"; "$ctl" add "$TOTAL"; "$ctl" remove "$target" ;;
+      move-slots) moves ;;
+      kill-node)  "$ctl" kill 1; sleep "$FAULT_FOR"; "$ctl" restart 1 ;;
+      move-and-kill)
+        moves &
+        mover=$!
+        sleep 1; "$ctl" kill 1; sleep 1; "$ctl" restart 1
+        wait "$mover" ;;
       restart-all)
         for i in $(seq 1 "$N"); do "$ctl" kill "$i"; done
         sleep "$FAULT_FOR"

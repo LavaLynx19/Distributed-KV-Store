@@ -6,6 +6,8 @@
 #   harness/local.sh add <id>          # add a Spare to the Group (kvctl)
 #   harness/local.sh remove <id>       # remove a Member from the Group (kvctl)
 #   harness/local.sh members           # what each Node says of the Group (kvctl)
+#   harness/local.sh table             # with DATA_GROUPS: which Group owns each Slot (kvctl)
+#   harness/local.sh move <slot> <group>   # with DATA_GROUPS: move a Slot (kvctl)
 #   harness/local.sh status
 #   harness/local.sh pause <id>        # freeze one Member (SIGSTOP)
 #   harness/local.sh resume <id>       # let it continue (SIGCONT)
@@ -18,6 +20,9 @@
 # Each Member keeps its durable state in harness/out/local/data<id>. "start"
 # wipes them; "restart" keeps them. NODATA=1 runs Members with no data
 # directory, as before Rung 3.
+#
+# DATA_GROUPS=3 on "start" runs a store with that many data Groups and a Meta
+# Group, each on 3 of the Nodes (A§11). SLOTS sets the number of Slots.
 #
 # Logs and pid files go to harness/out/local/.
 set -euo pipefail
@@ -35,7 +40,11 @@ addrs() { # base-port members
 launch() { # id nodes founders
   local data=()
   [[ -n "${NODATA:-}" ]] || data=(-data "$OUT/data$1")
-  "$BIN" -id "$1" -peers "$(addrs 7000 "$2")" -clients "$(addrs 8000 "$2")" -members "$(seq -s, 1 "$3" | sed 's/,$//')" \
+  local shape=(-members "$(seq -s, 1 "$3" | sed 's/,$//')")
+  local groups
+  groups="$(cat "$OUT/groups" 2>/dev/null || echo 0)"
+  [[ $groups -eq 0 ]] || shape=(-data-groups "$groups" -slots "$(cat "$OUT/slots")")
+  "$BIN" -id "$1" -peers "$(addrs 7000 "$2")" -clients "$(addrs 8000 "$2")" "${shape[@]}" \
     ${data[@]+"${data[@]}"} ${KVNODE_FLAGS:-} \
     >>"$OUT/node$1.log" 2>&1 &
   echo $! >"$OUT/node$1.pid"
@@ -62,6 +71,8 @@ case "${1:-}" in
     rm -rf "$OUT"/data*
     echo "$total" >"$OUT/nodes"
     echo "$n" >"$OUT/founders"
+    echo "${DATA_GROUPS:-0}" >"$OUT/groups"
+    echo "${SLOTS:-64}" >"$OUT/slots"
     for i in $(seq 1 "$total"); do launch "$i" "$total" "$n"; done
     echo "started $n Members${3:+ and $3 Spares}; clients on 127.0.0.1:8001..$((8000 + total))"
     ;;
@@ -99,6 +110,12 @@ case "${1:-}" in
   members)
     "$ROOT/bin/kvctl" -nodes "$(urls)" status
     ;;
+  table)
+    "$ROOT/bin/kvctl" -nodes "$(urls)" table
+    ;;
+  move)
+    "$ROOT/bin/kvctl" -nodes "$(urls)" move "${2:?usage: local.sh move <slot> <group>}" "${3:?usage: local.sh move <slot> <group>}"
+    ;;
   corrupt)
     id="${2:?usage: local.sh corrupt <id>}"
     seg="$(ls "$OUT/data$id/log"/*.seg | tail -1)"
@@ -114,11 +131,11 @@ case "${1:-}" in
       kill "$(cat "$f")" 2>/dev/null || true
       rm -f "$f"
     done
-    rm -f "$OUT/nodes" "$OUT/founders"
+    rm -f "$OUT/nodes" "$OUT/founders" "$OUT/groups" "$OUT/slots"
     echo "stopped"
     ;;
   *)
-    sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac
