@@ -175,7 +175,7 @@ func OpenWith(fs FS, dir string, opts Options) (*Store, core.Stored, error) {
 	raw, err := s.readWhole("snapshot")
 	var corrupt *CorruptError
 	switch {
-	case errors.As(err, &corrupt) || (err == nil && raw != nil && len(raw) < 16):
+	case errors.As(err, &corrupt) || (err == nil && raw != nil && !readableSnapshot(raw)):
 		if err := s.markDamaged(&stored); err != nil {
 			return nil, core.Stored{}, err
 		}
@@ -189,11 +189,7 @@ func OpenWith(fs FS, dir string, opts Options) (*Store, core.Stored, error) {
 	case err != nil:
 		return nil, core.Stored{}, err
 	case raw != nil:
-		stored.Snapshot = &core.Snapshot{
-			Index: core.Index(binary.BigEndian.Uint64(raw[:8])),
-			Term:  core.Term(binary.BigEndian.Uint64(raw[8:16])),
-			Data:  raw[16:],
-		}
+		stored.Snapshot = decodeSnapshot(raw)
 		s.first = stored.Snapshot.Index + 1
 		s.snapshotTerm = stored.Snapshot.Term
 	}
@@ -212,10 +208,90 @@ func OpenWith(fs FS, dir string, opts Options) (*Store, core.Stored, error) {
 	if err != nil {
 		return nil, core.Stored{}, err
 	}
+	if stored.Forced, err = s.readForced(); err != nil {
+		return nil, core.Stored{}, err
+	}
 	if err := s.Sync(); err != nil {
 		return nil, core.Stored{}, err
 	}
 	return s, stored, nil
+}
+
+// forcedFile holds the Member list an operator imposed by Unsafe recovery
+// (A§6.6): the Index of the last Entry the Member held at the time, a
+// 4-byte count, and 8 bytes per Member.
+const forcedFile = "forced"
+
+func (s *Store) readForced() (*core.ForcedMembers, error) {
+	raw, err := s.readWhole(forcedFile)
+	if err != nil || raw == nil {
+		return nil, err // a damaged file is an error: nothing else says who the Members are
+	}
+	if len(raw) < 12 || uint64(len(raw)-12) != 8*uint64(binary.BigEndian.Uint32(raw[8:12])) {
+		return nil, &CorruptError{Path: filepath.Join(s.dir, forcedFile), Detail: "not a forced Member list"}
+	}
+	f := &core.ForcedMembers{At: core.Index(binary.BigEndian.Uint64(raw[:8]))}
+	for rest := raw[12:]; len(rest) > 0; rest = rest[8:] {
+		f.Members = append(f.Members, core.NodeID(binary.BigEndian.Uint64(rest[:8])))
+	}
+	return f, nil
+}
+
+// Recovery is what ForceMembers found and did.
+type Recovery struct {
+	// LastIndex and LastTerm are the last Entry this Member holds. Anything
+	// the Group Committed after it is gone unless another survivor has it.
+	LastIndex core.Index
+	LastTerm  core.Term
+	// Term is the latest Term the Member had seen.
+	Term core.Term
+	// WasDamaged: the Member had found damage on its disk and not yet
+	// recovered (A§6.8). It may be missing Entries it once acknowledged,
+	// and it will now vote all the same.
+	WasDamaged bool
+	// Stored is everything the Member held, for the caller to describe.
+	Stored core.Stored
+}
+
+// ForceMembers is Unsafe recovery (A§6.6). It writes members to the
+// directory of a stopped Member as its Member list, overriding every
+// Membership change in its Log, and clears the mark that keeps a damaged
+// Member out of elections. The Member will then act on that list when it
+// starts. Nothing is removed from its Log.
+//
+// It is unsafe because it can't know what the rest of the Group Committed.
+// It must never be run while the Member is running, and the Members left
+// out must never be started again with their old data.
+func ForceMembers(fs FS, dir string, members []core.NodeID, opts Options) (Recovery, error) {
+	if len(members) == 0 {
+		return Recovery{}, errors.New("storage: a Group needs at least one Member")
+	}
+	s, stored, err := OpenWith(fs, dir, opts)
+	if err != nil {
+		return Recovery{}, err
+	}
+	rec := Recovery{Term: stored.HardState.Term, WasDamaged: stored.Damaged, Stored: stored}
+	if snap := stored.Snapshot; snap != nil {
+		rec.LastIndex, rec.LastTerm = snap.Index, snap.Term
+	}
+	if n := len(stored.Entries); n > 0 {
+		rec.LastIndex, rec.LastTerm = stored.Entries[n-1].Index, stored.Entries[n-1].Term
+	}
+	raw := binary.BigEndian.AppendUint64(nil, uint64(rec.LastIndex))
+	raw = binary.BigEndian.AppendUint32(raw, uint32(len(members)))
+	for _, m := range members {
+		raw = binary.BigEndian.AppendUint64(raw, uint64(m))
+	}
+	if err := s.replaceFile(forcedFile, raw); err != nil {
+		return Recovery{}, err
+	}
+	if err := s.Write(&core.Persist{Recovered: true}); err != nil {
+		return Recovery{}, err
+	}
+	if err := s.Sync(); err != nil {
+		return Recovery{}, err
+	}
+	return rec, s.Close()
 }
 
 // damageMark is the file whose presence says the directory was found
@@ -517,10 +593,7 @@ func (s *Store) Write(p *core.Persist) error {
 		}
 	}
 	if p.Snapshot != nil {
-		raw := make([]byte, 16, 16+len(p.Snapshot.Data))
-		binary.BigEndian.PutUint64(raw[:8], uint64(p.Snapshot.Index))
-		binary.BigEndian.PutUint64(raw[8:], uint64(p.Snapshot.Term))
-		if err := s.replaceFile("snapshot", append(raw, p.Snapshot.Data...)); err != nil {
+		if err := s.replaceFile("snapshot", encodeSnapshot(p.Snapshot)); err != nil {
 			return err
 		}
 		if err := s.dropThrough(p.Snapshot.Index, p.ResetLog); err != nil {
@@ -719,6 +792,58 @@ func (s *Store) dropThrough(index core.Index, all bool) error {
 		}
 	}
 	return nil
+}
+
+// withMembers is set in a Snapshot file's Term field when a Member list
+// follows the header. No Term comes near it.
+const withMembers = 1 << 63
+
+// encodeSnapshot lays a Snapshot out as Index and Term, 8 bytes each, then
+// the state machine's data. If the Snapshot carries a Member list (A§6.5),
+// the Term's top bit is set and the list comes between the two: a 4-byte
+// count, then 8 bytes per Member.
+func encodeSnapshot(snap *core.Snapshot) []byte {
+	raw := make([]byte, 16, 16+4+8*len(snap.Members)+len(snap.Data))
+	binary.BigEndian.PutUint64(raw[:8], uint64(snap.Index))
+	term := uint64(snap.Term)
+	if snap.Members != nil {
+		term |= withMembers
+		raw = binary.BigEndian.AppendUint32(raw, uint32(len(snap.Members)))
+		for _, m := range snap.Members {
+			raw = binary.BigEndian.AppendUint64(raw, uint64(m))
+		}
+	}
+	binary.BigEndian.PutUint64(raw[8:16], term)
+	return append(raw, snap.Data...)
+}
+
+// readableSnapshot reports whether raw is long enough for what its header
+// says it holds.
+func readableSnapshot(raw []byte) bool {
+	if len(raw) < 16 {
+		return false
+	}
+	if binary.BigEndian.Uint64(raw[8:16])&withMembers == 0 {
+		return true
+	}
+	return len(raw) >= 20 && uint64(len(raw)-20) >= 8*uint64(binary.BigEndian.Uint32(raw[16:20]))
+}
+
+func decodeSnapshot(raw []byte) *core.Snapshot {
+	term := binary.BigEndian.Uint64(raw[8:16])
+	snap := &core.Snapshot{Index: core.Index(binary.BigEndian.Uint64(raw[:8])), Term: core.Term(term &^ withMembers)}
+	rest := raw[16:]
+	if term&withMembers != 0 {
+		count := binary.BigEndian.Uint32(rest[:4])
+		rest = rest[4:]
+		snap.Members = make([]core.NodeID, count)
+		for i := range snap.Members {
+			snap.Members[i] = core.NodeID(binary.BigEndian.Uint64(rest[:8]))
+			rest = rest[8:]
+		}
+	}
+	snap.Data = rest
+	return snap
 }
 
 // endMark closes every checked record. It is non-zero on purpose.

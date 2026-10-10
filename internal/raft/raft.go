@@ -127,6 +127,14 @@ type Config struct {
 	// that needs Entries the Log no longer holds. It exists so that Rung 3's
 	// exposure of a Member that can't catch up stays reproducible.
 	NoSnapshotTransfer bool
+	// SwapMembersAtOnce accepts any new Member list and puts it in force in
+	// one step, with neither of the rules that make a change safe. It
+	// exists so that Rung 6's exposure of that stays reproducible.
+	SwapMembersAtOnce bool
+	// AddWithoutCatchUp makes a Member count from the moment it is added,
+	// before it holds any of the Log. It exists so that Rung 6's exposure of
+	// that stays reproducible.
+	AddWithoutCatchUp bool
 	// Volatile makes the Member store nothing, as before Rung 3. It exists so
 	// that Rung 3's exposure of a store with no disk stays reproducible.
 	Volatile bool
@@ -137,9 +145,27 @@ const maxBatch = 64
 
 // Node is one Member's consensus state.
 type Node struct {
-	id      core.NodeID
+	id  core.NodeID
+	cfg Config
+
+	// members is the Group's Member list in force: that of the latest
+	// Membership change in the Log, Committed or not (members.go). lists
+	// holds it and the earlier ones still needed: lists[0] is the list at
+	// the Snapshot, or the one the Group started with, and the rest are the
+	// changes in the Log, in order. changed is set once the list has ever
+	// differed from the starting one.
 	members []core.NodeID // ascending
-	cfg     Config
+	lists   []memberList
+	changed bool
+	// learner is a Node the Leader is bringing up to date before adding it,
+	// for the request learnerRef, since tick learnerSince. Zero means none.
+	learner      core.NodeID
+	learnerRef   uint64
+	learnerSince int
+	// forced is set while this Member's list is one an operator imposed and
+	// the Log doesn't say so yet (A§6.6). The first of the survivors to
+	// lead appends it as a change, so that everyone ends with the same list.
+	forced bool
 
 	term     core.Term
 	votedFor core.NodeID
@@ -203,13 +229,34 @@ func New(cfg Config) *Node {
 		cfg.LeaseTicks = cfg.ElectionTicks - 2
 	}
 	n := &Node{id: cfg.ID, members: members, cfg: cfg, pending: map[core.Index]uint64{}}
+	n.lists = []memberList{{members: members}}
 	n.term, n.votedFor = cfg.Stored.HardState.Term, cfg.Stored.HardState.VotedFor
 	if snap := cfg.Stored.Snapshot; snap != nil {
 		n.snapshot = snap
 		n.log.base, n.log.baseTerm = snap.Index, snap.Term
 		n.commit, n.applied = snap.Index, snap.Index
+		if snap.Members != nil {
+			n.members, n.changed = slices.Clone(snap.Members), true
+			n.lists = []memberList{{index: snap.Index, members: n.members}}
+		}
 	}
 	n.log.entries = slices.Clone(cfg.Stored.Entries)
+	// A list an operator forced overrides everything the Member held when
+	// it was forced: the Snapshot's list and the changes in the Log up to
+	// there. Anything after it is newer and stands.
+	var forcedAt core.Index
+	if f := cfg.Stored.Forced; f != nil && f.At >= n.log.base {
+		forcedAt = f.At
+		n.members, n.changed, n.forced = slices.Clone(f.Members), true, true
+		slices.Sort(n.members)
+		n.lists = []memberList{{index: f.At, members: n.members}}
+	}
+	for _, e := range n.log.entries {
+		if e.Kind == core.EntryMembers && (cfg.Stored.Forced == nil || e.Index > forcedAt) {
+			n.useMembers(e)
+			n.changed = true
+		}
+	}
 	n.recovering = cfg.Stored.Damaged
 	n.cfg.Stored = core.Stored{} // not needed again; don't hold the Log twice
 	n.resetElection()
@@ -235,10 +282,14 @@ func (n *Node) appendEntry(out *core.Output, e core.Entry) {
 	n.log.append(e)
 	p := persist(out)
 	p.Entries = append(p.Entries, e)
+	if e.Kind == core.EntryMembers {
+		n.useMembers(e)
+		n.changed = true
+	}
 }
 
 func (n *Node) Status() core.Status {
-	return core.Status{ID: n.id, Role: n.role, Term: n.term, Leader: n.leader, Commit: n.commit, Recovering: n.abstaining()}
+	return core.Status{ID: n.id, Role: n.role, Term: n.term, Leader: n.leader, Commit: n.commit, Recovering: n.abstaining(), Members: slices.Clone(n.members)}
 }
 
 // abstaining reports whether the Member must stay out of elections.
@@ -268,8 +319,14 @@ func (n *Node) Step(ev core.Event) core.Output {
 		n.read(&out, ev)
 	case core.Snapshotted:
 		n.snapshotted(&out, ev)
+	case core.Reconfigure:
+		n.reconfigure(&out, ev)
+	}
+	if n.role == core.LeaderRole {
+		n.promoteLearner(&out)
 	}
 	n.deliverCommitted(&out)
+	n.leaveIfRemoved(&out)
 	n.releaseReads(&out)
 	if n.cfg.Volatile {
 		out.Persist = nil
@@ -283,6 +340,9 @@ func (n *Node) tick(out *core.Output) {
 		if n.abstaining() {
 			return // no elections for a Member that is recovering
 		}
+		if !n.isMember(n.id) {
+			return // nor for a Node that isn't in the Group
+		}
 		if n.elapsed++; n.elapsed >= n.timeout {
 			n.startElection(out)
 		}
@@ -291,7 +351,7 @@ func (n *Node) tick(out *core.Output) {
 
 	// A Leader cut off from a Majority can't commit anything. It steps down
 	// so its clients get an answer instead of waiting.
-	inTouch := 1
+	inTouch := n.self()
 	for _, m := range n.members {
 		if m != n.id && n.now-n.heard[m] <= n.cfg.ElectionTicks {
 			inTouch++
@@ -304,10 +364,7 @@ func (n *Node) tick(out *core.Output) {
 
 	if n.heartbeat++; n.heartbeat >= n.cfg.HeartbeatTicks {
 		n.heartbeat = 0
-		for _, m := range n.members {
-			if m == n.id {
-				continue
-			}
+		for _, m := range n.peers() {
 			// Anything sent but not yet confirmed is sent again.
 			n.next[m] = n.match[m] + 1
 			n.sendHeartbeat(out, m)
@@ -335,6 +392,11 @@ func (n *Node) becomeFollower(out *core.Output, term core.Term, leader core.Node
 	if n.role == core.LeaderRole {
 		n.failPending(out)
 		n.failReads(out)
+		if n.learner != 0 {
+			// Nothing was appended for it, so the answer is definite.
+			out.Results = append(out.Results, core.Result{Ref: n.learnerRef, Reason: core.NotLeader, Leader: leader})
+			n.learner, n.learnerRef = 0, 0
+		}
 	}
 	if term > n.term {
 		n.term = term
@@ -365,6 +427,11 @@ func (n *Node) failPending(out *core.Output) {
 func (n *Node) receive(out *core.Output, msg core.Message) {
 	switch m := msg.Body.(type) {
 	case RequestVote:
+		if !n.isMember(msg.From) {
+			// A Node that was removed and never heard of it will go on
+			// standing for election. Its Term must not unseat a Leader.
+			return
+		}
 		if m.Term > n.term {
 			n.becomeFollower(out, m.Term, 0)
 		}
@@ -421,10 +488,10 @@ func (n *Node) propose(out *core.Output, p core.Propose) {
 	index := n.lastIndex() + 1
 	n.appendEntry(out, core.Entry{Index: index, Term: n.term, Kind: core.EntryCommand, Payload: slices.Clone(p.Payload)})
 	n.pending[index] = p.Ref
-	for _, m := range n.members {
+	for _, m := range n.peers() {
 		// A follower that has been sent everything so far gets the new Entry
 		// now. One that is behind gets it with the next heartbeat.
-		if m != n.id && n.next[m] == index {
+		if n.next[m] == index {
 			n.sendAppend(out, m)
 		}
 	}
@@ -437,8 +504,9 @@ func (n *Node) snapshotted(out *core.Output, s core.Snapshotted) {
 	if s.Index <= n.log.base || s.Index > n.applied {
 		return // older than what we have, or of Entries never handed over
 	}
-	snap := &core.Snapshot{Index: s.Index, Term: n.termAt(s.Index), Data: s.Data}
+	snap := &core.Snapshot{Index: s.Index, Term: n.termAt(s.Index), Data: s.Data, Members: n.snapshotMembers(s.Index)}
 	n.log.compactTo(s.Index)
+	n.foldListsTo(s.Index)
 	n.snapshot = snap
 	persist(out).Snapshot = snap
 }

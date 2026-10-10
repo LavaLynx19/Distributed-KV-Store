@@ -146,9 +146,9 @@ The state machine obeys the same rules, so every Member that applies the same En
 |---|---|
 | Vote state | Current **Term** and the Member voted for in it |
 | **Log** | **Entries**: index, Term, kind, payload. From Rung 5 a command's payload carries the Leader's time stamp |
-| **Snapshot** | Last included index and Term, and the state machine's full contents: keys and **Sessions**. The Member list joins them in Rung 6 |
+| **Snapshot** | Last included index and Term, and the state machine's full contents: keys and **Sessions**. From Rung 6, also the Member list as of that index, once it has ever changed |
 
-Entry kinds: no-op, command. Membership change arrives in Rung 6, and Rungs 7–8 add more (§10).
+Entry kinds: no-op, command, and from Rung 6 Membership change, whose payload is the Group's new Member list. Rungs 7–8 add more (§10).
 
 The commit index is not stored. A restarted Member knows only that its Snapshot is Committed, and learns the rest again from the Leader. The shell rebuilds the state machine from the Snapshot plus the Entries the core hands over again as they are confirmed.
 
@@ -174,7 +174,7 @@ A Member's data directory (`internal/storage`):
 | File | Content | How it changes |
 |---|---|---|
 | `state.a`, `state.b` | Term and vote, 16 bytes, twice | Each replaced whole, one after the other: written to a temporary file, synced, renamed |
-| `snapshot` | Index, Term, then the state machine's data | Replaced whole, the same way |
+| `snapshot` | Index, Term, then the state machine's data. If it carries a Member list, the Term's top bit is set and the list sits between the two: a 4-byte count and 8 bytes per Member | Replaced whole, the same way |
 | `log/<first>.seg` | Log segments, named by their first Entry's index. Each is a run of records | Appended to; a new segment starts every 4 MB |
 | `damaged` | Empty. Present while the Member is **Recovering** (§6.8) | Created when damage is found, removed when the core says it has recovered |
 
@@ -223,14 +223,28 @@ In Rung 1 clients never retry: a request with no definite answer is recorded as 
   - **It doesn't:** its Log is behind or has diverged, and it is dropped.
 
 ### 6.5 Membership change
-One Member is added or removed per change, as a Log Entry. A Member uses a new Member list as soon as the Entry is in its Log. Two rules guard it:
+One Member is added or removed per change, as a Log Entry that carries the whole new Member list. A Member uses a new list as soon as the Entry is in its Log, Committed or not, and goes back to the list before it if the Entry is replaced. Two rules guard it:
 - Only one change may be uncommitted at a time.
 - A Leader may not append a change until it has Committed an Entry from its own Term. Without this, changes that straddle Terms can produce two Majorities (a published flaw in the original single-change scheme).
 
-A new Member first catches up without counting toward the Majority.
+**Adding.** A Node to be added runs first as a **Spare**: it knows the Group's Member list, isn't in it, and so never stands for election. Asked to add it, the Leader makes it a **Learner**: it is sent the Log (or the Snapshot) like a follower and counts toward nothing. When it holds everything Committed, the Leader appends the change. If it hasn't caught up within 20 election timeouts the Leader gives up, and nothing has changed.
+
+**Removing.** The Leader appends the change and stops sending to the removed Member at once. A Leader may remove itself: it leads until the change is Committed, without counting itself toward the Majority, and then steps down.
+
+**A removed Member may never hear that it was removed**, and will then stand for election for ever. So a Member ignores a request for its vote from a Node that isn't in its list, and doesn't take that Node's Term either.
+
+**Where the list is kept.** Each Member remembers the list at its Snapshot (or the one the Group started with) and one per change still in its Log. A restarted Member reads them from its disk, and its start-up flags only name the starting list.
+
+**Addresses.** Every Node is started with the address of every Node that may ever join, Spares included. A change names a Node by id only.
 
 ### 6.6 Unsafe recovery
-An operator command, run on a surviving Member while the Group is stopped, rewrites its Member list to the survivors. It prints the last index it holds and warns that anything Committed beyond the survivors' Logs is lost. It is never automatic.
+An operator command, run on each surviving Member while it is stopped, rewrites its Member list to the survivors: `kvctl unsafe-recover -data <dir> -members <ids>`. It is never automatic, and without `-confirm` it only says what it would do.
+
+- **What it writes.** A file beside the Log holding the forced list and the index of the last Entry the Member held. The Log is not touched. When the Member starts, that list overrides the Snapshot's and every Membership change up to that index. A forced list that can't be read stops the Member starting.
+- **What happens next.** The survivors elect a Leader among themselves by the usual rule, so the one holding the most wins. Its first act is to append the forced list as a Membership change, so every survivor, and every Member added later, ends with the same list in its Log.
+- **What it reports.** The last index and Term the Member holds, the Member list it replaces if the disk says, the Members discarded, and that every write Committed after that index is lost unless another survivor holds it. It can't say which writes those were: the Members that knew are gone.
+- **It also clears the mark that keeps a damaged Member out of elections** (§6.8), and says so. This is the way out for a Group that has stopped because a Majority is Recovering.
+- **The discarded Members must never be started again with their old data.** They still hold the old list, and enough of them would elect a Leader of their own.
 
 ### 6.7 Expiry
 - **Log time** is the highest stamp applied so far. A stamp lower than Log time leaves it where it is, so time never goes back when a Leader's clock does.
@@ -279,7 +293,9 @@ Requests carry `Session-Id` and `Request-Seq` headers so that a retry takes effe
 | 503 | `no_majority` | This Member knows of no Leader backed by a Majority: it is cut off, or an election is under way | Retry later, same request number |
 | 504 | `timeout` | Outcome unknown | Retry, same request number |
 | 410 | `session_expired` | The Session was cleaned up | Open a new Session; the outcome of the last request is unknown |
-| 400 | `invalid` | Malformed request | Fix the request |
+| 400 | `invalid` | Malformed request, or a Membership change that isn't one: the Node is already a Member, or isn't one, or is the last | Fix the request |
+| 409 | `change_in_progress` | Another Membership change is under way, or the Leader has only just been elected. Nothing changed | Retry later |
+| 503 | `member_unreachable` | The Node to be added didn't catch up with the Log. Nothing changed | Check the Node is running as a Spare, then retry |
 | 500 | `internal` | A bug in the store | Report it; the outcome is unknown |
 
 New reasons are added here first.
@@ -287,8 +303,12 @@ New reasons are added here first.
 ### 7.3 Admin
 | Method and path | Purpose |
 |---|---|
-| `POST /v1/admin/members` | Add a Member |
-| `DELETE /v1/admin/members/{id}` | Remove a Member |
+| `POST /v1/admin/members` | Add a Member: `{"id": 4}`. The Node must be running as a Spare. Answers once the change is Committed, with the new Member list |
+| `DELETE /v1/admin/members/{id}` | Remove a Member. Answers once the change is Committed, with the new Member list |
+
+`GET /v1/status` includes `members`: the list as that Node has it. `kvctl -nodes <urls> status|add <id>|remove <id>` wraps these, finds the Leader, and retries while the answer is `change_in_progress`.
+
+A Node is started as a Spare by leaving it out of `kvnode -members`, which names the Members the Group begins with.
 
 Unsafe recovery is a command-line action on a stopped Member, not an API call.
 

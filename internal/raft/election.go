@@ -43,7 +43,7 @@ func (n *Node) handleRequestVote(out *core.Output, from core.NodeID, m RequestVo
 }
 
 func (n *Node) handleVoteReply(out *core.Output, from core.NodeID, m VoteReply) {
-	if n.role != core.Candidate || m.Term != n.term || !m.Granted {
+	if n.role != core.Candidate || m.Term != n.term || !m.Granted || !n.isMember(from) {
 		return
 	}
 	n.votes[from] = true
@@ -65,12 +65,18 @@ func (n *Node) becomeLeader(out *core.Output) {
 	n.sentSnap = map[core.NodeID]int{}
 	n.roundAcked = map[core.NodeID]uint64{}
 	n.leaseFrom = map[core.NodeID]int{}
+	n.learner, n.learnerRef = 0, 0
 	n.roundOpen = false
 	for _, m := range n.members {
 		n.next[m] = n.lastIndex() + 1
 		n.heard[m] = n.now
 	}
 	n.appendEntry(out, core.Entry{Index: n.lastIndex() + 1, Term: n.term, Kind: core.EntryNoop})
+	if n.forced {
+		// Unsafe recovery: put the forced list in the Log, where every
+		// survivor and every later Member will find it.
+		n.appendEntry(out, core.Entry{Index: n.lastIndex() + 1, Term: n.term, Kind: core.EntryMembers, Payload: encodeMembers(n.members)})
+	}
 	for _, m := range n.members {
 		if m != n.id {
 			n.sendAppend(out, m)

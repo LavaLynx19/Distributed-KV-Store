@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -223,5 +224,127 @@ func TestMatchesStoredApply(t *testing.T) {
 			}
 		}
 		s.Close()
+	}
+}
+
+// A Snapshot's Member list comes back with it, and a Membership change Entry
+// comes back as what it was. A Snapshot with no list is stored exactly as it
+// was before lists existed.
+func TestMemberListsSurviveARestart(t *testing.T) {
+	dir := t.TempDir()
+	s, _, err := Open(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	change := core.Entry{Index: 3, Term: 2, Kind: core.EntryMembers, Payload: []byte{2, 1, 4}}
+	save(t, s, core.Persist{Entries: append(es(1, 2, 1), change)})
+	save(t, s, core.Persist{Snapshot: &core.Snapshot{Index: 2, Term: 1, Data: []byte("state"), Members: []core.NodeID{1, 2, 5}}})
+	s, stored := reopen(t, s, dir, 0)
+	want := &core.Snapshot{Index: 2, Term: 1, Data: []byte("state"), Members: []core.NodeID{1, 2, 5}}
+	if !reflect.DeepEqual(stored.Snapshot, want) {
+		t.Fatalf("snapshot = %+v, want %+v", stored.Snapshot, want)
+	}
+	if len(stored.Entries) != 1 || !reflect.DeepEqual(stored.Entries[0], change) {
+		t.Fatalf("entries = %+v, want the Membership change", stored.Entries)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	plain := &core.Snapshot{Index: 7, Term: 3, Data: []byte("state")}
+	if raw := encodeSnapshot(plain); len(raw) != 16+5 || raw[8] != 0 {
+		t.Fatalf("a Snapshot with no Member list encoded as %v", raw)
+	}
+	if got := decodeSnapshot(encodeSnapshot(plain)); !reflect.DeepEqual(got, plain) {
+		t.Fatalf("round trip gave %+v", got)
+	}
+	// A header that promises more Members than the file holds is damage.
+	short := encodeSnapshot(want)[:20]
+	if readableSnapshot(short) {
+		t.Fatal("a Snapshot cut off inside its Member list was accepted")
+	}
+}
+
+// Unsafe recovery writes a Member list beside the Log, touches nothing in
+// the Log, and reports what the Member holds.
+func TestForceMembers(t *testing.T) {
+	dir := t.TempDir()
+	s, _, err := Open(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	save(t, s, core.Persist{HardState: &core.HardState{Term: 4, VotedFor: 2}, Entries: es(1, 7, 3)})
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, err := ForceMembers(OSFS{}, dir, []core.NodeID{2, 5}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.LastIndex != 7 || rec.LastTerm != 3 || rec.Term != 4 || rec.WasDamaged {
+		t.Fatalf("report = %+v, want last Entry 7 of Term 3, Term 4, no damage", rec)
+	}
+	s, stored, err := Open(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := &core.ForcedMembers{Members: []core.NodeID{2, 5}, At: 7}
+	if !reflect.DeepEqual(stored.Forced, want) || len(stored.Entries) != 7 || stored.HardState.Term != 4 {
+		t.Fatalf("after forcing: forced %+v, %d Entries, Term %d", stored.Forced, len(stored.Entries), stored.HardState.Term)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ForceMembers(OSFS{}, dir, nil, Options{}); err == nil {
+		t.Fatal("an empty Member list was accepted")
+	}
+
+	// A forced list that can't be read stops the Member starting: nothing
+	// else on its disk says who the Members are.
+	path := filepath.Join(dir, forcedFile)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[9] ^= 0x40
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var corrupt *CorruptError
+	if _, _, err := Open(dir, 0); !errors.As(err, &corrupt) {
+		t.Fatalf("opening with a damaged forced list: %v, want a CorruptError", err)
+	}
+}
+
+// Unsafe recovery lets a damaged Member vote again (A§6.8), and says that it
+// was damaged.
+func TestForceMembersClearsTheDamageMark(t *testing.T) {
+	fs := NewMemFS()
+	s, _, err := OpenFS(fs, "d", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	save(t, s, core.Persist{Entries: es(1, 20, 1)})
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fs.Crash(nil, false)
+	rng := rand.New(rand.NewPCG(7, 7))
+	for flipped := false; !flipped; {
+		fs.FlipBit(rng)
+		_, stored, err := OpenFS(fs, "d", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		flipped = stored.Damaged
+		fs.Crash(nil, false)
+	}
+	rec, err := ForceMembers(fs, "d", []core.NodeID{1}, Options{})
+	if err != nil || !rec.WasDamaged {
+		t.Fatalf("report = %+v, %v; want WasDamaged", rec, err)
+	}
+	if _, stored, err := OpenFS(fs, "d", 0); err != nil || stored.Damaged || stored.Forced == nil {
+		t.Fatalf("after forcing: %+v, %v; want no damage mark and the forced list", stored, err)
 	}
 }

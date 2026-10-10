@@ -2,7 +2,10 @@
 # Runs a Group as local processes: Member i listens for other Members on
 # 127.0.0.1:700i and for clients on 127.0.0.1:800i.
 #
-#   harness/local.sh start [members]   # default 3
+#   harness/local.sh start [members] [spares]   # default 3 and 0
+#   harness/local.sh add <id>          # add a Spare to the Group (kvctl)
+#   harness/local.sh remove <id>       # remove a Member from the Group (kvctl)
+#   harness/local.sh members           # what each Node says of the Group (kvctl)
 #   harness/local.sh status
 #   harness/local.sh pause <id>        # freeze one Member (SIGSTOP)
 #   harness/local.sh resume <id>       # let it continue (SIGCONT)
@@ -29,29 +32,41 @@ addrs() { # base-port members
   (IFS=,; echo "${list[*]}")
 }
 
-launch() { # id members
+launch() { # id nodes founders
   local data=()
   [[ -n "${NODATA:-}" ]] || data=(-data "$OUT/data$1")
-  "$BIN" -id "$1" -peers "$(addrs 7000 "$2")" -clients "$(addrs 8000 "$2")" ${data[@]+"${data[@]}"} ${KVNODE_FLAGS:-} \
+  "$BIN" -id "$1" -peers "$(addrs 7000 "$2")" -clients "$(addrs 8000 "$2")" -members "$(seq -s, 1 "$3" | sed 's/,$//')" \
+    ${data[@]+"${data[@]}"} ${KVNODE_FLAGS:-} \
     >>"$OUT/node$1.log" 2>&1 &
   echo $! >"$OUT/node$1.pid"
 }
 
-members() { cat "$OUT/members" 2>/dev/null || { echo "no Group running" >&2; exit 1; }; }
+# nodes is how many Nodes were started; founders, how many of them the Group
+# began with. The rest began as Spares.
+nodes() { cat "$OUT/nodes" 2>/dev/null || { echo "no Group running" >&2; exit 1; }; }
+founders() { cat "$OUT/founders"; }
+urls() {
+  local list=() i
+  for i in $(seq 1 "$(nodes)"); do list+=("http://127.0.0.1:$((8000 + i))"); done
+  (IFS=,; echo "${list[*]}")
+}
 
 case "${1:-}" in
   start)
     n="${2:-3}"
+    total=$((n + ${3:-0}))
     mkdir -p "$OUT" "$ROOT/bin"
     go build -o "$BIN" "$ROOT/cmd/kvnode"
+    go build -o "$ROOT/bin/kvctl" "$ROOT/cmd/kvctl"
     rm -f "$OUT"/node*.log "$OUT"/node*.pid
     rm -rf "$OUT"/data*
-    echo "$n" >"$OUT/members"
-    for i in $(seq 1 "$n"); do launch "$i" "$n"; done
-    echo "started $n Members; clients on 127.0.0.1:8001..$((8000 + n))"
+    echo "$total" >"$OUT/nodes"
+    echo "$n" >"$OUT/founders"
+    for i in $(seq 1 "$total"); do launch "$i" "$total" "$n"; done
+    echo "started $n Members${3:+ and $3 Spares}; clients on 127.0.0.1:8001..$((8000 + total))"
     ;;
   status)
-    for i in $(seq 1 "$(members)"); do
+    for i in $(seq 1 "$(nodes)"); do
       printf 'node %s: ' "$i"
       curl -s -m 1 "http://127.0.0.1:$((8000 + i))/v1/status" || printf 'down'
       echo
@@ -74,8 +89,15 @@ case "${1:-}" in
     ;;
   restart)
     id="${2:?usage: local.sh restart <id>}"
-    launch "$id" "$(members)"
+    launch "$id" "$(nodes)" "$(founders)"
     echo "restarted node $id"
+    ;;
+  add | remove)
+    id="${2:?usage: local.sh $1 <id>}"
+    "$ROOT/bin/kvctl" -nodes "$(urls)" "$1" "$id"
+    ;;
+  members)
+    "$ROOT/bin/kvctl" -nodes "$(urls)" status
     ;;
   corrupt)
     id="${2:?usage: local.sh corrupt <id>}"
@@ -92,11 +114,11 @@ case "${1:-}" in
       kill "$(cat "$f")" 2>/dev/null || true
       rm -f "$f"
     done
-    rm -f "$OUT/members"
+    rm -f "$OUT/nodes" "$OUT/founders"
     echo "stopped"
     ;;
   *)
-    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

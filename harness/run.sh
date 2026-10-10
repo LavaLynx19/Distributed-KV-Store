@@ -15,6 +15,8 @@
 #   restart-all      kill -9 every Member at once, then start them all again
 #   corrupt-follower kill -9 a follower, flip a bit in its Log, start it again
 #   corrupt-leader   the same to the Leader (both local only)
+#   replace-follower kill -9 a follower for good, add a Spare in its place and
+#                    remove the dead Member (local only; A§6.5)
 #
 # Environment:
 #   CLIENTS=8  DURATION=10s  FAULT_AT=3  FAULT_FOR=3   (seconds for the last two)
@@ -44,7 +46,7 @@ case "$BACKEND" in
 esac
 case "$FAULT" in
   none | pause-leader | kill-leader | restart-all) ;;
-  corrupt-follower | corrupt-leader) [[ $BACKEND == local ]] || { echo "$FAULT needs the local backend" >&2; exit 2; } ;;
+  corrupt-follower | corrupt-leader | replace-follower) [[ $BACKEND == local ]] || { echo "$FAULT needs the local backend" >&2; exit 2; } ;;
   isolate-leader) [[ $BACKEND == docker ]] || { echo "isolate-leader needs the docker backend" >&2; exit 2; } ;;
   *) echo "unknown fault $FAULT" >&2; exit 2 ;;
 esac
@@ -58,8 +60,14 @@ fi
 
 mkdir -p "$OUT" "$ROOT/bin"
 go build -o "$ROOT/bin/kvbench" "$ROOT/cmd/kvbench"
+# A replacement needs a Spare running beside the Group from the start.
+TOTAL="$N"
+if [[ $FAULT == replace-follower ]]; then
+  TOTAL=$((N + 1))
+  start=(start "$N" 1)
+fi
 nodes=()
-for i in $(seq 1 "$N"); do nodes+=("http://127.0.0.1:$((8000 + i))"); done
+for i in $(seq 1 "$TOTAL"); do nodes+=("http://127.0.0.1:$((8000 + i))"); done
 
 # leader prints the id of the Member that says it leads, or nothing.
 leader() {
@@ -92,13 +100,15 @@ log="$OUT/run-$BACKEND-$N-$FAULT${TAG:+-$TAG}.txt"
     pid=$!
     sleep "$FAULT_AT"
     target="$(leader)"
-    [[ $FAULT == corrupt-follower ]] && target=$((target % N + 1))
+    [[ $FAULT == corrupt-follower || $FAULT == replace-follower ]] && target=$((target % N + 1))
     case "$FAULT" in
       pause-leader)   "$ctl" pause "$target";   sleep "$FAULT_FOR"; "$ctl" resume "$target" ;;
       isolate-leader) "$ctl" isolate "$target"; sleep "$FAULT_FOR"; "$ctl" heal ;;
       kill-leader)    "$ctl" kill "$target";    sleep "$FAULT_FOR"; "$ctl" restart "$target" ;;
       corrupt-follower | corrupt-leader)
         "$ctl" kill "$target"; "$ctl" corrupt "$target"; sleep "$FAULT_FOR"; "$ctl" restart "$target" ;;
+      replace-follower)
+        "$ctl" kill "$target"; "$ctl" add "$TOTAL"; "$ctl" remove "$target" ;;
       restart-all)
         for i in $(seq 1 "$N"); do "$ctl" kill "$i"; done
         sleep "$FAULT_FOR"

@@ -76,7 +76,10 @@ func (n *Node) startRound(out *core.Output) {
 // confirmedRound is the highest round a Majority, counting the Leader, has
 // echoed.
 func (n *Node) confirmedRound() uint64 {
-	acked := []uint64{n.readRound}
+	var acked []uint64
+	if n.isMember(n.id) {
+		acked = append(acked, n.readRound)
+	}
 	for _, m := range n.members {
 		if m != n.id {
 			acked = append(acked, n.roundAcked[m])
@@ -91,6 +94,9 @@ func (n *Node) confirmedRound() uint64 {
 		}
 		return 0
 	})
+	if len(acked) < n.majority() {
+		return 0
+	}
 	return acked[n.majority()-1]
 }
 
