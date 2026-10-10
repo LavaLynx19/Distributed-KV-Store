@@ -9,10 +9,9 @@ import (
 	"distributed-kv-store/internal/sim"
 )
 
-type simReply = sim.Reply
-
-// agent is one Node's periodic work. It learns the table, and for each Group
-// whose Leader is on this Node it moves any Move along one step.
+// agent is one Node's periodic work. It learns the table, keeps time moving,
+// and for each data Group whose Leader is on this Node lets the mover take
+// any Move one step on.
 func (c *Cluster) agent(nd *node) {
 	c.S.After(agentEvery, func() { c.agent(nd) })
 	if !c.NodeUp(nd.id) {
@@ -30,115 +29,38 @@ func (c *Cluster) agent(nd *node) {
 			if now := c.S.Now(); now-nd.lastTick >= tickEvery {
 				nd.lastTick = now
 				tick := meta.Command{Op: meta.OpTick, Stamp: c.S.Clock(r)}.Encode()
-				c.S.Propose(r, tick, func(simReply) {})
+				c.S.Propose(r, tick, func(sim.Reply) {})
 			}
 			continue
 		}
-		m := c.S.Machine(r).(*shardfsm.Machine)
-		if m.Due(nd.table.StoreTime) {
+		if c.machine(r).Due(nd.table.StoreTime) {
 			// Nobody is writing to this Group: say what time it is, so
 			// that what is due expires (A§6.7).
 			tick := fsm.Command{Op: fsm.OpTick, Stamp: nd.table.StoreTime}.Encode()
-			c.S.Propose(r, tick, func(simReply) {})
+			c.S.Propose(r, tick, func(sim.Reply) {})
 		}
-		for slot, info := range m.Slots() {
-			c.moveAlong(nd, g, r, st.Term, m, shard.Slot(slot), info)
-		}
+		nd.mover.Step(env{c, nd}, g, st.Term, nd.table)
 	}
 }
 
-// moveAlong proposes the next step for one Slot of a Group this Node leads,
-// if there is one. It decides from the Group's own state and the table, and
-// every step it proposes is safe to propose again.
-func (c *Cluster) moveAlong(nd *node, g shard.GroupID, r core.NodeID, term core.Term, m *shardfsm.Machine, slot shard.Slot, info shardfsm.SlotInfo) {
-	key := moveKey{g, slot}
-	if c.S.Now() < nd.waiting[key] {
-		return
-	}
-	row := nd.table.Slots[slot]
-	wait := func() { nd.waiting[key] = c.S.Now() + patience }
-	clear := func() { delete(nd.waiting, key) }
-	local := func(step shardfsm.Step) {
-		wait()
-		c.S.Propose(r, step.Encode(), func(simReply) { clear() })
-	}
-	// toGroup proposes a step to another Group. It calls then if the step
-	// took, and refused if the Group answered that it couldn't take it.
-	toGroup := func(to shard.GroupID, step shardfsm.Step, then, refused func()) {
-		wait()
-		payload := step.Encode()
-		c.ask(nd.id, to, false, func(int64) []byte { return payload }, func(o Outcome, raw []byte) {
-			clear()
-			resp, err := fsm.DecodeResponse(raw)
-			switch {
-			case o != Answered || err != nil:
-			case resp.Status == fsm.StatusOK:
-				then()
-			case refused != nil:
-				refused()
-			}
-		})
-	}
+// env is what a Node's mover sees of the simulated store.
+type env struct {
+	c  *Cluster
+	nd *node
+}
 
-	if c.cfg.FlipAtOnce {
-		// The naive store: the table is the authority. A Group that finds
-		// it serves a Slot the table gives to another sends the Slot over
-		// as it stands, and lets go once the other has it.
-		if info.Serves() && row.Group != g {
-			toGroup(row.Group, shardfsm.AcceptStep(slot, row.Epoch, g, m.Unfrozen(slot)), func() {
-				c.S.Propose(r, shardfsm.FreezeStep(slot, info.Epoch).Encode(), func(simReply) {
-					c.S.Propose(r, shardfsm.DropStep(slot, info.Epoch).Encode(), func(simReply) {})
-				})
-			}, nil)
-		}
-		return
-	}
+func (e env) Now() int64 { return e.c.S.Now() }
 
-	switch info.Status {
-	case shardfsm.Owned:
-		if row.Group == g && row.Epoch == info.Epoch && row.MovingTo != 0 {
-			local(shardfsm.BeginStep(slot, info.Epoch, row.MovingTo))
-		}
+func (e env) WithMachine(g shard.GroupID, fn func(*shardfsm.Machine)) {
+	fn(e.c.machine(Replica(e.nd.id, g)))
+}
 
-	case shardfsm.Outgoing:
-		cp := nd.copying[key]
-		if !cp.covers(term, info.Epoch) {
-			cp = copyState{term: term, epoch: info.Epoch} // start from the beginning
-		}
-		if cp.done {
-			local(shardfsm.FreezeStep(slot, info.Epoch))
-			return
-		}
-		chunk, done := m.Chunk(slot, cp.after, chunkKeys)
-		if len(chunk) > 0 {
-			cp.after = chunk[len(chunk)-1].Key
-		}
-		cp.done = done
-		toGroup(info.Peer, shardfsm.IncomingStep(slot, info.Epoch+1, g, shardfsm.Transfer{Upserts: chunk}), func() {
-			nd.copying[key] = cp
-		}, nil)
+func (e env) Local(g shard.GroupID, payload []byte, done func()) {
+	e.c.S.Propose(Replica(e.nd.id, g), payload, func(sim.Reply) { done() })
+}
 
-	case shardfsm.Frozen:
-		if row.Group == info.Peer && row.Epoch > info.Epoch {
-			// The table says the other Group has it: let go.
-			local(shardfsm.DropStep(slot, info.Epoch))
-			return
-		}
-		// Send the rest. If this Leader made the copy it knows the target
-		// has everything but what changed since. If not, it sends it all.
-		cp := nd.copying[key]
-		final, ok := m.Final(slot, !cp.covers(term, info.Epoch) || !cp.done)
-		if !ok {
-			return
-		}
-		toGroup(info.Peer, shardfsm.AcceptStep(slot, info.Epoch+1, g, final), func() {
-			done := meta.Command{Op: meta.OpDone, Slot: slot, Epoch: info.Epoch + 1}.Encode()
-			wait()
-			c.ask(nd.id, shard.Meta, false, func(int64) []byte { return done }, func(Outcome, []byte) { clear() })
-		}, func() {
-			// The target doesn't hold the copy this agent thought it did.
-			// Next time, send everything.
-			delete(nd.copying, key)
-		})
-	}
+func (e env) Ask(g shard.GroupID, payload []byte, back func(bool, []byte)) {
+	e.c.ask(e.nd.id, g, false, func(int64) []byte { return payload }, func(o Outcome, raw []byte) {
+		back(o == Answered, raw)
+	})
 }

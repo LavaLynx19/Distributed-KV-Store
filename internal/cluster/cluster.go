@@ -22,6 +22,7 @@ import (
 	"distributed-kv-store/internal/core"
 	"distributed-kv-store/internal/fsm"
 	"distributed-kv-store/internal/meta"
+	"distributed-kv-store/internal/mover"
 	"distributed-kv-store/internal/shard"
 	"distributed-kv-store/internal/shardfsm"
 	"distributed-kv-store/internal/sim"
@@ -68,11 +69,18 @@ const (
 )
 
 // Replica is the id of Node n's replica of Group g.
-func Replica(n int, g shard.GroupID) core.NodeID { return core.NodeID(n*100 + int(g)) }
+func Replica(n int, g shard.GroupID) core.NodeID { return core.NodeID(shard.ReplicaID(n, g)) }
 
 // NodeOf and GroupOf take a replica's id apart.
-func NodeOf(r core.NodeID) int            { return int(r) / 100 }
-func GroupOf(r core.NodeID) shard.GroupID { return shard.GroupID(int(r) % 100) }
+func NodeOf(r core.NodeID) int {
+	n, _ := shard.SplitReplicaID(uint64(r))
+	return n
+}
+
+func GroupOf(r core.NodeID) shard.GroupID {
+	_, g := shard.SplitReplicaID(uint64(r))
+	return g
+}
 
 // node is one machine's shell state. None of it is durable, and none of it
 // is trusted by any Group.
@@ -83,30 +91,9 @@ type node struct {
 	table shard.Table
 	// leader is where this Node last heard each Group's Leader was.
 	leader map[shard.GroupID]core.NodeID
-	// copying is the agent's place in each copy it is making, and waiting
-	// is when it may next act on a Slot it has asked something about.
-	copying  map[moveKey]copyState
-	waiting  map[moveKey]int64
+	// mover carries out the Moves of the Groups this Node leads.
+	mover    *mover.Agent
 	lastTick int64
-}
-
-type moveKey struct {
-	group shard.GroupID
-	slot  shard.Slot
-}
-
-// copyState is how far a Leader's agent has got with copying a Slot out. It
-// is only good for the Move it was made for, by the Leader that made it: a
-// new Leader starts again, and so does the next Move of the same Slot.
-type copyState struct {
-	term  core.Term
-	epoch uint32
-	after string
-	done  bool
-}
-
-func (cp copyState) covers(term core.Term, epoch uint32) bool {
-	return cp.term == term && cp.epoch == epoch
 }
 
 // Cluster is one simulated store.
@@ -129,10 +116,9 @@ type Cluster struct {
 // Members are the replicas of Group g.
 func (c *Cluster) Members(g shard.GroupID) []core.NodeID {
 	var ms []core.NodeID
-	for i := range c.cfg.Replicas {
-		ms = append(ms, Replica(1+(int(g)+i)%c.cfg.Nodes, g))
+	for _, n := range shard.Hosts(g, c.cfg.Nodes, c.cfg.Replicas) {
+		ms = append(ms, Replica(n, g))
 	}
-	slices.Sort(ms)
 	return ms
 }
 
@@ -160,7 +146,8 @@ func New(cfg Config) *Cluster {
 	start := meta.New(cfg.Slots, cfg.Groups).Table()
 	var ids []core.NodeID
 	for n := 1; n <= cfg.Nodes; n++ {
-		c.nodes[n] = &node{id: n, table: start.Clone(), leader: map[shard.GroupID]core.NodeID{}, copying: map[moveKey]copyState{}, waiting: map[moveKey]int64{}}
+		c.nodes[n] = &node{id: n, table: start.Clone(), leader: map[shard.GroupID]core.NodeID{},
+			mover: &mover.Agent{Patience: patience, ChunkKeys: chunkKeys, FlipAtOnce: cfg.FlipAtOnce}}
 	}
 	for _, g := range c.Groups() {
 		for _, r := range c.Members(g) {
@@ -233,8 +220,7 @@ func (c *Cluster) CrashNode(n int) {
 	for _, r := range c.replicasOf(n) {
 		c.S.Crash(r)
 	}
-	nd := c.nodes[n]
-	nd.copying, nd.waiting = map[moveKey]copyState{}, map[moveKey]int64{}
+	c.nodes[n].mover.Reset()
 }
 
 func (c *Cluster) RestartNode(n int) {

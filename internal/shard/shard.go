@@ -126,3 +126,33 @@ func Version(epoch uint32, index uint64) uint64 { return uint64(epoch)<<epochShi
 func SplitVersion(v uint64) (epoch uint32, index uint64) {
 	return uint32(v >> epochShift), v & (1<<epochShift - 1)
 }
+
+// A store's Groups are placed on its Nodes by one rule, so that every Node
+// can work out where everything is from four numbers (A§11.9). Nodes are
+// numbered from 1. Group g has its replicas on consecutive Nodes starting
+// after Node g, so Groups overlap and a Node's failure hits some of them
+// and not others.
+
+// Hosts lists the Nodes that hold a replica of Group g, ascending, in a
+// store of nodes Nodes with replicas Members per Group.
+func Hosts(g GroupID, nodes, replicas int) []int {
+	hosts := make([]int, 0, replicas)
+	for i := range replicas {
+		hosts = append(hosts, 1+(int(g)+i)%nodes)
+	}
+	// Three or five numbers: insertion sort.
+	for i := 1; i < len(hosts); i++ {
+		for j := i; j > 0 && hosts[j] < hosts[j-1]; j-- {
+			hosts[j], hosts[j-1] = hosts[j-1], hosts[j]
+		}
+	}
+	return hosts
+}
+
+// ReplicaID is the id Node n's replica of Group g goes by among the Members
+// of its Group. It names both, so one network can carry every Group's
+// messages. A store has fewer than 100 Groups.
+func ReplicaID(n int, g GroupID) uint64 { return uint64(n*100 + int(g)) }
+
+// SplitReplicaID is the inverse of ReplicaID.
+func SplitReplicaID(id uint64) (n int, g GroupID) { return int(id) / 100, GroupID(id % 100) }
