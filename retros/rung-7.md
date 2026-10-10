@@ -1,6 +1,6 @@
 # Rung 7 retro: several Groups
 
-Status: **stages 7a and 7b done; 7b waiting for approval; 7c not started**. Rung 7 is built in three stages (A§11.1). This file has a part per stage: 7a first, 7b after it.
+Status: **all three stages done; 7c waiting for approval**. Rung 7 is built in three stages (A§11.1). This file has a part per stage, in order, and the verdict for the whole Rung at the end.
 
 Stage 7a in one paragraph: several Groups share the keys by Slot, a Meta Group holds the table, and a Slot can be moved between Groups while clients carry on. 2,400 simulated runs with 10,224 Moves have no run with two owners and none that isn't Linearizable, and 13 real runs are clean. A moved Slot refuses its clients for about 80 ms. **Three Groups on one machine are slower than one Group, at 0.52× with the disk on**, which misses the 0.9× target; the reason is below.
 
@@ -216,7 +216,7 @@ DATA_GROUPS=3 harness/local.sh start 5 && harness/local.sh table && harness/loca
 
 # Stage 7b: gossip
 
-Status: **done, waiting for approval**. Nodes now learn the Slot table, and of each other, by gossip, and no Node asks the Meta Group for the table on a timer. Gossip decides nothing. Two stores where it does decide are shown failing. 2,400 simulated runs with gossip only informing are clean, and so are 6 real ones. Two ways of noticing a dead Node were built and measured; neither ever took a running Node for dead.
+Status: **done and approved**. Nodes now learn the Slot table, and of each other, by gossip, and no Node asks the Meta Group for the table on a timer. Gossip decides nothing. Two stores where it does decide are shown failing. 2,400 simulated runs with gossip only informing are clean, and so are 6 real ones. Two ways of noticing a dead Node were built and measured; neither ever took a running Node for dead.
 
 Environment: the 7a Simulation with gossip between the Nodes. A gossip round is one tick. Each round a Node tells two others everything it knows: every Node's address and how it seems, and the whole Slot table. Nodes that host a Meta Group replica put that replica's table into their gossip, which is the only way it gets there.
 
@@ -357,3 +357,200 @@ DATA_GROUPS=3 harness/local.sh start 5 && harness/local.sh join 6 && harness/loc
 3. **Suspicion and verdict are different measurements.** My first comparison counted any bad opinion as a false alarm and made SWIM look hopeless. What 7c will act on is the verdict, and both detectors' count of wrong ones is zero.
 4. **A tight threshold fails in good weather.** Counters at 5 rounds suspected healthy Nodes with nothing wrong at all. The cause was the time gossip itself takes, which a threshold has to clear before it measures anything.
 5. **A hint that sticks is worse than no hint.** Preferring Nodes thought alive, I first always picked the first of them, and a Node that wasn't the Leader got every retry. Picking at random among them fixed it.
+
+# Stage 7c: the store looks after itself
+
+Status: **done, waiting for approval**. A Node that dies is replaced by a Spare in every Group it was in, the Meta Group included, with nobody asking. A Node that was replaced and comes back drops its replicas and is a Spare again. Slots are moved off a Group that carries far more than its share. Three naive stores are shown failing first. 3,200 simulated runs with all of it on are clean, and so are 7 real ones. **Evening out load makes this machine slower**, for the reason 7a found: one disk.
+
+Environment: the 7b Simulation with two Spares, counters detector unless said. Two things changed in the Simulation itself:
+- **A Node that restarts now forgets its table** and holds the one the store was founded with until gossip tells it more. A real Node always did. The Simulation had kept the table across a crash, and that kept the naive store looking correct.
+- **A scenario can lose a Node for good.**
+
+## Exposed: a Node keeps the replicas its table names it for (P7c.2)
+The naive rule is the obvious one: start a replica of every Group the table says you are in, drop the data of every Group it says you aren't. A Node that took a lost Node's place isn't in the founding table. So when it restarts it drops data its Group is counting on, and when gossip catches up a moment later it starts again, empty, as a Member in good standing.
+
+30 seeds per scenario, naive store:
+
+| Scenario | Runs with a replica dropped while still a Member |
+|---|---|
+| A Node lost for good, nothing else | 0 |
+| A Node lost, the others crashing and returning | 8 |
+| Slots moving, Nodes crashing and returning | 7 |
+| A Node lost, then Nodes restarted in overlapping turns | 12 |
+
+A wrong drop usually costs nothing visible: the Leader sends the empty Member everything again. It costs an Acknowledged write when one other Member is behind and the third is away at that moment, because the empty Member and the one behind then elect a Leader that never saw what was Committed. I searched 4,000 seeds of the last scenario for that:
+- **Seed 3480: the History isn't Linearizable.**
+- **Seed 1585: a core trips its own check**, asked for an Entry it no longer has.
+
+## Exposed, part two: one Meta Member's word, no wait
+The Meta Leader replaces a Node the moment its own gossip gives the Node up. In "Slots moving, Nodes crashing and returning" every Node is back within 350 units, and gossip gives a Node up after 250.
+
+| | Nodes replaced in 30 runs | Replicas dropped |
+|---|---|---|
+| Naive | 73 | 184 |
+| A Majority and a wait | 0 | 0 |
+
+Each replacement is a full copy of every Group the Node was in, for a Node that was only restarting.
+
+## Exposed, part three: rebalancing with no damping (P7c.5)
+The Meta Leader moves the busiest Slot off the busiest Group whenever that Group is over the line, going by the last count it heard. The table is under "Load" below: about 90 Moves a run where a handful would do, a third of the clients' requests lost to frozen Slots, and the load no more even at the end.
+
+### Reproduce
+```
+go test -run 'TestReplicasThatFollowTheTable|TestOneWordReplacement|TestNaiveRebalancing' ./internal/rungtest/
+```
+
+## Fix: replacing a dead Node (P7c.1, P7c.3)
+- **The Slot table holds each Group's Member list.** The Meta Group records the change it wants, the Group's Leader makes it in its own Log, one Member at a time, and reports. The table only follows: the Group's Log decides.
+- **A Node is replaced when a Majority of the Meta Group's Members have each thought it dead for longer than a wait.** They say so by gossip. The decision is an Entry in the Meta Group's Log.
+- **A Node drops a replica only on the Group's say-so.** The table prompts it to ask. The Group's Leader confirms it still leads, then shows its Committed list. The Node keeps its Term and vote.
+
+Same scenarios, 30 seeds each:
+
+| Scenario | Naive: runs failing | Fixed: runs failing | Fixed: Nodes replaced |
+|---|---|---|---|
+| A Node lost for good | 0 | 0 | 30 |
+| A Node lost, others crashing | 9 | 0 | 30 |
+| Nodes away for 600–800 units, then back | 0 | 0 | 47 |
+| Partitions of 600 units | 0 | 0 | 94 |
+| Slots moving, Nodes crashing | 7 | 0 | 0 |
+| A Node lost, then rolling restarts | 12 | 0 | 30 |
+
+`TestRung7cReplacing`: 2,400 runs over all twelve scenarios of 7a, 7b and 7c, with counters, with SWIM and with the busy workload. None unsafe, none with a wrong drop. 2,423 Nodes replaced, 3,973 replicas dropped. In the 200 runs where every crashed Node is back within 350 units, 2 Nodes were replaced: a Node that crashes again just after restarting looks away for both spells.
+
+### A Partition does what it should, and one thing I didn't expect
+Two Nodes cut off for a long time are replaced by the other side. Their side replaces nobody: it has no Majority of the Meta Group. That is `TestTheMinoritySideIsReplacedAndReturnsAsSpares`.
+
+What I didn't expect: **a Group whose Majority is on the cut-off side can't be changed until the network heals**, because only its Leader can change its Members and its Leader is over there. A change still wanted for it at that point is carried out even though the Node to be removed is back.
+
+### Bugs found on the way
+1. **Members disagreed on which Entry set their Member list.** After a Snapshot a Member knew its list "as of the Snapshot", so the index differed from Member to Member, and a Leader waiting for the table to catch up with its list waited for ever. A Snapshot now carries the index. Found by seed 28 of the long Partitions.
+2. **A Spare that died while being added blocked its Group for 2,000 units.** The Meta Group had already named another Spare, and the Leader was still waiting on the first. A Leader can now call an addition off (A§6.5). Found by one run in 3,600.
+3. **My first explanation of bug 2 was wrong.** I thought a joining replica was standing for election on an old table, fixed that, and the run failed exactly as before. The fix stays, because a replica with an empty Log that takes itself for a Member is the naive store's failure. I then traced the run and found the real cause.
+4. **On real processes a Spare had no address for the founders** and never answered them, **dropping a replica failed** because the Log is a directory there, and **a Leader held up by its disk reported no load**, so its Group looked idle and was given another Slot. The server test found the first two, a real run the third.
+
+### One design statement that was wrong
+At the design step I offered "never cancel a Move; replacement gives the Group its Majority back", and it was chosen. **Replacement can't do that.** A Group that has lost its Majority can't change its own Members, so nothing can be added to it. The Move waits until enough Members return or an operator runs Unsafe recovery. A Group that has only lost one Member carries on with the Move while the Member is replaced. `TestAMoveWaitsOutALostMajority` shows both. This needs confirming, since the choice was made on my wrong description.
+
+## Load, and moving Slots by it (P7c.4–P7c.6)
+**What a read costs.** One Group, 64 clients, 10 s, on real processes:
+
+| Requests | Answered a second |
+|---|---|
+| Writes only | 1,371 |
+| Reads only | 90,712 |
+
+A read costs a sixty-sixth of a write. Load counts a write as 64 and a read as 1.
+
+**What rebalancing does.** Twenty clients, no Faults, 30 seeds each. "One busy Group" sends four requests in five to the keys of the Slots Group 1 starts with. "One busy Slot" sends them to a single key. "Shifting" changes the busy Group every 1,200 units.
+
+| Load | Rebalancing | Moves per run | Units frozen | Requests answered | Busiest Group, × the mean |
+|---|---|---|---|---|---|
+| Even | Off | 0 | 0 | 1,657 | 1.51 |
+| Even | Naive | 87.4 | 2,220 | 1,061 | 2.14 |
+| Even | Damped | 1.1 | 25 | 1,677 | 1.09 |
+| One busy Group | Off | 0 | 0 | 1,370 | 2.71 |
+| One busy Group | Naive | 91.0 | 2,400 | 898 | 2.41 |
+| One busy Group | Damped | 2.2 | 45 | 1,572 | 1.13 |
+| One busy Slot | Off | 0 | 0 | 1,370 | 2.71 |
+| One busy Slot | Naive | 75.6 | 2,121 | 753 | 2.61 |
+| One busy Slot | Damped | 2.0 | 42 | 1,405 | 2.52 |
+| Shifting | Off | 0 | 0 | 1,402 | 2.04 |
+| Shifting | Naive | 91.5 | 2,410 | 909 | 2.22 |
+| Shifting | Damped | 6.0 | 124 | 1,432 | 1.52 |
+
+- **Even load isn't even.** Twenty-four keys hash unevenly over eight Slots, so one Group starts at 1.5× the mean. One Move fixes it, and after that nothing moves.
+- **One busy Slot can't be helped**, and the damped store stops after two Moves of the other Slots. The naive one passes the busy Slot from Group to Group for the whole run.
+- **Shifting load is followed, a step behind.** The busy Group changes every 1,200 units and a Move is followed by 500 units with no other.
+
+**The lines.** 1.3 and 1.1 were where the design started.
+
+| Lines | Even: Moves | One busy Group: Moves | One busy Group: busiest × mean |
+|---|---|---|---|
+| 1.3 and 1.1 | 1.8 | 3.4 | 1.11 |
+| 1.5 and 1.2 | 1.1 | 2.2 | 1.13 |
+
+As even, with a third fewer Moves. The store uses 1.5 and 1.2.
+
+**With five clients the figures are noise.** A Group then sees about four requests in each window. The damped store made about 3 Moves a run under even load and went on making them. The balancing tests use twenty clients for that reason.
+
+**Which Slot to move changed after a real run.** The first rule was the biggest Slot no more than half the gap between the two Groups. A real run left two busy Slots together in one Group at 1.6× the mean, when moving one would have levelled all three. The rule is now the Slot nearest half the gap, and none over three quarters of it.
+
+## Real runs (P7c.8)
+M4 Pro, local processes, 10 s, 64 clients retrying in Sessions, five Nodes hosting three data Groups and the Meta Group.
+
+| Run | Requests/s | Lost | Longest pause in any write | What the store did | Verdicts |
+|---|---|---|---|---|---|
+| Busy Group, automation off, 8 Slots | 885 | 0 | — | Nothing | Linearizable; one owner per Slot |
+| Busy Group, automation on, 8 Slots | 729 | 0 | — | Two Moves. Group 1 went from 89% of the load to 33%, with 38% and 30% for the others | Same |
+| Node 2 killed for good, a Spare running | 746 | 0 | 37 ms | Node 2 judged dead 5 s after the kill (`-dead-wait 2s`); Node 6 took its place in the Meta Group and Group 1 | Same, with Node 6 as a Member |
+| A Slot moved every half second | 715 | 0 | 43 ms | No Slot moved by itself | Same |
+| Node 1 killed for 3 s and restarted | 720 | 0 | 39 ms | Node 1 not replaced | Same |
+| Both at once | 683 | 0 | 60 ms | Nothing by itself | Same |
+
+- **Evening out the load lowered throughput, 885 to 729.** With the load on one Group, one Log carries nearly every write and each flush of the disk covers many of them. Spread over three Groups, three Logs queue for the same disk. It is 7a's finding again: several Groups pay off where Nodes have disks of their own.
+- **Automation costs nothing when it has nothing to do.** 715 and 720 here against 697 to 704 in 7a and 7b.
+- **A moved Slot was frozen for 76 to 380 ms** in these runs, against a median of 52 ms in 7b. These have 64 clients where those had 8, and the freeze spans three Entries that each wait their turn at the disk.
+- The automation-on run was made twice. The first showed the vanishing-load bug above. The table is the second.
+
+The same on Nodes in one process (`TestADeadNodeIsReplacedAndReturnsAsASpare`): a stopped Node is replaced in both its Groups, the Spare holds all 16 keys itself, and the Node, started again, drops both replicas and starts neither after another restart.
+
+**Not covered:**
+- **No plain run with no Fault at 64 clients** was repeated, so "automation costs nothing" rests on the Fault runs.
+- **A returning Node on separate processes** was not run. The in-process test covers it.
+- **No real run of the naive stores.** They exist in the Simulation only.
+- **With automation off a Node reports no load**, so the first row has no load shares.
+- Nothing ran in Docker, as in 7a and 7b.
+- `kvbench` still sends no scans or Transactions.
+
+### Reproduce
+```
+go test -run 'TestRung7c' ./internal/rungtest/
+go test ./internal/automation/ ./internal/cluster/ ./internal/server/
+KV_MEASURE=1 go test -run 'TestMeasure' -v ./internal/rungtest/
+RETRY=1 DATA_GROUPS=3 CLIENTS=64 harness/run.sh local 5 kill-for-good
+RETRY=1 DATA_GROUPS=3 SLOTS=8 CLIENTS=64 harness/run.sh local 5 skewed-load      # AUTO=0 to compare
+```
+
+## Things decided while building stage 7c
+- **One wait before replacing, for every size of Group**, where the design step chose a faster path for a Group one failure from stopping. With three Members that is every Group, always. Left to me at the design step.
+- **A Node that says it is leaving is replaced like a dead one**, after the wait.
+- **The decisions live in one pure package**, `internal/automation`, that the Simulation and the real Node both call. The Simulation tests the code the real Node runs.
+- **A Leader can call off an addition** (A§6.5). New behaviour in the Rung 6 core.
+- **A Snapshot carries the index of the Entry that set its Member list.** The file format changed; data directories from before don't open.
+- **`kvnode -auto` is on by default.** `-dead-wait` defaults to 5 s.
+- **Real load windows are half a second**, with 2.5 s after a Move and 5 s of rest for a moved Slot.
+- **The two measurement tests run only with `KV_MEASURE=1`.** The suite was within 20 s of Go's ten-minute limit with them.
+- **Plan changes:** real-shell work planned under P7c.1 and P7c.4 was done in P7c.7, and P7c.5 and P7c.6 went in as one commit.
+
+## Verdict for stage 7c
+| Check | Result |
+|---|---|
+| Exposed | **Pass**: table-following replicas (`TestReplicasThatFollowTheTableAreExposed`, seeds 4, 1585, 3480), one word and no wait (`TestOneWordReplacementIsExposed`), no damping (`TestNaiveRebalancingIsExposed`) |
+| Those seeds can't be reproduced after | **Pass** |
+| A Node lost for good is replaced everywhere, the Meta Group included, with no hand on it | **Pass**: every such run of the suite; one real run |
+| A minority side replaces nobody | **Pass** |
+| A returned Node never drops data its Group counts on | **Pass**: no wrong drop in 3,200 runs, 3,973 drops in the replacing suite alone |
+| One busy Group is relieved | **Pass**: 2.71× the mean to 1.13× in 2.2 Moves; 89% to 33% on real processes |
+| Load that is even, or can't be evened, is left alone | **Pass**: 0.1 Moves a run or fewer in the last 1,500 units |
+| Everything on at once | **Pass**: 600 runs |
+| A Move stuck on a lost Majority finishes after replacement | **Not as designed**: it finishes when Members return. See above |
+
+## Verdict for Rung 7
+The four checks of the README:
+
+| Check | Result |
+|---|---|
+| Exposed | **Pass**: seven naive stores across the three stages, each with seeds kept as tests |
+| Guarantee: each key owned by exactly one Group at any moment; single-key operations Linearizable while keys move | **Pass**: 8,000 simulated runs over the three stages and 26 real ones, none with two owners, none not Linearizable |
+| Numbers: at least 0.9× Rung 6 | **One Group: pass (0.97×). Three Groups on one machine: miss (0.52×)**, and evening out load on one machine costs a further 18% |
+| Retro | This file |
+
+## Lessons from stage 7c
+1. **The Simulation was kinder than a real Node.** It kept a Node's table across a crash. The naive store passed every scenario until the Simulation forgot what a real Node forgets.
+2. **Following the table is gossip deciding, by another door.** Stage 7b's rule was that gossip informs. A Node acting on the table it happens to hold breaks that rule just as surely as one taking Members from gossip did.
+3. **A fix that changes nothing wasn't the fix.** The run failed identically after my first repair, down to the totals. Identical totals across 3,600 runs said the code path I had changed was never on the failing path.
+4. **An identifier must mean the same on every Member.** "The index of my Member list" quietly meant "of my Snapshot" on some. Nothing was unsafe; one Group just never finished.
+5. **Check a claim against the mechanism before offering it as a choice.** "Replacement heals a Group without a Majority" sounded right and can't happen. The user chose on it.
+6. **A measurement can vanish as well as be wrong.** A Leader too busy to answer "do you lead?" in 100 ms reported nothing, and the busiest Group looked idle.
+7. **Balance is a cost here.** The store moved load exactly as designed and the machine got slower. Whether a decision helps depends on what the bottleneck is, and this one has one disk.

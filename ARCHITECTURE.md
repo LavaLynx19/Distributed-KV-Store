@@ -507,6 +507,8 @@ Details confirmed with the user at P7c.0.
   - The Node whose replica answers a request counts it. Load is folded every half second; a Move is followed by 2.5 s with no other, and a moved Slot rests 5 s: the Simulation's waits in the same proportion to the window.
   - The decisions themselves are `internal/automation`, a pure package the Simulation and the real shell both call.
 
+- **Measured** (`retros/rung-7.md`): 3,200 simulated runs with replacement and rebalancing on, none unsafe and none with a replica dropped while its Group counted on it. One busy Group goes from 2.7 times the mean load to 1.13 in about two Moves; without damping the store makes about ninety Moves a run and answers a third fewer requests. On real processes a killed Node was judged dead after 5 s and replaced with no request lost. Evening out load there lowered throughput from 885 to 729 requests a second, because every Group's Log shares one disk (§11.9).
+
 ### 11.12 Verification
 - **Linearizability** is checked per key over the whole store, as before: a History doesn't care which Group answered.
 - **One owner.** The Simulation samples every Group's own view and fails the run if two Groups would serve the same Slot at the same instant.
@@ -517,6 +519,8 @@ Details confirmed with the user at P7c.0.
 - The Meta Group is one more thing to run, and moves, new Sessions and expiry all wait on it.
 - A merged scan is weaker than a scan in Rungs 5–6.
 - Automatic replacement and load balancing can cause churn. They can't break the one-owner rule, because they only ever ask for changes that go through Raft.
+- A Group that has lost its Majority is beyond automation: it can't change its own Members. A Move it is part of waits, and blocks rebalancing, until Members return or an operator runs Unsafe recovery.
+- On one machine, moving load onto more Groups makes the store slower, not faster.
 
 ## Decision Log
 
