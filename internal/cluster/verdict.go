@@ -19,7 +19,7 @@ import (
 func (c *Cluster) Leader(g shard.GroupID) core.NodeID {
 	var best core.NodeID
 	var bestTerm core.Term
-	for _, r := range c.Members(g) {
+	for _, r := range c.Replicas(g) {
 		if st := c.S.Status(r); c.S.Up(r) && st.Role == core.LeaderRole && (best == 0 || st.Term > bestTerm) {
 			best, bestTerm = r, st.Term
 		}
@@ -98,8 +98,12 @@ func (c *Cluster) EndState() []string {
 	for _, g := range c.Groups()[1:] {
 		items := map[core.NodeID][]fsm.Item{}
 		var first *shardfsm.Machine
-		for _, r := range c.Members(g) {
-			if !c.S.Up(r) {
+		members := c.Members(g)
+		if members == nil {
+			members = c.Replicas(g)
+		}
+		for _, r := range members {
+			if !c.S.Has(r) || !c.S.Up(r) {
 				continue
 			}
 			m := c.machine(r)

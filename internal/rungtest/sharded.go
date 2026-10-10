@@ -106,7 +106,7 @@ func watchOwners(c *cluster.Cluster, rep *Report, until int64) {
 		if rep.TwoLeaders == "" {
 			for _, g := range c.Groups() {
 				byTerm := map[core.Term][]core.NodeID{}
-				for _, r := range c.Members(g) {
+				for _, r := range c.Replicas(g) {
 					if st := c.S.Status(r); c.S.Up(r) && st.Role == core.LeaderRole {
 						byTerm[st.Term] = append(byTerm[st.Term], r)
 					}

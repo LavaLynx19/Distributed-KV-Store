@@ -70,7 +70,7 @@ func (c *Cluster) gossipRound(nd *node) {
 		// this Node's gossip thinks are alive.
 		for _, g := range nd.groups {
 			var alive []core.NodeID
-			for _, r := range c.Members(g) {
+			for _, r := range c.Founders(g) {
 				if NodeOf(r) == nd.id || nd.gossip.Alive(NodeOf(r)) {
 					alive = append(alive, r)
 				}

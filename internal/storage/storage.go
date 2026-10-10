@@ -294,6 +294,35 @@ func ForceMembers(fs FS, dir string, members []core.NodeID, opts Options) (Recov
 	return rec, s.Close()
 }
 
+// DropData empties a Member's directory of its Log and Snapshot and keeps
+// its Term and vote. It is for a Node that is no longer a Member of the
+// Group (A§11.11). The Term and vote stay because the Node may one day be
+// added to the same Group again under the same id, and must not then vote a
+// second time in a Term it voted in before. The Member must not be running.
+func DropData(fs FS, dir string, opts Options) error {
+	// Opening first makes sure the Term and vote can be read back.
+	s, _, err := OpenWith(fs, dir, opts)
+	if err != nil {
+		return err
+	}
+	if err := s.Close(); err != nil {
+		return err
+	}
+	names, err := fs.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		if strings.HasPrefix(name, "state") {
+			continue
+		}
+		if err := fs.Remove(filepath.Join(dir, name)); err != nil {
+			return err
+		}
+	}
+	return fs.SyncDir(dir)
+}
+
 // damageMark is the file whose presence says the directory was found
 // damaged and the Member hasn't recovered yet.
 const damageMark = "damaged"

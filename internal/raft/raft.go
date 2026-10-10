@@ -293,7 +293,8 @@ func (n *Node) appendEntry(out *core.Output, e core.Entry) {
 }
 
 func (n *Node) Status() core.Status {
-	return core.Status{ID: n.id, Role: n.role, Term: n.term, Leader: n.leader, Commit: n.commit, Recovering: n.abstaining(), Members: slices.Clone(n.members)}
+	return core.Status{ID: n.id, Role: n.role, Term: n.term, Leader: n.leader, Commit: n.commit, Recovering: n.abstaining(), Members: slices.Clone(n.members),
+		MembersAt: n.lists[len(n.lists)-1].index, Changing: n.changing()}
 }
 
 // abstaining reports whether the Member must stay out of elections.

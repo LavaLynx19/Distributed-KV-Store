@@ -127,9 +127,10 @@ type node struct {
 	mover    *mover.Agent
 	lastTick int64
 	// up is whether the machine is running, and side which side of a
-	// Partition it is on. A Spare has no replica to ask.
-	up   bool
-	side int
+	// Partition it is on. A Spare has no replica to ask. gone is set when
+	// the machine is lost for good.
+	up, gone bool
+	side     int
 	// gossip is this Node's gossip, if the store uses it.
 	gossip *gossip.Node
 }
@@ -159,15 +160,51 @@ type Cluster struct {
 	// two Groups served the same Slot by that measure (verdict.go).
 	owned     map[shard.GroupID]ownership
 	twoOwners string
+
+	// sets is the Partition in force, by machine, or nil.
+	sets [][]int
 }
 
-// Members are the replicas of Group g.
-func (c *Cluster) Members(g shard.GroupID) []core.NodeID {
-	var ms []core.NodeID
-	for _, n := range shard.Hosts(g, c.cfg.Nodes, c.cfg.Replicas) {
-		ms = append(ms, Replica(n, g))
+// Founders are the replicas Group g starts with (A§11.9).
+func (c *Cluster) Founders(g shard.GroupID) []core.NodeID {
+	return replicasOn(g, shard.Hosts(g, c.cfg.Nodes, c.cfg.Replicas))
+}
+
+func replicasOn(g shard.GroupID, nodes []int) []core.NodeID {
+	var rs []core.NodeID
+	for _, n := range nodes {
+		rs = append(rs, Replica(n, g))
 	}
-	return ms
+	return rs
+}
+
+// Replicas lists every replica of Group g there is, on whichever Nodes,
+// whether or not the Group counts it as a Member.
+func (c *Cluster) Replicas(g shard.GroupID) []core.NodeID {
+	var rs []core.NodeID
+	for _, n := range c.NodeIDs() {
+		if c.hosts(n, g) {
+			rs = append(rs, Replica(n, g))
+		}
+	}
+	return rs
+}
+
+// Members are the replicas Group g's Leader has as its Members, or nil if
+// it has no Leader.
+func (c *Cluster) Members(g shard.GroupID) []core.NodeID {
+	if l := c.Leader(g); l != 0 {
+		return c.S.Status(l).Members
+	}
+	return nil
+}
+
+// startMembers is the Member list a replica's core is started with: the one
+// in the table its Node holds. What the replica has in its own Log, once it
+// has anything, overrides it.
+func (c *Cluster) startMembers(id core.NodeID) []core.NodeID {
+	g := GroupOf(id)
+	return replicasOn(g, c.nodes[NodeOf(id)].table.Hosts(g))
 }
 
 // Groups lists every Group, the Meta Group first.
@@ -191,7 +228,7 @@ func (c *Cluster) NodeIDs() []int {
 // New builds the store and starts every Node's agent.
 func New(cfg Config) *Cluster {
 	c := &Cluster{cfg: cfg, nodes: map[int]*node{}, owned: map[shard.GroupID]ownership{}, versionAt: map[uint64]int64{}}
-	start := meta.New(cfg.Slots, cfg.Groups).Table()
+	start := meta.NewPlaced(cfg.Slots, cfg.Groups, cfg.Nodes, cfg.Replicas).Table()
 	var ids []core.NodeID
 	for n := 1; n <= cfg.Nodes+cfg.Spares; n++ {
 		c.nodes[n] = &node{id: n, up: true, table: start.Clone(), leader: map[shard.GroupID]core.NodeID{},
@@ -201,7 +238,7 @@ func New(cfg Config) *Cluster {
 				OnHandover:            func(_ shard.GroupID, _ shard.Slot, frozenFor int64) { c.Pauses = append(c.Pauses, frozenFor) }}}
 	}
 	for _, g := range c.Groups() {
-		for _, r := range c.Members(g) {
+		for _, r := range c.Founders(g) {
 			ids = append(ids, r)
 			c.nodes[NodeOf(r)].groups = append(c.nodes[NodeOf(r)].groups, g)
 		}
@@ -211,10 +248,10 @@ func New(cfg Config) *Cluster {
 		Seed: cfg.Seed,
 		IDs:  ids,
 		NewNode: func(id core.NodeID, _ []core.NodeID, rng core.Rand) core.Node {
-			return cfg.NewCore(id, c.Members(GroupOf(id)), rng, core.Stored{})
+			return cfg.NewCore(id, c.startMembers(id), rng, core.Stored{})
 		},
 		Restart: func(id core.NodeID, _ []core.NodeID, rng core.Rand, stored core.Stored) core.Node {
-			return cfg.NewCore(id, c.Members(GroupOf(id)), rng, stored)
+			return cfg.NewCore(id, c.startMembers(id), rng, stored)
 		},
 		NewMachineFor: c.newMachine,
 		OnApply:       c.applied,
@@ -233,10 +270,11 @@ func New(cfg Config) *Cluster {
 func (c *Cluster) newMachine(id core.NodeID) sim.Machine {
 	g := GroupOf(id)
 	if g == shard.Meta {
+		m := meta.NewPlaced(c.cfg.Slots, c.cfg.Groups, c.cfg.Nodes, c.cfg.Replicas)
 		if c.cfg.FlipAtOnce {
-			return meta.NewFlipping(c.cfg.Slots, c.cfg.Groups)
+			return m.Flipping()
 		}
-		return meta.New(c.cfg.Slots, c.cfg.Groups)
+		return m
 	}
 	var owned []shard.Slot
 	for s, o := range meta.New(c.cfg.Slots, c.cfg.Groups).Table().Slots {
@@ -277,6 +315,9 @@ func (c *Cluster) CrashNode(n int) {
 }
 
 func (c *Cluster) RestartNode(n int) {
+	if c.nodes[n].gone {
+		return
+	}
 	for _, r := range c.replicasOf(n) {
 		c.S.Restart(r)
 	}
@@ -286,8 +327,26 @@ func (c *Cluster) RestartNode(n int) {
 	}
 }
 
+// DestroyNode stops Node n for good, as if the machine had been lost.
+func (c *Cluster) DestroyNode(n int) {
+	c.CrashNode(n)
+	c.nodes[n].gone = true
+}
+
+// host starts a replica of Group g on Node nd, which had none: empty, and a
+// Member of nothing until the Group's Leader adds it (A§11.11).
+func (c *Cluster) host(nd *node, g shard.GroupID) {
+	nd.groups = append(nd.groups, g)
+	slices.Sort(nd.groups)
+	c.S.Add(Replica(nd.id, g))
+	if c.sets != nil {
+		c.PartitionNodes(c.sets...) // the new replica is on its Node's side
+	}
+}
+
 // Heal ends every Partition.
 func (c *Cluster) Heal() {
+	c.sets = nil
 	c.S.Heal()
 	for _, nd := range c.nodes {
 		nd.side = 0
@@ -296,6 +355,7 @@ func (c *Cluster) Heal() {
 
 // PartitionNodes cuts the network between the given sets of machines.
 func (c *Cluster) PartitionNodes(sets ...[]int) {
+	c.sets = sets
 	replicas := make([][]core.NodeID, len(sets))
 	for _, nd := range c.nodes {
 		nd.side = 0
@@ -353,7 +413,7 @@ func (c *Cluster) askOnce(n int, g shard.GroupID, read bool, payload func(storeT
 	nd := c.nodes[n]
 	target, known := nd.leader[g]
 	if !known {
-		members := c.Members(g)
+		members := replicasOn(g, nd.table.Hosts(g))
 		if nd.gossip != nil {
 			// With gossip, a Node thought dead isn't worth a guess, unless
 			// they all are.
@@ -591,6 +651,16 @@ func (c *Cluster) Move(n int, slot shard.Slot, to shard.GroupID, done func(ok bo
 			c.MovesTaken++
 		}
 		done(ok)
+	})
+}
+
+// Replace asks the Meta Group, through Node n, to have Node in take Node
+// out's place in every Group out is a Member of (A§11.11).
+func (c *Cluster) Replace(n, out, in int, done func(ok bool)) {
+	cmd := func(int64) []byte { return meta.Command{Op: meta.OpReplace, Out: out, In: in}.Encode() }
+	c.ask(n, shard.Meta, false, cmd, func(o Outcome, raw []byte) {
+		resp, err := meta.DecodeResponse(raw)
+		done(o == Answered && err == nil && resp.Status == meta.StatusOK)
 	})
 }
 

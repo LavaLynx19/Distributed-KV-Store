@@ -201,23 +201,53 @@ func New(cfg Config) *Sim {
 	}
 	s.ids = append(s.ids, cfg.IDs...)
 	for _, id := range s.ids {
-		m := &member{
-			id:      id,
-			core:    cfg.NewNode(id, s.Founders(), rand.New(rand.NewPCG(cfg.Seed, uint64(id)))),
-			machine: s.newMachine(id),
-			up:      true,
-			pending: map[uint64]func(Reply){},
-			queries: map[uint64][]byte{},
-			fs:      storage.NewMemFS(),
-
-			clockRate: 100,
-		}
-		m.store, _, _ = s.openDisk(m.fs) // an empty MemFS can't fail to open
-		s.members[id] = m
-		// Members tick out of phase with each other.
-		s.schedule(s.rng.Int64N(cfg.TickEvery), func() { s.tick(m) })
+		s.start(id)
 	}
 	return s
+}
+
+// start gives the Sim a new Member with an empty disk, and schedules its
+// first tick.
+func (s *Sim) start(id core.NodeID) {
+	m := &member{
+		id:      id,
+		core:    s.cfg.NewNode(id, s.Founders(), rand.New(rand.NewPCG(s.cfg.Seed, uint64(id)))),
+		machine: s.newMachine(id),
+		up:      true,
+		pending: map[uint64]func(Reply){},
+		queries: map[uint64][]byte{},
+		fs:      storage.NewMemFS(),
+
+		clockRate: 100,
+	}
+	m.store, _, _ = s.openDisk(m.fs) // an empty MemFS can't fail to open
+	s.members[id] = m
+	// Members tick out of phase with each other.
+	s.schedule(s.rng.Int64N(s.cfg.TickEvery), func() { s.tick(m) })
+}
+
+// Add starts a Node the Sim didn't begin with, or one whose data was
+// dropped, as a machine does when it is told to host a replica (A§11.11).
+// It is in no Group until a Membership change adds it.
+func (s *Sim) Add(id core.NodeID) {
+	s.mix('A', uint64(id), 0)
+	if _, exists := s.members[id]; exists {
+		s.Restart(id)
+		return
+	}
+	s.ids = append(s.ids, id)
+	s.start(id)
+}
+
+// Has reports whether the Sim has ever had a Node with this id.
+func (s *Sim) Has(id core.NodeID) bool { return s.members[id] != nil }
+
+// DropData stops a Node and removes its Log and Snapshot from its disk,
+// keeping its Term and vote (storage.DropData). It stays down until Add.
+func (s *Sim) DropData(id core.NodeID) {
+	s.Crash(id)
+	s.mix('W', uint64(id), 0)
+	must(storage.DropData(s.members[id].fs, dataDir, storage.Options{Unchecked: s.cfg.UncheckedDisk}))
 }
 
 func (s *Sim) newMachine(id core.NodeID) Machine {

@@ -384,3 +384,35 @@ func TestSharedSyncFS(t *testing.T) {
 		}
 	}
 }
+
+// A Node that stops being a Member drops the Group's data and keeps its
+// Term and vote.
+func TestDropDataKeepsTermAndVote(t *testing.T) {
+	fs := NewMemFS()
+	s, _, err := OpenWith(fs, "d", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hard := core.HardState{Term: 7, VotedFor: 3}
+	p := &core.Persist{HardState: &hard, Entries: []core.Entry{{Index: 1, Term: 7, Kind: core.EntryCommand, Payload: []byte("x")}}}
+	if err := s.Save(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(&core.Persist{Snapshot: &core.Snapshot{Index: 1, Term: 7, Data: []byte("s")}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := DropData(fs, "d", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	fs.Crash(nil, false)
+	_, stored, err := OpenWith(fs, "d", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.HardState != hard || stored.Snapshot != nil || len(stored.Entries) != 0 || stored.Damaged {
+		t.Fatalf("after dropping: %+v", stored)
+	}
+}

@@ -2,6 +2,7 @@ package cluster_test
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 
 	"distributed-kv-store/internal/cluster"
@@ -85,7 +86,7 @@ func TestMoveASlot(t *testing.T) {
 		t.Fatal("the Meta Group didn't take the Move")
 	}
 	for _, n := range c.NodeIDs() {
-		if row := c.Table(n).Slots[0]; row != (shard.Owner{Group: 2, Epoch: 1}) {
+		if row := c.Table(n).Slots[0]; row.Group != 2 || row.Epoch != 1 || row.MovingTo != 0 || row.MovedAt == 0 {
 			t.Fatalf("node %d's table has Slot 0 as %+v, want Group 2 at Epoch 1", n, row)
 		}
 	}
@@ -166,6 +167,66 @@ func TestLeavingAndDyingLookDifferent(t *testing.T) {
 		c.S.Run(2000)
 		if diffs := c.GossipAgrees(); len(diffs) > 0 {
 			t.Fatalf("mode %d: after both returned: %v", mode, diffs)
+		}
+	}
+}
+
+// A Node lost for good is replaced by a Spare in every Group it was in,
+// the Meta Group included, once the Meta Group is asked (A§11.11). The
+// Spare starts a replica of each because the table says so, each Group's
+// Leader adds it and then removes the lost Node, and the table ends up
+// with what the Groups report.
+func TestASpareTakesALostNodesPlace(t *testing.T) {
+	for _, lost := range []int{2, 4} { // Node 2 is in the Meta Group; Node 4 is not
+		c := newGossipCluster(5, cluster.GossipCounters, 1)
+		c.S.Run(300)
+		for i := range 24 {
+			key := fmt.Sprintf("k%d", i)
+			do(t, c, 1, fsm.Command{Op: fsm.OpPut, Key: key, Value: []byte(key)})
+		}
+		var in []shard.GroupID
+		for g, row := range c.Table(1).Groups {
+			if slices.Contains(row.Members, lost) {
+				in = append(in, shard.GroupID(g))
+			}
+		}
+		if len(in) < 2 {
+			t.Fatalf("node %d is in Groups %v: the test wants it in several", lost, in)
+		}
+		c.DestroyNode(lost)
+		asked := false
+		for !asked && c.S.Now() < 3000 {
+			c.Replace(1, lost, 6, func(ok bool) { asked = asked || ok })
+			c.S.Run(c.S.Now() + 100)
+		}
+		if !asked {
+			t.Fatalf("the Meta Group didn't take the replacement of node %d", lost)
+		}
+		c.S.Run(c.S.Now() + 3000)
+		for g, row := range c.Table(1).Groups {
+			g := shard.GroupID(g)
+			var members []int
+			for _, r := range c.Members(g) {
+				members = append(members, cluster.NodeOf(r))
+			}
+			if !slices.Equal(members, row.Members) || row.Add != 0 || row.Remove != 0 {
+				t.Errorf("node %d lost: Group %d has Members %v, and the table says %+v", lost, g, members, row)
+			}
+			if slices.Contains(members, lost) || slices.Contains(members, 6) != slices.Contains(in, g) || len(members) != 3 {
+				t.Errorf("node %d lost: Group %d ended with Members %v", lost, g, members)
+			}
+		}
+		for i := range 24 {
+			key := fmt.Sprintf("k%d", i)
+			if r := do(t, c, 6, fsm.Command{Op: fsm.OpGet, Key: key}); string(r.Value) != key {
+				t.Fatalf("node %d lost: get %s: %+v", lost, key, r)
+			}
+		}
+		if diffs := c.EndState(); len(diffs) > 0 {
+			t.Fatalf("node %d lost: end state: %v", lost, diffs)
+		}
+		if diffs := c.GossipAgrees(); len(diffs) > 0 {
+			t.Fatalf("node %d lost: gossip: %v", lost, diffs)
 		}
 	}
 }

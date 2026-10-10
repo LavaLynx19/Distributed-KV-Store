@@ -310,7 +310,13 @@ type Status struct {
 	// staying out of elections (A§6.8).
 	Recovering bool
 	// Members is the Group's Member list as this Node has it, ascending.
-	Members []NodeID
+	// MembersAt is the index of the Entry that set it, or 0 for the list
+	// the Group was founded with. Changing is set while a Membership change
+	// is under way: the list isn't Committed yet, or a Learner is catching
+	// up.
+	Members   []NodeID
+	MembersAt Index
+	Changing  bool
 }
 
 // Node is a consensus core. Step must be called from one goroutine at a

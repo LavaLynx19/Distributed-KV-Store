@@ -102,8 +102,9 @@ func TestFlippingChangesTheOwnerAtOnce(t *testing.T) {
 }
 
 func TestCommandRoundTrip(t *testing.T) {
-	for _, c := range []Command{{Op: OpMove, Slot: 63, To: 4}, {Op: OpDone, Slot: 1, Epoch: 9}, {Op: OpTick, Stamp: -3}, {Op: OpOpenSession}} {
-		if got, err := DecodeCommand(c.Encode()); err != nil || got != c {
+	for _, c := range []Command{{Op: OpMove, Slot: 63, To: 4}, {Op: OpDone, Slot: 1, Epoch: 9}, {Op: OpTick, Stamp: -3}, {Op: OpOpenSession},
+		{Op: OpReplace, Out: 2, In: 6}, {Op: OpMembers, To: 1, At: 40, Members: []int{1, 3, 6}}} {
+		if got, err := DecodeCommand(c.Encode()); err != nil || !reflect.DeepEqual(got, c) {
 			t.Errorf("round trip of %+v gave %+v, %v", c, got, err)
 		}
 	}
@@ -111,5 +112,42 @@ func TestCommandRoundTrip(t *testing.T) {
 		if _, err := DecodeCommand(bad); err == nil {
 			t.Errorf("accepted %v", bad)
 		}
+	}
+}
+
+// A replacement is wanted in every Group the Node is in, and is over for a
+// Group once that Group reports a list with the new Node and without the old.
+func TestReplaceFollowsWhatGroupsReport(t *testing.T) {
+	m := NewPlaced(8, 2, 5, 3) // Meta on 1,2,3; Group 1 on 2,3,4; Group 2 on 3,4,5
+	rs := run(t, m, 1,
+		Command{Op: OpReplace, Out: 4, In: 3},                             // 3 isn't a Spare
+		Command{Op: OpReplace, Out: 4, In: 6},                             // Groups 1 and 2
+		Command{Op: OpReplace, Out: 4, In: 7},                             // both busy
+		Command{Op: OpMembers, To: 1, At: 10, Members: []int{2, 3, 4, 6}}, // half way
+		Command{Op: OpMembers, To: 1, At: 12, Members: []int{2, 3, 6}},
+		Command{Op: OpMembers, To: 1, At: 10, Members: []int{2, 3, 4, 6}}, // old news
+		Command{Op: OpReplace, Out: 6, In: 7},                             // 6 died before Group 2 took it
+	)
+	var got []Status
+	for _, r := range rs {
+		got = append(got, r.Status)
+	}
+	if want := []Status{StatusInvalid, StatusOK, StatusBusy, StatusOK, StatusOK, StatusOK, StatusOK}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("statuses %v, want %v", got, want)
+	}
+	table := m.Table()
+	if g := table.Groups[0]; !reflect.DeepEqual(g, shard.Group{Members: []int{1, 2, 3}}) {
+		t.Errorf("Meta Group: %+v", g)
+	}
+	if g := table.Groups[1]; !reflect.DeepEqual(g, shard.Group{Members: []int{2, 3, 6}, At: 12, Add: 7, Remove: 6}) {
+		t.Errorf("Group 1: %+v", g)
+	}
+	if g := table.Groups[2]; !reflect.DeepEqual(g, shard.Group{Members: []int{3, 4, 5}, Add: 7, Remove: 4}) {
+		t.Errorf("Group 2: %+v", g)
+	}
+	// The table survives a Snapshot.
+	again := New(8, 2)
+	if err := again.Restore(m.Capture()()); err != nil || !reflect.DeepEqual(again.Table(), table) {
+		t.Errorf("restored %+v, %v", again.Table(), err)
 	}
 }

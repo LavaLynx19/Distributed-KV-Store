@@ -38,6 +38,23 @@ type Owner struct {
 	// MovingTo is the Group the Slot is on its way to, or 0. While it is
 	// set, Group still owns the Slot.
 	MovingTo GroupID
+	// MovedAt is the Store time at which the Slot last changed owner, or 0
+	// if it never has (A§11.11).
+	MovedAt int64
+}
+
+// Group is one Group's row of the table: who its Members are, as the Group
+// last reported, and the change the Meta Group wants made to them, if any
+// (A§11.11). The Group's own Log is what decides who its Members are.
+type Group struct {
+	// Members are the Nodes that host the Group's Members, ascending.
+	Members []int
+	// At is the index, in the Group's own Log, of the Entry that set that
+	// Member list. A report with a lower one is old news.
+	At uint64
+	// Add and Remove are the change wanted: the Node Add is to become a
+	// Member, and then the Node Remove is to stop being one. Zero: none.
+	Add, Remove int
 }
 
 // Table is the Slot table, as the Meta Group holds it.
@@ -49,6 +66,17 @@ type Table struct {
 	Slots []Owner
 	// StoreTime is the time the whole store goes by (A§11.7).
 	StoreTime int64
+	// Groups has one row per Group, the Meta Group first. It is empty in a
+	// store whose Groups never change Members.
+	Groups []Group
+}
+
+// Hosts lists the Nodes the table gives as hosting Group g's Members.
+func (t Table) Hosts(g GroupID) []int {
+	if int(g) >= len(t.Groups) {
+		return nil
+	}
+	return t.Groups[g].Members
 }
 
 // OwnerOf is the Group the table says owns key's Slot.
@@ -57,11 +85,15 @@ func (t Table) OwnerOf(key string) GroupID { return t.Slots[SlotOf(key, len(t.Sl
 // Clone returns a copy that shares nothing with t.
 func (t Table) Clone() Table {
 	t.Slots = append([]Owner(nil), t.Slots...)
+	t.Groups = append([]Group(nil), t.Groups...)
+	for i := range t.Groups {
+		t.Groups[i].Members = append([]int(nil), t.Groups[i].Members...)
+	}
 	return t
 }
 
 // Encode lays the table out as Version, StoreTime, the number of Slots and
-// then each Owner, all as varints.
+// then each Owner, the number of Groups and then each Group, all as varints.
 func (t Table) Encode() []byte {
 	b := binary.AppendUvarint(nil, t.Version)
 	b = binary.AppendVarint(b, t.StoreTime)
@@ -70,6 +102,17 @@ func (t Table) Encode() []byte {
 		b = binary.AppendUvarint(b, uint64(o.Group))
 		b = binary.AppendUvarint(b, uint64(o.Epoch))
 		b = binary.AppendUvarint(b, uint64(o.MovingTo))
+		b = binary.AppendVarint(b, o.MovedAt)
+	}
+	b = binary.AppendUvarint(b, uint64(len(t.Groups)))
+	for _, g := range t.Groups {
+		b = binary.AppendUvarint(b, g.At)
+		b = binary.AppendUvarint(b, uint64(g.Add))
+		b = binary.AppendUvarint(b, uint64(g.Remove))
+		b = binary.AppendUvarint(b, uint64(len(g.Members)))
+		for _, n := range g.Members {
+			b = binary.AppendUvarint(b, uint64(n))
+		}
 	}
 	return b
 }
@@ -104,7 +147,28 @@ func DecodeTable(b []byte) (Table, error) {
 		if len(b) == 0 {
 			return Table{}, errMalformed
 		}
-		t.Slots = append(t.Slots, Owner{Group: GroupID(next()), Epoch: uint32(next()), MovingTo: GroupID(next())})
+		o := Owner{Group: GroupID(next()), Epoch: uint32(next()), MovingTo: GroupID(next())}
+		at, n := binary.Varint(b)
+		if n <= 0 {
+			return Table{}, errMalformed
+		}
+		o.MovedAt, b = at, b[n:]
+		t.Slots = append(t.Slots, o)
+	}
+	groups := next()
+	if groups > uint64(len(b)) {
+		return Table{}, errMalformed
+	}
+	for range groups {
+		g := Group{At: next(), Add: int(next()), Remove: int(next())}
+		members := next()
+		if members > uint64(len(b)) {
+			return Table{}, errMalformed
+		}
+		for range members {
+			g.Members = append(g.Members, int(next()))
+		}
+		t.Groups = append(t.Groups, g)
 	}
 	if b == nil || len(b) != 0 {
 		return Table{}, errMalformed

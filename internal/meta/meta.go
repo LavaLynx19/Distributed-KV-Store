@@ -6,6 +6,7 @@ package meta
 import (
 	"encoding/binary"
 	"errors"
+	"slices"
 
 	"distributed-kv-store/internal/core"
 	"distributed-kv-store/internal/shard"
@@ -27,6 +28,13 @@ const (
 	// OpTick moves Store time on to Stamp, the Meta Leader's clock reading
 	// (A§11.7).
 	OpTick
+	// OpReplace records the wish to replace Node Out with Node In in every
+	// Group Out is a Member of (A§11.11). Each Group's Leader makes the
+	// change in its own Log; nothing changes here until it reports.
+	OpReplace
+	// OpMembers is Group To reporting its Member list, set by the Entry at
+	// index At of its own Log.
+	OpMembers
 )
 
 // Command is one request to the Meta Group, carried in an Entry's payload.
@@ -36,6 +44,11 @@ type Command struct {
 	To    shard.GroupID
 	Epoch uint32
 	Stamp int64
+	// Out and In are the Nodes of an OpReplace. Members and At are the
+	// list of an OpMembers.
+	Out, In int
+	Members []int
+	At      uint64
 }
 
 // Status is the outcome of a Command.
@@ -70,6 +83,21 @@ type Machine struct {
 // New returns the table a store starts with: slots Slots dealt out in turn
 // to data Groups 1..groups, all at Epoch 0.
 func New(slots, groups int) *Machine {
+	return newMachine(slots, groups)
+}
+
+// NewPlaced is New for a store whose Groups may change Members (A§11.11):
+// the table also starts with each Group's Members, placed on nodes Nodes
+// with replicas Members each by the rule of A§11.9.
+func NewPlaced(slots, groups, nodes, replicas int) *Machine {
+	m := newMachine(slots, groups)
+	for g := 0; g <= groups; g++ {
+		m.table.Groups = append(m.table.Groups, shard.Group{Members: shard.Hosts(shard.GroupID(g), nodes, replicas)})
+	}
+	return m
+}
+
+func newMachine(slots, groups int) *Machine {
 	m := &Machine{groups: groups}
 	for i := range slots {
 		m.table.Slots = append(m.table.Slots, shard.Owner{Group: shard.GroupID(1 + i%groups)})
@@ -80,7 +108,14 @@ func New(slots, groups int) *Machine {
 // NewFlipping is New for the naive store: OpMove changes a Slot's owner at
 // once. It exists so that Rung 7's exposure of that stays reproducible.
 func NewFlipping(slots, groups int) *Machine {
-	m := New(slots, groups)
+	m := newMachine(slots, groups)
+	m.flipAtOnce = true
+	return m
+}
+
+// Flipping turns m into the naive store's table (NewFlipping) and returns
+// it.
+func (m *Machine) Flipping() *Machine {
 	m.flipAtOnce = true
 	return m
 }
@@ -110,6 +145,10 @@ func (m *Machine) Apply(e core.Entry) []byte {
 		if cmd.Stamp > m.table.StoreTime {
 			m.table.StoreTime = cmd.Stamp
 		}
+	case OpReplace:
+		resp.Status = m.replace(cmd, uint64(e.Index))
+	case OpMembers:
+		resp.Status = m.members(cmd, uint64(e.Index))
 	}
 	resp.Version = m.table.Version
 	return resp.Encode()
@@ -149,6 +188,58 @@ func (m *Machine) done(cmd Command, index uint64) Status {
 		return StatusInvalid
 	}
 	o.Group, o.Epoch, o.MovingTo = o.MovingTo, cmd.Epoch, 0
+	o.MovedAt = m.table.StoreTime
+	m.table.Version = index
+	return StatusOK
+}
+
+// replace notes, for every Group that has Out as a Member, that In should
+// take its place. A Group already being changed is left alone, unless the
+// Node it was waiting for is the one now being replaced and hasn't been
+// added yet: then In is added in its stead.
+func (m *Machine) replace(cmd Command, index uint64) Status {
+	if cmd.Out <= 0 || cmd.In <= 0 || cmd.Out == cmd.In {
+		return StatusInvalid
+	}
+	for _, g := range m.table.Groups {
+		if slices.Contains(g.Members, cmd.In) || g.Add == cmd.In {
+			return StatusInvalid // In isn't a Spare
+		}
+	}
+	changed := false
+	for i := range m.table.Groups {
+		g := &m.table.Groups[i]
+		switch {
+		case g.Add == 0 && g.Remove == 0 && slices.Contains(g.Members, cmd.Out):
+			g.Add, g.Remove, changed = cmd.In, cmd.Out, true
+		case g.Add == cmd.Out && !slices.Contains(g.Members, cmd.Out):
+			g.Add, changed = cmd.In, true
+		}
+	}
+	if !changed {
+		return StatusBusy
+	}
+	m.table.Version = index
+	return StatusOK
+}
+
+// members takes a Group's report of its own Member list. The Group's Log
+// decides who its Members are; the table only follows. A change that was
+// wanted is over once the list has the Node to add and not the one to
+// remove.
+func (m *Machine) members(cmd Command, index uint64) Status {
+	if int(cmd.To) >= len(m.table.Groups) || len(cmd.Members) == 0 {
+		return StatusInvalid
+	}
+	g := &m.table.Groups[cmd.To]
+	if cmd.At <= g.At {
+		return StatusOK // old news
+	}
+	g.Members, g.At = slices.Clone(cmd.Members), cmd.At
+	slices.Sort(g.Members)
+	if g.Add != 0 && slices.Contains(g.Members, g.Add) && !slices.Contains(g.Members, g.Remove) {
+		g.Add, g.Remove = 0, 0
+	}
 	m.table.Version = index
 	return StatusOK
 }
@@ -172,37 +263,58 @@ func (m *Machine) Restore(data []byte) error {
 	return nil
 }
 
-// Encode lays a Command out as its op, then Slot, To, Epoch and Stamp as
-// varints.
+// Encode lays a Command out as its op, then Slot, To, Epoch, Stamp, Out, In,
+// At, and the number of Members and each one, as varints.
 func (c Command) Encode() []byte {
 	b := []byte{byte(c.Op)}
 	b = binary.AppendUvarint(b, uint64(c.Slot))
 	b = binary.AppendUvarint(b, uint64(c.To))
 	b = binary.AppendUvarint(b, uint64(c.Epoch))
-	return binary.AppendVarint(b, c.Stamp)
+	b = binary.AppendVarint(b, c.Stamp)
+	b = binary.AppendUvarint(b, uint64(c.Out))
+	b = binary.AppendUvarint(b, uint64(c.In))
+	b = binary.AppendUvarint(b, c.At)
+	b = binary.AppendUvarint(b, uint64(len(c.Members)))
+	for _, n := range c.Members {
+		b = binary.AppendUvarint(b, uint64(n))
+	}
+	return b
 }
 
 var errMalformed = errors.New("meta: malformed payload")
 
 func DecodeCommand(b []byte) (Command, error) {
-	if len(b) < 1 || Op(b[0]) < OpMove || Op(b[0]) > OpTick {
+	if len(b) < 1 || Op(b[0]) < OpMove || Op(b[0]) > OpMembers {
 		return Command{}, errMalformed
 	}
 	c := Command{Op: Op(b[0])}
 	b = b[1:]
-	var fields [3]uint64
-	for i := range fields {
+	next := func() uint64 {
 		v, n := binary.Uvarint(b)
 		if n <= 0 {
-			return Command{}, errMalformed
+			b = nil
+			return 0
 		}
-		fields[i], b = v, b[n:]
+		b = b[n:]
+		return v
 	}
+	c.Slot, c.To, c.Epoch = shard.Slot(next()), shard.GroupID(next()), uint32(next())
 	stamp, n := binary.Varint(b)
-	if n <= 0 || n != len(b) {
+	if n <= 0 {
 		return Command{}, errMalformed
 	}
-	c.Slot, c.To, c.Epoch, c.Stamp = shard.Slot(fields[0]), shard.GroupID(fields[1]), uint32(fields[2]), stamp
+	c.Stamp, b = stamp, b[n:]
+	c.Out, c.In, c.At = int(next()), int(next()), next()
+	count := next()
+	if count > uint64(len(b)) {
+		return Command{}, errMalformed
+	}
+	for range count {
+		c.Members = append(c.Members, int(next()))
+	}
+	if b == nil || len(b) != 0 {
+		return Command{}, errMalformed
+	}
 	return c, nil
 }
 
