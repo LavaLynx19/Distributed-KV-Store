@@ -301,7 +301,15 @@ type tableAnswer struct {
 		Group    uint64 `json:"group"`
 		Epoch    uint64 `json:"epoch"`
 		MovingTo uint64 `json:"moving_to"`
+		Load     uint64 `json:"load"`
 	} `json:"slots"`
+	Groups []struct {
+		Group   uint64 `json:"group"`
+		Members []int  `json:"members"`
+		Add     int    `json:"add"`
+		Remove  int    `json:"remove"`
+		Load    uint64 `json:"load"`
+	} `json:"groups"`
 }
 
 // fetchTable asks the Nodes in turn for the Slot table until one answers.
@@ -335,8 +343,25 @@ func table(httpc *http.Client, urls []string) error {
 			fmt.Printf("  Slot %d is moving from Group %d to Group %d\n", row.Slot, row.Group, row.MovingTo)
 		}
 	}
-	for g := uint64(1); len(byGroup[g]) > 0 || g <= uint64(len(byGroup)); g++ {
-		fmt.Printf("  Group %d owns %d Slots: %v\n", g, len(byGroup[g]), byGroup[g])
+	// Load is as the Node asked has heard it by gossip, smoothed (A§11.11).
+	var total uint64
+	for _, g := range t.Groups {
+		total += g.Load
+	}
+	for _, g := range t.Groups {
+		line := fmt.Sprintf("  Group %d on Nodes %v", g.Group, g.Members)
+		if g.Group == 0 {
+			line = fmt.Sprintf("  Meta Group on Nodes %v", g.Members)
+		} else {
+			line += fmt.Sprintf(" owns %d Slots: %v", len(byGroup[g.Group]), byGroup[g.Group])
+			if total > 0 {
+				line += fmt.Sprintf("; %d%% of the load", (g.Load*100+total/2)/total)
+			}
+		}
+		if g.Add != 0 {
+			line += fmt.Sprintf("; Node %d is taking Node %d's place", g.Add, g.Remove)
+		}
+		fmt.Println(line)
 	}
 	return nil
 }

@@ -29,13 +29,14 @@ const (
 	autoEvery = 10
 	// loadWindow is how often a Node folds what it has counted into its
 	// smoothed load, and loadWeight the share of the newest window in it.
-	loadWindow = time.Second
+	loadWindow = 500 * time.Millisecond
 	loadWeight = 0.25
 )
 
 // balancing is how a real store evens out load: the lines the Simulation
-// settled on, and waits in milliseconds of Store time.
-var balancing = automation.Balancing{High: 1.5, Low: 1.2, Rest: 10_000, Settle: 5_000, Idle: 2 * shard.WriteCost}
+// settled on, and its waits in the same proportion to the window, in
+// milliseconds of Store time.
+var balancing = automation.Balancing{High: 1.5, Low: 1.2, Rest: 5_000, Settle: 2_500, Idle: 2 * shard.WriteCost}
 
 // leads reports which Groups this Node's replicas lead.
 func (s *Store) leads(ctx context.Context) map[shard.GroupID]bool {

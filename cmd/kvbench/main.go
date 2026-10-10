@@ -33,23 +33,28 @@ import (
 	"distributed-kv-store/internal/core"
 	"distributed-kv-store/internal/fsm"
 	"distributed-kv-store/internal/server"
+	"distributed-kv-store/internal/shard"
 )
 
 type config struct {
-	nodes    []string
-	clients  int
-	keys     int
-	groups   int
-	duration time.Duration
-	timeout  time.Duration
-	mark     time.Duration
-	settle   time.Duration
-	checkFor time.Duration
-	seed     uint64
-	retry    bool
-	readPct  int
-	ttlPct   int
-	ttl      time.Duration
+	nodes   []string
+	clients int
+	keys    int
+	groups  int
+	// hotPct of requests go to hot, the keys of the Slots hotGroup starts
+	// with, in a store of slots Slots.
+	hotPct, hotGroup, slots int
+	hot                     []string
+	duration                time.Duration
+	timeout                 time.Duration
+	mark                    time.Duration
+	settle                  time.Duration
+	checkFor                time.Duration
+	seed                    uint64
+	retry                   bool
+	readPct                 int
+	ttlPct                  int
+	ttl                     time.Duration
 }
 
 func main() {
@@ -64,6 +69,9 @@ func main() {
 	flag.DurationVar(&cfg.settle, "settle", 15*time.Second, "how long to wait after the load for Members to converge")
 	flag.DurationVar(&cfg.checkFor, "check", time.Minute, "time limit for the linearizability check (0 skips it)")
 	flag.Uint64Var(&cfg.seed, "seed", 1, "seed for the clients' choices")
+	flag.IntVar(&cfg.hotPct, "hot-pct", 0, "with -groups: percentage of requests that go to the keys of the Slots -hot-group starts with, to load one Group more than the rest (A§11.11)")
+	flag.IntVar(&cfg.hotGroup, "hot-group", 1, "with -hot-pct: the Group whose first Slots are the busy ones")
+	flag.IntVar(&cfg.slots, "slots", shard.DefaultSlots, "with -hot-pct: how many Slots the store has")
 	flag.IntVar(&cfg.readPct, "read-pct", 35, "percentage of requests that are gets; the rest keep the default write mix")
 	flag.IntVar(&cfg.ttlPct, "ttl-pct", 0, "percentage of puts that carry a time-to-live (A§6.7)")
 	flag.DurationVar(&cfg.ttl, "ttl", 200*time.Millisecond, "the longest time-to-live given; each is between a quarter of this and all of it")
@@ -76,6 +84,14 @@ func main() {
 	}
 	if len(cfg.nodes) == 0 {
 		log.Fatal("kvbench: -nodes is required")
+	}
+	if cfg.hotPct > 0 && cfg.groups > 0 {
+		// Slot s starts in Group s mod groups + 1 (meta.New).
+		for i := range cfg.keys {
+			if key := fmt.Sprintf("k%d", i); int(shard.SlotOf(key, cfg.slots))%cfg.groups+1 == cfg.hotGroup {
+				cfg.hot = append(cfg.hot, key)
+			}
+		}
 	}
 	if !run(cfg) {
 		os.Exit(1)
@@ -308,6 +324,9 @@ func (c *client) request() {
 // the same 30:25:10 proportion.
 func (c *client) pick() fsm.Command {
 	key := fmt.Sprintf("k%d", c.rng.IntN(c.cfg.keys))
+	if c.cfg.hotPct > 0 && len(c.cfg.hot) > 0 && c.rng.IntN(100) < c.cfg.hotPct {
+		key = c.cfg.hot[c.rng.IntN(len(c.cfg.hot))]
+	}
 	c.count++
 	value := []byte(fmt.Sprintf("c%d-%d", c.id, c.count))
 	if c.rng.IntN(100) < c.cfg.readPct {
@@ -457,12 +476,54 @@ func members(httpc *http.Client, nodes []string) []core.NodeID {
 // Members of each Group must hold the same data, and each Slot must be
 // served by exactly the Group the table names.
 func compareGroups(httpc *http.Client, nodes []string) (diffs []string, unreachable int) {
+	var table struct {
+		Slots []struct {
+			Slot     int    `json:"slot"`
+			Group    uint32 `json:"group"`
+			MovingTo uint32 `json:"moving_to"`
+		} `json:"slots"`
+		Groups []struct {
+			Group   uint32 `json:"group"`
+			Members []int  `json:"members"`
+			Add     int    `json:"add"`
+			Remove  int    `json:"remove"`
+		} `json:"groups"`
+	}
+	for _, n := range nodes {
+		resp, err := httpc.Get(n + "/v1/table")
+		if err != nil {
+			continue
+		}
+		err = json.NewDecoder(resp.Body).Decode(&table)
+		resp.Body.Close()
+		if err == nil && len(table.Slots) > 0 {
+			break
+		}
+	}
+	if len(table.Slots) == 0 {
+		return append(diffs, "no Node gave the Slot table"), unreachable
+	}
+	// Who is a Member of what is the table's to say. A Node that is in no
+	// Group, a Spare or one that was replaced, needn't even be running.
+	member := map[uint32]map[int]bool{}
+	inSome := map[int]bool{}
+	for _, g := range table.Groups {
+		member[g.Group] = map[int]bool{}
+		for _, n := range g.Members {
+			member[g.Group][n], inSome[n] = true, true
+		}
+		if g.Add != 0 {
+			diffs = append(diffs, fmt.Sprintf("Group %d: still replacing node %d with node %d", g.Group, g.Remove, g.Add))
+		}
+	}
 	items := map[uint32]map[core.NodeID][]fsm.Item{}
 	serves := map[int]map[uint32]bool{}
 	for i, n := range nodes {
 		resp, err := httpc.Get(n + "/v1/debug/items")
 		if err != nil {
-			unreachable++
+			if inSome[i+1] {
+				unreachable++
+			}
 			continue
 		}
 		var dump []server.GroupItems
@@ -473,6 +534,9 @@ func compareGroups(httpc *http.Client, nodes []string) (diffs []string, unreacha
 			continue
 		}
 		for _, g := range dump {
+			if !member[uint32(g.Group)][i+1] {
+				continue // a replica its Group no longer counts
+			}
 			list := make([]fsm.Item, len(g.Items))
 			for j, it := range g.Items {
 				list[j] = fsm.Item{Key: it.Key, Value: []byte(it.Value), Version: it.Version}
@@ -494,26 +558,10 @@ func compareGroups(httpc *http.Client, nodes []string) (diffs []string, unreacha
 			diffs = append(diffs, fmt.Sprintf("Group %d: %s", g, d))
 		}
 	}
-	var table struct {
-		Slots []struct {
-			Slot     int    `json:"slot"`
-			Group    uint32 `json:"group"`
-			MovingTo uint32 `json:"moving_to"`
-		} `json:"slots"`
-	}
-	for _, n := range nodes {
-		resp, err := httpc.Get(n + "/v1/table")
-		if err != nil {
-			continue
+	for g, nodes := range member {
+		if g != 0 && len(items[g]) != len(nodes) {
+			diffs = append(diffs, fmt.Sprintf("Group %d: %d of its %d Members gave their data", g, len(items[g]), len(nodes)))
 		}
-		err = json.NewDecoder(resp.Body).Decode(&table)
-		resp.Body.Close()
-		if err == nil && len(table.Slots) > 0 {
-			break
-		}
-	}
-	if len(table.Slots) == 0 {
-		return append(diffs, "no Node gave the Slot table"), unreachable
 	}
 	for _, row := range table.Slots {
 		if got := serves[row.Slot]; len(got) != 1 || !got[row.Group] || row.MovingTo != 0 {
