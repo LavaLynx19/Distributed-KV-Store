@@ -83,7 +83,7 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P7a.8 Versions as Epoch and index (A§11.5) → §P7
 - [x] P7a.9 Store-wide Sessions: ids from the Meta Group, registering with a floor, moving with a Slot (A§11.6) → §P7
 - [x] P7a.10 Store time from the Meta Group (A§11.7) → §P7
-- [ ] P7a.11 Merged scans; `cross_group` for Transactions (A§11.8) → §P7
+- [x] P7a.11 Merged scans; `cross_group` for Transactions (A§11.8) → §P7
 - [ ] P7a.12 Real shell: `kvnode` hosting several Groups, `kvctl move-slot`, harness → §P7
 - [ ] P7a.13 Stage 7a suite, real runs with the pause of a Move measured, `retros/rung-7.md` → §P7
 - [>] P7b.0 Break stage 7b (gossip, A§11.10) into tasks → defer until: stage 7a is approved

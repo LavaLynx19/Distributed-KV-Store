@@ -402,6 +402,63 @@ func (c *Cluster) Request(n int, cmd fsm.Command, done func(Outcome, fsm.Respons
 	})
 }
 
+// Part is one Group's answer to a scan.
+type Part struct {
+	Group shard.GroupID
+	Resp  fsm.Response
+}
+
+// Scan is a client asking Node n for a range scan (A§11.8). The Node asks
+// every data Group and merges what they say. Each Group's Part is
+// Linearizable; the merged answer is not one moment, because the Groups are
+// read one after another while Slots may be moving between them. done gets
+// the merged answer and the Parts it was made from, or ok false if any
+// Group couldn't be reached, in which case there is no answer.
+func (c *Cluster) Scan(n int, cmd fsm.Command, done func(merged fsm.Response, parts []Part, ok bool)) {
+	if !c.NodeUp(n) {
+		done(fsm.Response{}, nil, false)
+		return
+	}
+	groups := c.Groups()[1:]
+	parts := make([]Part, 0, len(groups))
+	failed := false
+	payload := cmd.Encode()
+	for _, g := range groups {
+		c.ask(n, g, true, func(int64) []byte { return payload }, func(o Outcome, raw []byte) {
+			if failed {
+				return
+			}
+			resp, err := fsm.DecodeResponse(raw)
+			if o != Answered || err != nil || resp.Status != fsm.StatusOK {
+				failed = true
+				done(fsm.Response{}, nil, false)
+				return
+			}
+			parts = append(parts, Part{Group: g, Resp: resp})
+			if len(parts) < len(groups) {
+				return
+			}
+			merged := fsm.Response{Status: fsm.StatusOK}
+			for _, p := range parts {
+				merged.Items = append(merged.Items, p.Resp.Items...)
+			}
+			slices.SortFunc(merged.Items, func(a, b fsm.Item) int {
+				switch {
+				case a.Key < b.Key:
+					return -1
+				case a.Key > b.Key:
+					return 1
+				}
+				return 0
+			})
+			if limit := cmd.Limit; limit > 0 && uint64(len(merged.Items)) > limit {
+				merged.Items = merged.Items[:limit]
+			}
+			done(merged, parts, true)
+		})
+	}
+}
+
 // groupOf is the Group the table gives for a Command's keys, and whether it
 // is the same for all of them.
 func (c *Cluster) groupOf(t shard.Table, cmd fsm.Command) (shard.GroupID, bool) {

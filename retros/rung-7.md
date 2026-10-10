@@ -59,7 +59,7 @@ A Group serves a Slot from its accept to its freeze, by its own Log. The accept 
 
 ### Same scenarios, same harness
 
-`TestRung7a`: 6 scenarios × 200 seeds × two workloads = **2,400 runs, none unsafe, 10,514 Moves finished**, every run ending with each Slot served by exactly the Group the table names. The second workload adds time-to-lives, Transactions over two keys, and Sessions that are cleaned up.
+`TestRung7a`: 6 scenarios × 200 seeds × two workloads = **2,400 runs, none unsafe, 10,401 Moves finished**, every run ending with each Slot served by exactly the Group the table names. The second workload adds time-to-lives, Transactions over two keys, range scans merged from every Group, and Sessions that are cleaned up.
 
 ### Two bugs the suite found in the fix
 

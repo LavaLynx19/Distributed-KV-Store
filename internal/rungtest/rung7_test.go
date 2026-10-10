@@ -52,13 +52,14 @@ var flipping = sharded(func(s *rungtest.ShardedStore) { s.FlipAtOnce = true })
 // Log, and a Move is confirmed by both Groups.
 var rung7Store = sharded(func(*rungtest.ShardedStore) {})
 
-// busy is rung7Store with clients that also give keys a time-to-live and
-// run Transactions over two keys, and with Sessions that are removed after
-// 800 units unused.
+// busy is rung7Store with clients that also give keys a time-to-live, run
+// Transactions over two keys and scan, and with Sessions that are removed
+// after 800 units unused.
 var busy = sharded(func(s *rungtest.ShardedStore) {
 	s.Workload.TTLPercent = 40
 	s.Workload.TTL = [2]int64{100, 600}
 	s.Workload.TxnPercent = 15
+	s.Workload.ScanPercent = 10
 	s.SessionTTL = 800
 })
 
@@ -112,6 +113,9 @@ func TestRung7a(t *testing.T) {
 				moved += r.Moves
 				if !r.Passed() || r.Recovery < 0 {
 					t.Errorf("%v\n  end state: %v", r, r.Diverged)
+				}
+				if r.TimedOut {
+					t.Errorf("the checker ran out of time: %v", r)
 				}
 			}
 		}

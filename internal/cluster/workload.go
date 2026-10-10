@@ -22,6 +22,10 @@ type Workload struct {
 	// TxnPercent of requests are Transactions over two keys. Many of them
 	// span Groups and are refused (A§11.8).
 	TxnPercent int
+	// ScanPercent of requests are range scans, merged from every Group.
+	// The History records each Group's part as a request of its own, since
+	// that is the unit the store promises is Linearizable.
+	ScanPercent int
 }
 
 // DefaultWorkload spreads a dozen keys over the Slots, few enough that
@@ -96,6 +100,10 @@ func (w Workload) next(c *Cluster, h *check.History, cl *client, until int64) {
 		w.openSession(c, cl, func() { w.next(c, h, cl, until) })
 		return
 	}
+	if w.ScanPercent > 0 && c.S.Rand().IntN(100) < w.ScanPercent {
+		w.scan(c, h, cl, until)
+		return
+	}
 	cmd := w.choose(c, cl)
 	cl.seq++
 	cmd.Session, cmd.Seq = cl.session, cl.seq
@@ -168,6 +176,46 @@ func (w Workload) next(c *Cluster, h *check.History, cl *client, until int64) {
 		})
 	}
 	attempt()
+}
+
+// scan sends one range scan, once. A scan changes nothing, so a failed one
+// is simply dropped.
+func (w Workload) scan(c *Cluster, h *check.History, cl *client, until int64) {
+	rng := c.S.Rand()
+	cmd := fsm.Command{Op: fsm.OpScan}
+	if rng.IntN(2) == 0 {
+		a, b := rng.IntN(w.Keys), rng.IntN(w.Keys+1)
+		cmd.Key, cmd.End = fmt.Sprintf("k%d", min(a, b)), fmt.Sprintf("k%d", max(a, b))
+	}
+	if rng.IntN(3) == 0 {
+		cmd.Limit = uint64(1 + rng.IntN(w.Keys))
+	}
+	start := c.S.Now()
+	settled := false
+	next := func() {
+		if !settled {
+			settled = true
+			c.S.After(1+rng.Int64N(w.Think), func() { w.next(c, h, cl, until) })
+		}
+	}
+	c.S.After(w.Timeout, next)
+	c.Scan(w.node(c, cl), cmd, func(merged fsm.Response, parts []Part, ok bool) {
+		if settled {
+			return
+		}
+		if ok {
+			for _, p := range parts {
+				// Each part is its own request, by a client of its own:
+				// the parts overlap in time.
+				id := h.Begin(1000*(cl.id+1)+int(p.Group), cmd, start)
+				h.End(id, check.Answered, p.Resp, c.S.Now())
+			}
+			for _, it := range merged.Items {
+				cl.seen[it.Key] = it.Version
+			}
+		}
+		next()
+	})
 }
 
 func (w Workload) choose(c *Cluster, cl *client) fsm.Command {

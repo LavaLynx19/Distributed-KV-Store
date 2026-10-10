@@ -268,7 +268,9 @@ func (m *Machine) Read(query []byte) []byte {
 
 // scan answers a range scan over the Slots this Group serves. Keys are
 // stored by Slot, so each Slot is scanned and the results put in key order.
-// A Group answers only for what it serves: the caller merges the Groups.
+// A Group answers only for what it serves: the caller merges the Groups
+// (A§11.8). The Response's Value says which Slots those were, one byte per
+// Slot, so that whoever checks the answer knows what it covers.
 func (m *Machine) scan(cmd fsm.Command, ask func(fsm.Command) []byte) fsm.Response {
 	limit := cmd.Limit
 	if limit == 0 || limit > fsm.MaxScan {
@@ -304,7 +306,13 @@ func (m *Machine) scan(cmd fsm.Command, ask func(fsm.Command) []byte) fsm.Respon
 	if uint64(len(items)) > limit {
 		items = items[:limit]
 	}
-	return fsm.Response{Status: fsm.StatusOK, Items: items}
+	served := make([]byte, len(m.slots))
+	for s, info := range m.slots {
+		if info.Serves() {
+			served[s] = 1
+		}
+	}
+	return fsm.Response{Status: fsm.StatusOK, Items: items, Value: served}
 }
 
 // store rewrites a Command's keys to the names they are kept under.
