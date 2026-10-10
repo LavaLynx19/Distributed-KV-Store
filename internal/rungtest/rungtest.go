@@ -97,6 +97,12 @@ type Report struct {
 	Final []core.NodeID
 	// Changes is how many Membership changes were Committed.
 	Changes int
+	// TwoOwners is set when two Groups would both have answered for one
+	// Slot at the same moment (A§11.12). Moves is how many Moves finished,
+	// and Routing counts what the Nodes' routing did.
+	TwoOwners string
+	Moves     int
+	Routing   Routing
 
 	verdict check.Verdict
 }
@@ -104,7 +110,18 @@ type Report struct {
 // Safe is true when nothing false was ever said or done: the History is
 // Linearizable, no Term had two Leaders, and no core tripped its own check.
 func (r Report) Safe() bool {
-	return r.Linearizable && !r.TimedOut && r.TwoLeaders == "" && r.Panic == ""
+	return r.Linearizable && !r.TimedOut && r.TwoLeaders == "" && r.Panic == "" && r.TwoOwners == ""
+}
+
+// Routing counts what happened to requests on their way to a Group in a
+// store with several (A§11.3).
+type Routing struct {
+	// Forwarded requests were passed from the Node asked to another.
+	Forwarded int
+	// WrongGroup were refused by a Group that didn't own the key's Slot:
+	// the Node's table was out of date. Moving were refused because the
+	// Slot was frozen for a Move.
+	WrongGroup, Moving int
 }
 
 // Passed is true when the run kept every guarantee: it was Safe, every
@@ -126,6 +143,9 @@ func (r Report) String() string {
 		r.Signals.Answered, r.Signals.Rejected, r.Signals.Lost, r.Recovery)
 	if r.TwoLeaders != "" {
 		s += " two-leaders: " + r.TwoLeaders
+	}
+	if r.TwoOwners != "" {
+		s += " two-owners: " + r.TwoOwners
 	}
 	if r.Panic != "" {
 		s += " panic: " + r.Panic

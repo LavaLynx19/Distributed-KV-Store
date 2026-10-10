@@ -125,6 +125,10 @@ const (
 	// StatusMoving: this Group owns the key's Slot and has frozen it to
 	// hand it to another (A§11.4). Nothing changed; ask again shortly.
 	StatusMoving
+	// StatusCrossGroup: a Transaction's keys are owned by more than one
+	// Group (A§11.8). No state machine gives this answer: the Node that
+	// routes the request does, before sending it anywhere.
+	StatusCrossGroup
 )
 
 // Response is what the client gets back. Version is the key's version after

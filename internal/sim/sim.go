@@ -51,10 +51,18 @@ type Config struct {
 	// Membership change adds them (A§6.5). Zero means every Node.
 	Members int
 
+	// IDs, if set, are the Nodes' ids, in place of 1..Nodes. A store with
+	// several Groups runs one simulated Node per replica, and gives each an
+	// id that says which machine and which Group it is (A§11.9).
+	IDs []core.NodeID
+
 	// NewNode builds a Member's core. members lists every Member, id included.
 	NewNode func(id core.NodeID, members []core.NodeID, rng core.Rand) core.Node
 	// NewMachine builds a Member's state machine.
 	NewMachine func() Machine
+	// NewMachineFor, if set, is used in place of NewMachine, for a run in
+	// which Nodes don't all hold the same kind of state.
+	NewMachineFor func(id core.NodeID) Machine
 
 	// Restart, if set, makes a crash lose everything that wasn't durable: a
 	// restarted Member gets a new core built from its simulated disk, and a
@@ -84,6 +92,11 @@ type Config struct {
 	// whether it has something to propose so that time moves in a Group
 	// nobody is writing to (A§6.7). It returns the proposal, or nil.
 	TimeEntry func(m Machine, now int64) []byte
+
+	// OnApply, if set, is called each time a Member has applied a Committed
+	// Entry to its state machine, with the machine as it then stands. A
+	// test uses it to watch a Group's state change at the exact Entry.
+	OnApply func(id core.NodeID, index core.Index, m Machine)
 
 	// Copy, if set, stands in for the network's encoding: every message is
 	// passed through it on the way, so Members never share memory.
@@ -183,14 +196,15 @@ func New(cfg Config) *Sim {
 		blocked: map[[2]core.NodeID]bool{},
 		digest:  14695981039346656037, // FNV-1a offset basis
 	}
-	for i := 1; i <= cfg.Nodes; i++ {
+	for i := 1; i <= cfg.Nodes && cfg.IDs == nil; i++ {
 		s.ids = append(s.ids, core.NodeID(i))
 	}
+	s.ids = append(s.ids, cfg.IDs...)
 	for _, id := range s.ids {
 		m := &member{
 			id:      id,
 			core:    cfg.NewNode(id, s.Founders(), rand.New(rand.NewPCG(cfg.Seed, uint64(id)))),
-			machine: cfg.NewMachine(),
+			machine: s.newMachine(id),
 			up:      true,
 			pending: map[uint64]func(Reply){},
 			queries: map[uint64][]byte{},
@@ -204,6 +218,13 @@ func New(cfg Config) *Sim {
 		s.schedule(s.rng.Int64N(cfg.TickEvery), func() { s.tick(m) })
 	}
 	return s
+}
+
+func (s *Sim) newMachine(id core.NodeID) Machine {
+	if s.cfg.NewMachineFor != nil {
+		return s.cfg.NewMachineFor(id)
+	}
+	return s.cfg.NewMachine()
 }
 
 // Now is the current virtual time.
@@ -355,13 +376,13 @@ func (s *Sim) Restart(id core.NodeID) {
 	}
 	store, stored, err := s.openDisk(m.fs)
 	if err == nil && stored.Snapshot != nil {
-		machine := s.cfg.NewMachine()
+		machine := s.newMachine(id)
 		if err = machine.Restore(stored.Snapshot.Data); err == nil {
 			m.machine = machine
 			m.applied, m.snapshotAt = stored.Snapshot.Index, stored.Snapshot.Index
 		}
 	} else if err == nil {
-		m.machine = s.cfg.NewMachine()
+		m.machine = s.newMachine(id)
 		m.applied, m.snapshotAt = 0, 0
 	}
 	if err != nil {
@@ -621,6 +642,9 @@ func (s *Sim) finish(m *member, out core.Output) {
 	for _, e := range out.Committed {
 		responses[e.Index] = m.machine.Apply(e)
 		m.applied = e.Index
+		if s.cfg.OnApply != nil {
+			s.cfg.OnApply(m.id, e.Index, m.machine)
+		}
 	}
 	for _, r := range out.Results {
 		done, ok := m.pending[r.Ref]

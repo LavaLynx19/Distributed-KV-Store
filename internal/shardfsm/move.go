@@ -109,10 +109,10 @@ func (m *Machine) applyMove(payload []byte) fsm.Response {
 		switch {
 		case info.Serves() && info.Epoch >= st.Epoch:
 			return ok // this Move finished already
-		case info.Status == Absent:
+		case info.Status == Absent && st.Epoch > info.Epoch:
 			*info = SlotInfo{Status: Incoming, Epoch: st.Epoch, Peer: st.Peer}
 		case info.Status != Incoming || info.Epoch != st.Epoch:
-			return refused
+			return refused // including a step left over from a Move long finished
 		}
 		m.stage(st.Slot, st.Transfer)
 
@@ -129,7 +129,7 @@ func (m *Machine) applyMove(payload []byte) fsm.Response {
 		switch {
 		case info.Serves() && info.Epoch >= st.Epoch:
 			return ok
-		case info.Status == Absent && st.Transfer.Full:
+		case info.Status == Absent && st.Transfer.Full && st.Epoch > info.Epoch:
 			// Nothing was copied ahead: the accept brings the whole Slot.
 		case info.Status != Incoming || info.Epoch != st.Epoch:
 			return refused
@@ -166,7 +166,9 @@ func (m *Machine) applyMove(payload []byte) fsm.Response {
 			return refused
 		}
 		m.clear(st.Slot)
-		*info = SlotInfo{}
+		// The Epoch is kept. A step of the Move that brought the Slot here
+		// may still be on its way, and must find that it is too late.
+		*info = SlotInfo{Epoch: st.Epoch}
 	}
 	return ok
 }
@@ -508,4 +510,19 @@ func (m *Machine) Restore(data []byte) error {
 	}
 	*m = *next
 	return nil
+}
+
+// Unfrozen reads a whole Slot as it stands, whether or not it is Frozen.
+// What it returns may be out of date the moment it is read: the Group can
+// still be taking writes. Only the naive store, which hands a Slot over
+// without freezing it, uses this. It exists so that Rung 7's exposure of
+// that stays reproducible.
+func (m *Machine) Unfrozen(slot shard.Slot) Transfer {
+	t := Transfer{Full: true, LogTime: m.inner.LogTime(), VEpoch: m.slots[slot].VEpoch}
+	m.inner.Range(stored(slot, ""), slotEnd(slot), func(r fsm.Raw) bool {
+		r.Key = r.Key[2:]
+		t.Upserts = append(t.Upserts, r)
+		return true
+	})
+	return t
 }

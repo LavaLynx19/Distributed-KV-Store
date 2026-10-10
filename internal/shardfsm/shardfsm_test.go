@@ -449,3 +449,46 @@ func TestCaptureMidMove(t *testing.T) {
 		t.Fatal("Restore accepted garbage")
 	}
 }
+
+// A step can arrive long after its Move finished: a Leader sent it, lost
+// touch, and the request got through in the end. By then the Slot may have
+// come to this Group and gone again. The late step must not bring it back.
+func TestAStepFromAFinishedMoveIsRefused(t *testing.T) {
+	a, b := newGroup(1, 0), newGroup(2, 1)
+	k := keyIn(0, 0)
+	a.do(t, put(k, "first"))
+
+	// The Slot goes from a to b. Keep the accept that took it there.
+	a.step(t, BeginStep(0, 0, 2))
+	chunk, _ := a.Chunk(0, "", 100)
+	late := IncomingStep(0, 1, 1, Transfer{Upserts: chunk})
+	b.step(t, late)
+	a.step(t, FreezeStep(0, 0))
+	whole, _ := a.Final(0, true)
+	lateAccept := AcceptStep(0, 1, 1, whole)
+	b.step(t, lateAccept)
+	a.step(t, DropStep(0, 0))
+
+	// It is written there, and goes back to a.
+	b.do(t, put(k, "second"))
+	move(t, b, a, 0, 1)
+	a.do(t, put(k, "third"))
+
+	// Now the old steps turn up at b, which no longer has the Slot.
+	for _, old := range []Step{lateAccept, late} {
+		if r := b.step(t, old); r.Status != fsm.StatusInvalid {
+			t.Fatalf("a step from the finished Move was taken: %+v", r)
+		}
+	}
+	if b.Slots()[0].Serves() || len(b.itemsOf(0)) != 0 {
+		t.Fatalf("the Slot came back to the Group it had left: %+v holding %+v", b.Slots()[0], b.itemsOf(0))
+	}
+	if r := read(t, a, k); string(r.Value) != "third" {
+		t.Fatalf("the owner's data: %+v", r)
+	}
+	// A real Move to b still works: it comes at a higher Epoch.
+	move(t, a, b, 0, 2)
+	if r := read(t, b, k); string(r.Value) != "third" {
+		t.Fatalf("after moving again: %+v", r)
+	}
+}

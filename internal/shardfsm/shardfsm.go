@@ -53,7 +53,9 @@ const (
 type SlotInfo struct {
 	Status Status
 	// Epoch is the Slot's Epoch in the table while this Group owns it, or
-	// the Epoch it will have once an Incoming Slot is accepted.
+	// the Epoch it will have once an Incoming Slot is accepted. For an
+	// Absent Slot it is the Epoch at which this Group last had it: the Slot
+	// can only come back at a higher one.
 	Epoch uint32
 	// Peer is the Group the Slot is going to or coming from.
 	Peer shard.GroupID

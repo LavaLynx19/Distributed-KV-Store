@@ -73,16 +73,16 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 
 ### Phase 7 — Rung 7: several Groups (§P7)
 - [x] P7.0 Confirm or replace the A§10 sketch; write A§11 and Decision Log entries → §P7
-- [ ] P7a.1 Several cores per Node: Group ids on messages, a data directory per Group, the Simulation hosting several Groups (A§11.9) → §P7
-- [ ] P7a.2 The Meta Group with a fixed Slot table; keys hashed to Slots; a Group's tree keyed by Slot (A§11.2, A§11.4) → §P7
+- [x] P7a.1 Several cores per Node: Group ids on messages, a data directory per Group, the Simulation hosting several Groups (A§11.9) → §P7
+- [x] P7a.2 The Meta Group with a fixed Slot table; keys hashed to Slots; a Group's tree keyed by Slot (A§11.2, A§11.4) → §P7
 - [ ] P7a.3 Routing: forward once, answers carry the table version; clients learn (A§11.3) → §P7
-- [ ] P7a.4 Expose: a Group that doesn't check ownership serves a key it doesn't own → §P7
-- [ ] P7a.5 Expose: the Meta Group flips the table and nobody confirms; two Groups serve one Slot → §P7
-- [ ] P7a.6 The one-owner verdict and the across-Groups End-state check (A§11.12) → §P7
-- [ ] P7a.7 The Move: intent, copy while serving, freeze, accept, done, drop; carried on after a crash at each step (A§11.4) → §P7
-- [ ] P7a.8 Versions as Epoch and index (A§11.5) → §P7
-- [ ] P7a.9 Store-wide Sessions: ids from the Meta Group, registering with a floor, moving with a Slot (A§11.6) → §P7
-- [ ] P7a.10 Store time from the Meta Group (A§11.7) → §P7
+- [x] P7a.4 Expose: a Group that doesn't check ownership serves a key it doesn't own → §P7
+- [x] P7a.5 Expose: the Meta Group flips the table and nobody confirms; two Groups serve one Slot → §P7
+- [x] P7a.6 The one-owner verdict and the across-Groups End-state check (A§11.12) → §P7
+- [x] P7a.7 The Move: intent, copy while serving, freeze, accept, done, drop; carried on after a crash at each step (A§11.4) → §P7
+- [x] P7a.8 Versions as Epoch and index (A§11.5) → §P7
+- [x] P7a.9 Store-wide Sessions: ids from the Meta Group, registering with a floor, moving with a Slot (A§11.6) → §P7
+- [x] P7a.10 Store time from the Meta Group (A§11.7) → §P7
 - [ ] P7a.11 Merged scans; `cross_group` for Transactions (A§11.8) → §P7
 - [ ] P7a.12 Real shell: `kvnode` hosting several Groups, `kvctl move-slot`, harness → §P7
 - [ ] P7a.13 Stage 7a suite, real runs with the pause of a Move measured, `retros/rung-7.md` → §P7

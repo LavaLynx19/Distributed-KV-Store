@@ -297,7 +297,7 @@ Requests carry `Session-Id` and `Request-Seq` headers so that a retry takes effe
 | 409 | `change_in_progress` | Another Membership change is under way, or the Leader has only just been elected. Nothing changed | Retry later |
 | 421 | `wrong_group` | From Rung 7: no Group reachable from this Node owns the key's Slot by its own Log. Includes the table version the Node holds | Refresh the table, retry, same request number |
 | 503 | `moving` | From Rung 7: the key's Slot is frozen for a Move (§11.4). Nothing changed | Retry shortly, same request number |
-| 400 | `cross_group` | From Rung 7: a Transaction's keys are owned by more than one Group (§11.8) | Use keys in one Group, or wait for Rung 8 |
+| 400 | `cross_group` | From Rung 7: a Transaction's keys are owned by more than one Group (§11.8). This attempt changed nothing | Use keys in one Group, or wait for Rung 8. If an earlier attempt of the same request ended unknown, the outcome is still unknown: a Move may have split the keys since |
 | 503 | `member_unreachable` | The Node to be added didn't catch up with the Log. Nothing changed | Check the Node is running as a Spare, then retry |
 | 500 | `internal` | A bug in the store | Report it; the outcome is unknown |
 
@@ -404,15 +404,19 @@ The Meta Group decides a move; the two data Groups carry it out and each records
 
 - **Exactly one owner.** A serves s only before its freeze Entry. B serves s only after its accept Entry. B can build its accept only from A's frozen data. So there is no moment when both serve, whatever the Meta Group, the forwarders or the clients believe.
 - **The pause** is from A's freeze to B's accept: the time to send what changed during the copy. It is measured.
+- **A step can arrive late**, after its Move has finished and the Slot has since come and gone again. So a Group keeps, for a Slot it no longer has, the Epoch at which it last had it, and takes the Slot back only at a higher one.
+- **Who carries it out.** On each Node an agent looks, for every Group whose Leader is there, at that Group's own state and the table, and proposes the next step. It keeps no state that matters. If the Leader that made the copy is replaced, the new one can't know what the target holds, and sends the whole Slot with the accept.
 - **A crash at any step** leaves that step's Entry in a Log. A new Leader of A, B or the Meta Group reads its own Log and the intent, and carries on. Messages between Groups go Leader to Leader and are repeated until answered; every step may be applied twice without harm.
 - **To make a Slot cheap to send**, a Group's tree is keyed by Slot and then key, so a Slot is one contiguous range (*to settle*: this changes key order inside a Group, and scans then merge across Slots as they do across Groups).
 
 ### 11.5 Versions
-A key's version is the Slot's Epoch and the index of the Entry that wrote it, in the Log of the Group that owned the Slot then, packed into one number with the Epoch in the high bits. It never repeats and always increases, across moves. Rungs 1–6 are the case Epoch 0.
+A key's version is the Slot's Epoch and the index of the Entry that wrote it, in the Log of the Group that owned the Slot then, packed into one number with the Epoch in the high 16 bits. It never repeats and always increases, across moves. Rungs 1–6 are the case Epoch 0.
+
+A Transaction gives every key it writes one version, and its keys may be in Slots with different Epochs. So each Group keeps, per Slot, a version Epoch that is at least the Slot's Epoch: a Transaction uses the highest among its Slots and raises the others to it, and a Move carries it and adds one.
 
 ### 11.6 Sessions
 - A client opens a Session with the Meta Group, once, and gets an id that means the same in every Group.
-- A data Group must be told of a Session before it trusts it. The Node handling a request registers the Session with the Group on first use, with a floor: the request number the client is up to. The Group refuses anything below the floor. That way a Session it once cleaned up and is told of again can't be made to apply an old request a second time.
+- A data Group must be told of a Session before it trusts it. A request can ask the Group to start a record of its Session at that request. The record then has a floor, the request's number, and the Group refuses anything below it. A client asks this only while no earlier attempt of the request can have taken effect, and never on a retry after an unknown outcome. That way a Session a Group once cleaned up and is told of again can't be made to apply an old request a second time. It relies on an attempt being delivered at most once: only the client repeats a request.
 - **Moving.** Each Session record notes the Slot of its last request. When a Slot moves, the Sessions whose last request was in it go too. If the target already knows the Session it keeps the higher request number.
 - A retry that reaches a Group which doesn't know the Session is answered `session_expired`, and the client treats the outcome as unknown, as now.
 
