@@ -42,7 +42,7 @@ _Avoid_: Observer, non-voter, witness
 
 **Meta Group**:
 The one Group that holds the Slot table, hands out Session ids and issues Store time. It stores no keys.
-_Avoid_: Coordinator, config server, master, placement driver
+_Avoid_: Config server, master, placement driver
 
 **Slot**:
 One of a fixed number of shares of the keys. A key's Slot is decided by its hash and never changes; a Slot is owned by exactly one Group at any moment.
@@ -93,6 +93,17 @@ _Avoid_: Timeout, eviction
 **Store time**:
 The time the whole store goes by for Expiry, issued by the Meta Group's Leader and never read from any other clock.
 _Avoid_: Wall clock, global clock, timestamp oracle
+**Transaction**:
+A list of conditions and writes over several keys that takes effect all or nothing.
+_Avoid_: Batch, multi-put
+
+**Coordinator Group**:
+The Group whose Log records whether a Transaction across Groups commits or aborts.
+_Avoid_: Transaction manager, deciding Group
+
+**Lock**:
+A Group's promise to leave a key unchanged and unread until the Transaction that named it is decided. Clients can't take one.
+_Avoid_: Hold, latch, intent
 
 ## Guarantees
 

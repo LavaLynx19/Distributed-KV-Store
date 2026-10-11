@@ -106,8 +106,20 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P7c.8 Stage 7c suite (the 7b suite with automation on, plus Nodes lost for good and skewed load), real runs, the 7c part and the Rung 7 verdict in `retros/rung-7.md` → §P7
 
 ### Phase 8 — Rung 8: transactions across Groups (§P8)
-- [>] P8.0 Confirm or replace the A§10 sketch → defer until: Rung 7 retro is done
-- [>] P8.1 Replicated two-phase commit → defer until: P8.0 is approved
+- [x] P8.0 Confirm or replace the A§10 sketch; write A§12 and Decision Log entries → §P8
+- [x] P8a.1 Naive Transactions across Groups: the receiving Node drives prepare and finish from memory; switches leave Locked keys readable and the version with no offset; the Simulation's workload sends them and the whole-store model checks them (A§12.2). The offset itself (A§12.6) was built here, behind its switch: without it every run fails on versions and nothing else can be seen → §P8
+- [ ] P8a.2 Expose: a driver that crashes between two finishes leaves a Transaction half-committed → §P8
+- [ ] P8a.3 Expose: a Stale read of a Locked key; a version that goes backwards → §P8
+- [ ] P8a.4 Fix: begin, decision and confirmed Entries in the Coordinator Group; its Leader drives, a new Leader carries on, abort after a bound (A§12.2, A§12.4) → §P8
+- [ ] P8a.5 Fix: Locked keys ask the Coordinator Group, wait, then `locked`; old Locks are asked about; a Move waits for a Slot's Locks (A§12.3, A§12.7) → §P8
+- [ ] P8a.6 The per-Slot version offset (A§12.6), built in P8a.1: its regression seeds from P8a.3, and Moves resetting it → §P8
+- [ ] P8a.7 Stage 8a suite with the verdicts of A§12.9, crashes between every pair of steps, and the 8a part of `retros/rung-8.md` → §P8
+- [ ] P8b.1 Naive conflicts: Transactions wait for each other's Locks with no order and no bound. Expose: two Transactions that never decide → §P8
+- [ ] P8b.2 Fix: age, older wins, `txn_conflict` carrying the age, the client's retry (A§12.5) → §P8
+- [ ] P8b.3 Measure a Move stalled behind a slow Transaction; then Moves abort undecided Transactions (A§12.7) → §P8
+- [ ] P8b.4 Forget a record when every Group has confirmed (A§12.2) → §P8
+- [ ] P8b.5 Real shell: the steps between processes, `kvctl` shows Locks and undecided Transactions, `kvbench` can send a share of Transactions across Groups → §P8
+- [ ] P8b.6 Stage 8b suite with Moves and automation on, real runs, the 8b part and the Rung 8 verdict in `retros/rung-8.md` → §P8
 
 ### Phase 9 — Rung 9: the Leaderless variant (§P9)
 - [>] P9.0 Confirm or replace the A§10 sketch; design the convergence check → defer until: Rung 6 retro is done (independent of Rungs 7–8)
@@ -180,8 +192,15 @@ Design is A§11. Three stages (A§11.1), each ending with a retro section and th
 
 **Verify (7a):** P7a.4's and P7a.5's seeds fail before and pass after. No run ever has two Groups serving one Slot. Single-key operations stay Linearizable while Slots move, including Moves interrupted by crashes and Partitions at every step. A retry that crosses a Move takes effect once. The pause of a Move is reported.
 
-## §P8–§P9
-Each starts with its `.0` task: revisit the A§10 sketch with what the earlier Rungs taught, update ARCHITECTURE.md, and get approval. Tasks are broken down then.
+## §P8 — Rung 8
+Design is A§12. Two stages (A§12.1), each ending with a retro part and the user's approval.
+
+**Verify (8a):** P8a.2's and P8a.3's seeds fail naive and can't be reproduced after. With the Coordinator Group's Leader or another Group's Leader crashed between any two steps, every Transaction ends the same way in every Group, the run is Linearizable over the whole store, and after Faults stop no key is Locked and nothing is undecided. Versions never go down for a key.
+
+**Verify (8b):** P8b.1's seed fails naive and can't be reproduced after. Under steady contention every Transaction is decided and none loses for ever. A Move during Transactions waits only for commits already decided. No record is left at the end. The Rung 7 load reaches 0.9× of Rung 7 on real processes, and the cost of a Transaction across Groups is stated.
+
+## §P9
+Starts with its `.0` task: revisit the A§10 sketch with what the earlier Rungs taught, update ARCHITECTURE.md, and get approval. Tasks are broken down then.
 
 ## §P10 — Writeup
 **Verify:** each Decision Log entry is walked through with the evidence from its Rung.

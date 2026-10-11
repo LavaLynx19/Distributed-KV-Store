@@ -281,7 +281,7 @@ The mark survives restarts, so a Member that restarts while Recovering is still 
 | `PUT /v1/kv/{key}` | Write a key; optional `ttl` in milliseconds; optional `if_version` for compare-and-set |
 | `DELETE /v1/kv/{key}` | Delete a key; optional `if_version` |
 | `GET /v1/kv?start=&end=&limit=` | Range scan in key order: keys from `start` up to but not including `end`. An empty `end` means to the last key. At most `limit` keys, and never more than 1,000. Answers `{"items": [{key, value, version}]}` |
-| `POST /v1/txn` | Transaction: `{"if": [{key, version}], "writes": [{op: "put" or "delete", key, value, ttl}]}`. A refusal is `version_mismatch` with `failed`: the conditions that didn't hold and the versions found |
+| `POST /v1/txn` | Transaction: `{"if": [{key, version}], "writes": [{op: "put" or "delete", key, value, ttl}]}`. From Rung 8 it also takes an optional `age` (§12.8). A refusal is `version_mismatch` with `failed`: the conditions that didn't hold and the versions found |
 | `GET /v1/status` | This Member's role, Term, Leader hint, commit index |
 
 Requests carry `Session-Id` and `Request-Seq` headers so that a retry takes effect once (§6.3). A request without them is applied every time it arrives.
@@ -299,7 +299,9 @@ Requests carry `Session-Id` and `Request-Seq` headers so that a retry takes effe
 | 409 | `change_in_progress` | Another Membership change is under way, or the Leader has only just been elected. Nothing changed | Retry later |
 | 421 | `wrong_group` | From Rung 7: no Group reachable from this Node owns the key's Slot by its own Log. Includes the table version the Node holds | Refresh the table, retry, same request number |
 | 503 | `moving` | From Rung 7: the key's Slot is frozen for a Move (§11.4). Nothing changed | Retry shortly, same request number |
-| 400 | `cross_group` | From Rung 7: a Transaction's keys are owned by more than one Group (§11.8). This attempt changed nothing | Use keys in one Group, or wait for Rung 8. If an earlier attempt of the same request ended unknown, the outcome is still unknown: a Move may have split the keys since |
+| 400 | `cross_group` | Rung 7 only (§12 removes it): a Transaction's keys are owned by more than one Group (§11.8). This attempt changed nothing | Use keys in one Group, or wait for Rung 8. If an earlier attempt of the same request ended unknown, the outcome is still unknown: a Move may have split the keys since |
+| 503 | `locked` | From Rung 8: a key is Locked by a Transaction that is not yet decided (§12.3). Nothing changed | Retry shortly, same request number |
+| 409 | `txn_conflict` | From Rung 8: a Transaction across Groups was aborted for an older Transaction, a Move, or a table that had changed (§12.5, §12.7). This attempt changed nothing. Carries `age` | Send it again as a new request, with that `age` |
 | 503 | `member_unreachable` | The Node to be added didn't catch up with the Log. Nothing changed | Check the Node is running as a Spare, then retry |
 | 500 | `internal` | A bug in the store | Report it; the outcome is unknown |
 
@@ -374,7 +376,7 @@ These are hypotheses chosen by the user, to be confirmed or replaced when the Ru
 | Rung | Sketch |
 |---|---|
 | 7 | Confirmed and replaced by §11. |
-| 8 | Two-phase commit where prepare, decision and commit are Entries in the Logs of the Groups involved, so a new Leader reads the decision and nothing stays undecided. |
+| 8 | Confirmed and replaced by §12. |
 | 9 | The **Leaderless variant** first settles conflicts by last-write-wins, to expose Acknowledged writes disappearing, then by version vectors that keep both values. A convergence check replaces the linearizability check. |
 
 What earlier Rungs must leave room for: Entry kinds are extensible (§5.1); a Node can host more than one core; the state machine can refuse a key it doesn't own; the client API can carry a routing-table version.
@@ -428,7 +430,7 @@ The Meta Group decides a move; the two data Groups carry it out and each records
 ### 11.5 Versions
 A key's version is the Slot's Epoch and the index of the Entry that wrote it, in the Log of the Group that owned the Slot then, packed into one number with the Epoch in the high 16 bits. It never repeats and always increases, across moves. Rungs 1–6 are the case Epoch 0.
 
-A Transaction gives every key it writes one version, and its keys may be in Slots with different Epochs. So each Group keeps, per Slot, a version Epoch that is at least the Slot's Epoch: a Transaction uses the highest among its Slots and raises the others to it, and a Move carries it and adds one.
+A Transaction gives every key it writes one version, and its keys may be in Slots with different Epochs. So each Group keeps, per Slot, a version Epoch that is at least the Slot's Epoch: a Transaction uses the highest among its Slots and raises the others to it, and a Move carries it and adds one. From Rung 8 a per-Slot offset is added to the index (§12.6).
 
 ### 11.6 Sessions
 - A client opens a Session with the Meta Group, once, and gets an id that means the same in every Group.
@@ -444,7 +446,7 @@ A Transaction gives every key it writes one version, and its keys may be in Slot
 
 ### 11.8 Scans and Transactions
 - A range scan asks every Group and merges the answers. Each Group's part is Linearizable. The whole is not one moment: a key that moves during the scan can be seen twice or not at all (*to settle*: whether to detect a table change during the scan and retry).
-- A Transaction whose keys are not all owned by one Group is refused with `cross_group`. Whether two keys share a Group can change when a Slot moves. Rung 8 removes the limit.
+- A Transaction whose keys are not all owned by one Group is refused with `cross_group`. Whether two keys share a Group can change when a Slot moves. Rung 8 removes the limit (§12).
 
 ### 11.9 Nodes and Groups
 - A Node hosts one core per Group it is a Member of, each with its own data directory. One event loop, one transport and one client API per Node; messages name their Group.
@@ -522,6 +524,86 @@ Details confirmed with the user at P7c.0.
 - A Group that has lost its Majority is beyond automation: it can't change its own Members. A Move it is part of waits, and blocks rebalancing, until Members return or an operator runs Unsafe recovery.
 - On one machine, moving load onto more Groups makes the store slower, not faster.
 
+## 12. Rung 8: Transactions across Groups
+
+Confirmed with the user at P8.0. It replaces the Rung 8 row of §10. Details marked *to settle* are decided in the task that builds them. A Transaction is still one request (§5.2): conditions and writes, with no reads in between, so a key is only kept waiting between a prepare and the decision.
+
+### 12.1 Stages
+Two stages. Each ships its naive versions first, is measured, gets a part in `retros/rung-8.md`, and needs the user's approval before the next.
+
+| Stage | Adds | Shipped first, to be seen failing |
+|---|---|---|
+| 8a | The steps of §12.2 as Entries, **Locks**, asking for a decision, carrying on after a crash, one version per Transaction | A decision kept only in memory; a Locked key that can still be read; a version with no offset |
+| 8b | Older Transaction wins, Moves that abort undecided Transactions, forgetting records, the real shell, the numbers | Transactions that wait for each other with no order |
+
+Until 8b, a Transaction that meets another's Lock is refused at once, a Move waits until its Slot has no Lock, and records are never forgotten. All three are safe and slow.
+
+### 12.2 The steps
+A Transaction's id is its Session id and request number. Its **Coordinator Group** is the Group that owns the Slot of its lowest key. A Transaction whose keys are all in one Group is one Entry, as in Rung 5, and takes none of these steps.
+
+1. **Begin.** The Node that receives the request forwards it to the Coordinator Group's Leader, which commits a begin Entry: the id, the age (§12.5), the conditions, the writes, and the Group it believes owns each key. The begin Entry is also the Coordinator Group's own prepare.
+2. **Prepare.** The Coordinator Group's Leader sends each other Group its part. That Group commits a prepare Entry. It answers yes only if it owns every Slot named by its own Log, none is frozen or about to move, every condition holds and no key is Locked by another Transaction. A yes Locks every key named, in a condition or a write, records the writes, and carries the version the Group would have given. A no says why. A no for a failed condition names the versions found and Locks the keys all the same, until the finish: otherwise what two Groups report about their conditions would be true at two different moments, and the answer to the client would describe a store that never existed. Any other no holds nothing.
+3. **Decision.** When every Group has answered, or one has said no, the Coordinator Group commits a decision Entry: commit only if all said yes. It carries the Transaction's version (§12.6). The same Entry applies the Coordinator Group's own writes and releases its own Locks. The client is answered once this Entry is Committed.
+4. **Finish.** The Leader sends the decision to each other Group, which commits a finish Entry: on commit it applies its writes with that version, and either way it releases its Locks.
+5. **Confirmed.** Each Group's answer to finish is Committed in the Coordinator Group. When every Group has confirmed, the record is forgotten (8b).
+
+Messages go Leader to Leader, name the Transaction and are repeated until answered. Every step may be applied twice without harm: a Group answers a step it has already taken the same way. The decision lives in a table that belongs to the Group, not to a Slot, and is part of its Snapshot. A Move never carries it: no Group is ever dissolved, so the record stays reachable where it was written.
+
+### 12.3 Locks
+- A **Lock** covers one key for one Transaction. Clients can't take one.
+- A read, write, compare-and-set, scan or single-Group Transaction that touches a Locked key is not served from what the Group holds. The Group's Leader asks the Coordinator Group what was decided. If there is a decision, the Group commits its finish Entry first and then serves the request.
+- If the answer is "not decided yet", or none comes, the request waits a bounded time (*to settle*: about one election timeout) and is then refused with `locked`.
+- The Coordinator Group answers the question as a Linearizable read. A Member that has been replaced as Leader may not have applied the begin Entry, and its "no record" would be wrong.
+- "No record" from the Coordinator Group means abort, and the Lock is released. This is safe because begin is Committed before any prepare is sent and a record is forgotten only after every Group confirmed. So a prepare that arrives late, after all that, Locks its keys only until the first question.
+- A Group's Leader also asks about every Lock older than a bound, whether or not a request is waiting, so no Lock outlives its Transaction.
+
+### 12.4 Crashes
+- Each step is an Entry. A new Leader of the Coordinator Group reads its table and carries on: prepares for a Transaction that has begun, finishes for one that is decided. A new Leader of another Group finds its Locks in its state and asks about them.
+- The Coordinator Group may decide abort at any time before it has decided commit. Its Leader does so when not every answer has come within a bound (*to settle*). A Group that says yes afterwards is sent the abort.
+- A client that loses its connection retries with the same request number. The Coordinator Group's Session record answers with the recorded outcome, or makes the retry wait while the Transaction is in flight. That record follows the Slot of the lowest key (§11.6), so it is still found after a Move.
+- **The limit.** A Coordinator Group that has lost its Majority can decide nothing, and the other Groups keep their Locks until its Members return or an operator runs Unsafe recovery. "Nothing stays undecided" holds while every Group involved has a Majority.
+
+### 12.5 Two Transactions and one key (8b)
+- **Age.** A Transaction's age is the Store time stamped on its begin Entry, then its Session id, then its request number. Every Group compares ages the same way.
+- **Older wins.** A prepare that finds a key Locked by a younger Transaction asks that Transaction's Coordinator Group to abort it. If it is still undecided it is aborted; if it has already committed, the answer is the commit. Either way the Lock goes, and the prepare waits for that.
+- A prepare that finds a key Locked by an older Transaction waits a bounded time and then answers no.
+- So no two Transactions can wait for each other: of any two, only the younger waits.
+- **A Transaction that loses** is refused with `txn_conflict`, which carries its age. That attempt changed nothing. The client sends it again as a new request with that age, so it keeps getting older and must win in the end.
+- The store trusts the age a client sends, except that it can't be later than Store time now. A client that lies about its age can push in front of others. It can't break atomicity or lose a write.
+- Requests that aren't Transactions across Groups have no age. They wait and are refused as in §12.3.
+
+### 12.6 One version per Transaction
+- Every key a Transaction writes gets the same version, in every Group: the highest of the versions the Groups offered at prepare.
+- A Group must never give a later write a lower version. So each Group keeps, per Slot, an offset. A version is the Slot's version Epoch and the Entry's index plus the offset (§11.5). When a Transaction's version is higher than the Group would have given, the Group raises the Slot's version Epoch to the Transaction's if that is higher, and raises the offset so that the next Entry's version is above it.
+- A Move adds one to the version Epoch (§11.5), which is above anything the source gave, so the offset starts again at zero in the target.
+- A version is then no longer exactly an Entry's index. It still never repeats and always increases for a key.
+
+### 12.7 Moves
+- Once the table shows an intent to move a Slot, its Group refuses new prepares for it, and a begin whose lowest key is in it.
+- **8a:** the Group freezes the Slot only when no key in it is Locked.
+- **8b:** the Group asks the Coordinator Group of each Lock in the Slot to abort. A Transaction that had already committed is finished first. Then the Slot freezes. So a Move waits at most for commits already decided, and Transactions on a Slot being moved are refused with `txn_conflict` and retried.
+- A Move carries no Lock and no decision record. It carries Session records, with the outcome, as before.
+
+### 12.8 Client API
+- `POST /v1/txn` takes an optional `age`. A `txn_conflict` refusal carries the `age` to send with the next attempt.
+- `cross_group` is no longer returned.
+- A Transaction's answer still has one version.
+
+### 12.9 Verification
+- **Linearizability** over the whole store, with Transactions whose keys are in different Groups in every run (§8.2: such Histories stay small).
+- **Same outcome everywhere.** For every Transaction, every Group that took a step for it ends with the same outcome as the Coordinator Group's decision.
+- **Nothing left.** After Faults stop, no key is Locked and no Transaction is undecided; from 8b no record is left at all.
+- **Faults:** the Coordinator Group's Leader and each other Group's Leader crashed between every pair of steps, Partitions between Groups, and from 8b Moves and automation during Transactions.
+- **Client signals** add: requests refused `locked` and `txn_conflict`, attempts per Transaction, and the longest time a key stayed Locked.
+- **Numbers.** The Rung 7 load with no Transactions is run again and must reach 0.9× of Rung 7. Transactions across Groups are then measured on their own and their cost is stated in the retro as a known cost.
+
+### 12.10 Risks accepted
+- Two-phase commit stops when the Coordinator Group has no Majority (§12.4).
+- A Transaction across two Groups costs at least five Committed writes where one in a single Group costs one: begin, decision and confirmed in the Coordinator Group, prepare and finish in the other.
+- A client can lie about a Transaction's age (§12.5).
+- A scan across Groups is still not one moment (§11.8).
+- Moves made by the balancer now cost Transactions a retry.
+
 ## Decision Log
 
 ### The consensus core is a pure step function
@@ -565,3 +647,12 @@ Rung 5 let each Group's Leader stamp Entries from its own clock. With several Gr
 
 ### Sessions are store-wide and follow the Slot of their last request
 A Session per Group would be simplest and would forget a retry that lands on a new owner after a move. A single Session table in the Meta Group would put it in every write's path. So ids come from the Meta Group, each data Group keeps its own record of the Sessions it has served, and a record moves with the Slot its last request touched. A client sends one request at a time, so that is the only request a retry can be for.
+
+### The Coordinator Group is one of the Groups involved, and begins in its own Log
+The decision of a Transaction across Groups could live in the Meta Group, or travel with the lowest key's Slot. The Meta Group commits about 1,400 writes a second here and already carries the table, Sessions and Store time; it would cap every Transaction and stop them all when it stops. A record that travels with a Slot only helps if a Group can disappear, and none can. So the Group that owns the lowest key decides, in a table of its own. Its first step is a begin Entry, one more Committed write per Transaction, so that its Leader drives the steps and a new Leader can always finish them. Without it, "no record" would have to mean abort for a Transaction whose prepares had been sent, and that abort would have to be remembered for ever.
+
+### One version per Transaction, kept rising by a per-Slot offset
+Across Groups there is no one index. Each key could take its own Group's version, which changes the answer's shape and ends "one Transaction, one version". The Meta Group could hand out a number, which puts it in every Transaction's path. So every key takes the highest version the Groups offered, and a Group whose own index is behind raises a per-Slot offset so that its later versions stay above. Raising the Slot's Epoch instead would use up its 16 bits within minutes. The cost: a version is no longer exactly an Entry's index.
+
+### The older Transaction wins, and a retry keeps its age
+A Transaction that meets a Lock could be refused at once, which lets two keep refusing each other, or all could prepare in one key order, which makes prepares one after another. So each has an age, the younger gives way, and only a younger one ever waits. Age is the Store time on the begin Entry, then the Session id: coarse, but one order every Group agrees on with no extra call. A Transaction that loses is told its age and sends it back, so it can't lose for ever. The store has to trust that number.
