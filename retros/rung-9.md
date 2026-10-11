@@ -1,6 +1,6 @@
 # Rung 9 retro: the Leaderless variant
 
-Status: **stages 9a and 9b done and approved. Stage 9c done, waiting for approval.** Rung 9 is built in three stages (A§13.1). This file has a part per stage, and the verdict for the whole Rung at the end.
+Status: **all three stages done and approved.** Rung 9 is built in three stages (A§13.1). This file has a part per stage, and the verdict for the whole Rung at the end.
 
 Stage 9a in one paragraph: a second store with no Leader, in which a key is a set of strings kept on three Home Nodes of five, a write is acknowledged when W Nodes have it, and a Node that isn't a Home Node stands in for one that can't be reached. With two Nodes cut off from three, the consistent store of Rung 8 gets 19% of its usual work done and the Leaderless variant at W=1 R=1 gets 92% done. With sets where add wins, 4,500 simulated runs lose no Acknowledged add. It does not yet always end Converged: that is stage 9b.
 
@@ -244,7 +244,7 @@ W=1 R=1 harness/partition.sh leaderless              # LWW=1 for last-write-wins
 
 ## Verdict (9c)
 
-Done, waiting for approval.
+Done and approved by the user.
 
 # Rung 9 verdict
 
