@@ -104,3 +104,47 @@ func TestDecisionInTheLogSurvives(t *testing.T) {
 		t.Errorf("only %d Transactions across Groups committed in 10 runs", committed)
 	}
 }
+
+// readLocked is rung8Store with one shortcut left in: a Locked key can be
+// read.
+var readLocked = sharded(func(s *rungtest.ShardedStore) {
+	s.Workload.TxnPercent = 30
+	s.Transactions.On = true
+	s.Transactions.ReadLocked = true
+})
+
+// Rung 8, "Exposed": a Locked key that can still be read. The client is
+// told a Transaction committed as soon as the Coordinator Group has decided,
+// and another Group may not have heard yet. A read of its key in between
+// gets the old value: a Stale read. No Fault is needed.
+func TestReadableLockIsExposed(t *testing.T) {
+	for _, seed := range []uint64{1, 15, 17} {
+		if r := rungtest.RunSharded(readLocked, shardedScenario(t, "no-moves"), seed); r.Linearizable {
+			t.Errorf("seed %d: expected a History that isn't Linearizable, got %v", seed, r)
+		}
+		if r := rungtest.RunSharded(rung8Store, shardedScenario(t, "no-moves"), seed); !r.Passed() {
+			t.Errorf("with Locked keys unreadable: %v %v", r, r.Diverged)
+		}
+	}
+}
+
+// noOffset is rung8Store with another shortcut left in: a Group that is
+// given a version above its own does nothing about it.
+var noOffset = sharded(func(s *rungtest.ShardedStore) {
+	s.Workload.TxnPercent = 30
+	s.Transactions.On = true
+	s.Transactions.NoOffset = true
+})
+
+// Rung 8, "Exposed": a version with no offset. A Transaction's keys all get
+// the highest version any of its Groups offered. In a Group whose Log is
+// shorter, the next write to such a key gets a lower version than the key
+// already had, so versions go down and a compare-and-set made against the
+// old version can succeed against the wrong value. Every run shows it.
+func TestVersionWithNoOffsetIsExposed(t *testing.T) {
+	for seed := uint64(1); seed <= 3; seed++ {
+		if r := rungtest.RunSharded(noOffset, shardedScenario(t, "no-moves"), seed); r.Linearizable {
+			t.Errorf("seed %d: expected a History that isn't Linearizable, got %v", seed, r)
+		}
+	}
+}
