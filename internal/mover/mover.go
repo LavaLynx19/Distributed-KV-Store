@@ -182,6 +182,13 @@ func (a *Agent) slot(env Env, g shard.GroupID, term core.Term, slot shard.Slot, 
 			cp = copyState{term: term, epoch: info.Epoch} // start from the beginning
 		}
 		if cp.done {
+			// A Slot with Locked keys isn't frozen: look again shortly
+			// (A§12.7).
+			held := 0
+			env.WithMachine(g, func(m *shardfsm.Machine) { held = m.LockedIn(slot) })
+			if held > 0 {
+				return
+			}
 			// Once the freeze is Committed the Slot is refusing its
 			// clients, so don't wait for the next look: send the rest now.
 			wait()

@@ -70,7 +70,12 @@ func (c *Cluster) applied(id core.NodeID, index core.Index, m sim.Machine) {
 	if index <= c.owned[g].index {
 		return
 	}
-	if f := m.(*shardfsm.Machine).LastFinished(); f.OK {
+	if f := m.(*shardfsm.Machine).LastFinished(); len(f.Began) > 0 {
+		if c.txnGroups == nil {
+			c.txnGroups = map[shardfsm.TxnID][]shard.GroupID{}
+		}
+		c.txnGroups[f.ID] = f.Began
+	} else if f.OK {
 		if c.txnEnds == nil {
 			c.txnEnds = map[shardfsm.TxnID]map[shard.GroupID][]bool{}
 		}

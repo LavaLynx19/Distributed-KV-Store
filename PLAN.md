@@ -111,9 +111,9 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P8a.2 Expose: a driver that crashes between two finishes leaves a Transaction half-committed; so does a client's retry through a second Node → §P8
 - [x] P8a.3 Expose: a version that goes backwards (now); a Stale read of a Locked key (after P8a.4: with the decision in memory the client is answered only after every finish, so the read can't be told apart) → §P8
 - [x] P8a.4 Fix: begin, decision and confirmed Entries in the Coordinator Group; its Leader drives, a new Leader carries on, abort after a bound (A§12.2, A§12.4) → §P8
-- [ ] P8a.5 Fix: Locked keys ask the Coordinator Group, wait, then `locked`; old Locks are asked about; a Move waits for a Slot's Locks (A§12.3, A§12.7) → §P8
-- [ ] P8a.6 The per-Slot version offset (A§12.6), built in P8a.1: its regression seeds from P8a.3, and Moves resetting it → §P8
-- [ ] P8a.7 Stage 8a suite with the verdicts of A§12.9, crashes between every pair of steps, and the 8a part of `retros/rung-8.md` → §P8
+- [x] P8a.5 Fix: Locked keys ask the Coordinator Group, wait, then `locked`; old Locks are asked about; a Move waits for a Slot's Locks (A§12.3, A§12.7) → §P8
+- [x] P8a.6 The per-Slot version offset (A§12.6), built in P8a.1: its regression seeds from P8a.3, and Moves resetting it → §P8
+- [x] P8a.7 Stage 8a suite with the verdicts of A§12.9, crashes between every pair of steps, and the 8a part of `retros/rung-8.md` → §P8
 - [ ] P8b.1 Naive conflicts: Transactions wait for each other's Locks with no order and no bound. Expose: two Transactions that never decide → §P8
 - [ ] P8b.2 Fix: age, older wins, `txn_conflict` carrying the age, the client's retry (A§12.5) → §P8
 - [ ] P8b.3 Measure a Move stalled behind a slow Transaction; then Moves abort undecided Transactions (A§12.7) → §P8

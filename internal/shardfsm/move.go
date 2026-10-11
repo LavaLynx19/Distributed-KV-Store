@@ -122,6 +122,10 @@ func (m *Machine) applyMove(payload []byte) fsm.Response {
 			return ok
 		case !info.Serves() || info.Epoch != st.Epoch:
 			return refused
+		case m.LockedIn(st.Slot) > 0:
+			// A Lock is not carried by a Move: the Slot stays until the
+			// Transactions that hold its keys are decided (A§12.7).
+			return fsm.Response{Status: fsm.StatusLocked}
 		}
 		info.Status = Frozen
 
@@ -470,7 +474,7 @@ func (m *Machine) Capture() func() []byte {
 		b = binary.AppendUvarint(b, uint64(txns.Len()))
 		txns.Ascend("", "", func(id string, p prepared) bool {
 			b = append(b, id...) // always 16 bytes
-			b = appendBytes(b, TxnStep{op: opPrepare, Writes: p.writes, Stamp: p.stamp}.Encode())
+			b = appendBytes(b, TxnStep{op: opPrepare, Coord: p.coord, Writes: p.writes, Stamp: p.stamp}.Encode())
 			b = binary.AppendUvarint(b, uint64(len(p.keys)))
 			for _, k := range p.keys {
 				b = appendBytes(b, []byte(k))
@@ -534,7 +538,7 @@ func (m *Machine) Restore(data []byte) error {
 			if err != nil {
 				return err
 			}
-			p := prepared{writes: step.Writes, stamp: step.Stamp}
+			p := prepared{coord: step.Coord, writes: step.Writes, stamp: step.Stamp}
 			for range r.count() {
 				p.keys = append(p.keys, string(r.bytes()))
 			}

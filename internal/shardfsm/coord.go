@@ -51,6 +51,9 @@ type CoordStep struct {
 	Commit  bool
 	Version uint64
 	Failed  []fsm.Item
+	// Offers, on a decision to commit, are the versions the other Groups
+	// offered in the prepares the decision counts.
+	Offers []Offer
 
 	// For a confirmation: the Group that has finished.
 	Group shard.GroupID
@@ -61,9 +64,15 @@ func TxnBeginStep(id TxnID, parts []Part, stamp int64, register bool) CoordStep 
 	return CoordStep{op: opTxnBegin, ID: id, Parts: parts, Stamp: stamp, Register: register}
 }
 
+// Offer is the version a Group offered when it prepared a Transaction.
+type Offer struct {
+	Group   shard.GroupID
+	Version uint64
+}
+
 // DecideStep records a Transaction's outcome.
-func DecideStep(id TxnID, commit bool, version uint64, failed []fsm.Item) CoordStep {
-	return CoordStep{op: opDecide, ID: id, Commit: commit, Version: version, Failed: failed}
+func DecideStep(id TxnID, commit bool, version uint64, offers []Offer, failed []fsm.Item) CoordStep {
+	return CoordStep{op: opDecide, ID: id, Commit: commit, Version: version, Offers: offers, Failed: failed}
 }
 
 // ConfirmStep records that a Group has finished a Transaction.
@@ -71,9 +80,30 @@ func ConfirmStep(id TxnID, g shard.GroupID) CoordStep {
 	return CoordStep{op: opConfirm, ID: id, Group: g}
 }
 
-// OutcomeQuery is a read that asks a Coordinator Group what it decided.
-func OutcomeQuery(id TxnID) []byte {
-	return CoordStep{op: opOutcome, ID: id}.Encode()
+// OutcomeQuery is a read that asks a Coordinator Group what it decided. A
+// Group that asks about a Transaction it has prepared names itself, and is
+// told the offer of its own that the decision counted.
+func OutcomeQuery(id TxnID, asking shard.GroupID) []byte {
+	return CoordStep{op: opOutcome, ID: id, Group: asking}.Encode()
+}
+
+// EncodeOutcome packs the answer to an OutcomeQuery.
+func EncodeOutcome(s TxnState, resp fsm.Response, offer uint64) []byte {
+	return binary.AppendUvarint(appendBytes([]byte{byte(s)}, resp.Encode()), offer)
+}
+
+// DecodeOutcome unpacks the answer to an OutcomeQuery.
+func DecodeOutcome(b []byte) (TxnState, fsm.Response, uint64, error) {
+	if len(b) == 0 || b[0] < byte(TxnNone) || b[0] > byte(TxnRefused) {
+		return 0, fsm.Response{}, 0, errMalformed
+	}
+	r := &reader{b: b[1:]}
+	resp, err := fsm.DecodeResponse(r.bytes())
+	offer := r.uvarint()
+	if err != nil || r.bad || len(r.b) != 0 {
+		return 0, fsm.Response{}, 0, errMalformed
+	}
+	return TxnState(b[0]), resp, offer, nil
 }
 
 // TxnState is where a Transaction stands in its Coordinator Group.
@@ -118,6 +148,17 @@ type coordinated struct {
 	// outcome is the client's answer, encoded, once decided.
 	outcome   []byte
 	confirmed []shard.GroupID
+	// offers are what the other Groups offered, if it committed.
+	offers []Offer
+}
+
+func (r coordinated) offer(g shard.GroupID) uint64 {
+	for _, o := range r.offers {
+		if o.Group == g {
+			return o.Version
+		}
+	}
+	return 0
 }
 
 func (r coordinated) open() bool { return !r.decided || len(r.confirmed) < len(r.parts) }
@@ -145,6 +186,18 @@ type Coordinated struct {
 	Commit    bool
 	Version   uint64
 	Confirmed []shard.GroupID
+	// Offers are the other Groups' offers the decision counted.
+	Offers []Offer
+}
+
+// Offer is the offer of Group g that the decision counted, or zero.
+func (c Coordinated) Offer(g shard.GroupID) uint64 {
+	for _, o := range c.Offers {
+		if o.Group == g {
+			return o.Version
+		}
+	}
+	return 0
 }
 
 // Coordinating lists the Transactions this Group coordinates that aren't
@@ -153,7 +206,7 @@ func (m *Machine) Coordinating() []Coordinated {
 	var out []Coordinated
 	m.openTxns.Ascend("", "", func(k string, _ struct{}) bool {
 		r, _ := m.coord.Get(k)
-		c := Coordinated{ID: idOf(k), Parts: r.parts, Stamp: r.stamp, Decided: r.decided, Commit: r.commit, Version: r.version, Confirmed: r.confirmed}
+		c := Coordinated{ID: idOf(k), Parts: r.parts, Stamp: r.stamp, Decided: r.decided, Commit: r.commit, Version: r.version, Confirmed: r.confirmed, Offers: r.offers}
 		if p, held := m.txns.Get(k); held {
 			c.Own, c.OwnResp, _ = DecodeVote(p.answer)
 		}
@@ -186,7 +239,7 @@ func (m *Machine) applyCoord(index core.Index, payload []byte) []byte {
 			return EncodeState(TxnRefused, fsm.Response{Status: fsm.StatusWrongGroup})
 		}
 		own := st.Parts[0]
-		vote, resp, _ := DecodeVote(m.prepare(index, PrepareStep(st.ID, true, own.Conds, own.Writes, st.Stamp, st.Register)))
+		vote, resp, _ := DecodeVote(m.prepare(index, PrepareStep(st.ID, m.cfg.Group, true, own.Conds, own.Writes, st.Stamp, st.Register)))
 		switch {
 		case vote == VoteDone:
 			return EncodeState(TxnDecided, resp)
@@ -196,6 +249,10 @@ func (m *Machine) applyCoord(index core.Index, payload []byte) []byte {
 		rec = coordinated{parts: st.Parts[1:], stamp: st.Stamp}
 		m.coord = m.coord.Put(key, rec)
 		m.openTxns = m.openTxns.Put(key, struct{}{})
+		m.finished = Finished{ID: st.ID}
+		for _, p := range st.Parts {
+			m.finished.Began = append(m.finished.Began, p.Group)
+		}
 		return rec.state()
 
 	case opDecide:
@@ -216,6 +273,9 @@ func (m *Machine) applyCoord(index core.Index, payload []byte) []byte {
 			failed = append(slices.Clone(own.Items), failed...)
 		}
 		rec.decided, rec.commit, rec.version = true, st.Commit && vote == VoteYes, st.Version
+		if rec.commit {
+			rec.offers = st.Offers
+		}
 		switch {
 		case rec.commit:
 			rec.outcome = fsm.Response{Status: fsm.StatusOK, Version: st.Version}.Encode()
@@ -224,7 +284,7 @@ func (m *Machine) applyCoord(index core.Index, payload []byte) []byte {
 		default:
 			rec.outcome = fsm.Response{Status: fsm.StatusTxnConflict}.Encode()
 		}
-		m.finish(index, FinishStep(st.ID, true, rec.commit, st.Version))
+		m.finish(index, FinishStep(st.ID, m.cfg.Group, true, rec.commit, st.Version, own.Version))
 
 	case opConfirm:
 		if !known || !rec.decided || slices.Contains(rec.confirmed, st.Group) {
@@ -248,10 +308,32 @@ func (m *Machine) outcome(query []byte) []byte {
 	if err != nil {
 		return fsm.Response{Status: fsm.StatusInvalid}.Encode()
 	}
-	if rec, known := m.coord.Get(st.ID.key()); known {
-		return rec.state()
+	rec, known := m.coord.Get(st.ID.key())
+	switch {
+	case !known:
+		return EncodeOutcome(TxnNone, fsm.Response{}, 0)
+	case !rec.decided:
+		return EncodeOutcome(TxnBegun, fsm.Response{}, 0)
 	}
-	return EncodeState(TxnNone, fsm.Response{})
+	resp, _ := fsm.DecodeResponse(rec.outcome)
+	return EncodeOutcome(TxnDecided, resp, rec.offer(st.Group))
+}
+
+func appendOffers(b []byte, offers []Offer) []byte {
+	b = binary.AppendUvarint(b, uint64(len(offers)))
+	for _, o := range offers {
+		b = binary.AppendUvarint(b, uint64(o.Group))
+		b = binary.AppendUvarint(b, o.Version)
+	}
+	return b
+}
+
+func (r *reader) offers() []Offer {
+	var offers []Offer
+	for range r.count() {
+		offers = append(offers, Offer{Group: shard.GroupID(r.uvarint()), Version: r.uvarint()})
+	}
+	return offers
 }
 
 func appendParts(b []byte, parts []Part) []byte {
@@ -308,7 +390,8 @@ func (s CoordStep) Encode() []byte {
 		b = append(b, flag(s.Commit))
 		b = binary.AppendUvarint(b, s.Version)
 		b = appendItems(b, s.Failed)
-	case opConfirm:
+		b = appendOffers(b, s.Offers)
+	case opConfirm, opOutcome:
 		b = binary.AppendUvarint(b, uint64(s.Group))
 	}
 	return b
@@ -328,7 +411,8 @@ func DecodeCoordStep(payload []byte) (CoordStep, error) {
 	case opDecide:
 		s.Commit, s.Version = r.byte() == 1, r.uvarint()
 		s.Failed = r.items()
-	case opConfirm:
+		s.Offers = r.offers()
+	case opConfirm, opOutcome:
 		s.Group = shard.GroupID(r.uvarint())
 	}
 	if r.bad || len(r.b) != 0 {
@@ -351,6 +435,7 @@ func appendCoord(b []byte, m *Machine) []byte {
 		for _, g := range rec.confirmed {
 			b = binary.AppendUvarint(b, uint64(g))
 		}
+		b = appendOffers(b, rec.offers)
 		return true
 	})
 	return b
@@ -368,6 +453,7 @@ func (m *Machine) restoreCoord(r *reader) {
 		for range r.count() {
 			rec.confirmed = append(rec.confirmed, shard.GroupID(r.uvarint()))
 		}
+		rec.offers = r.offers()
 		m.coord = m.coord.Put(k, rec)
 		if rec.open() {
 			m.openTxns = m.openTxns.Put(k, struct{}{})

@@ -24,6 +24,10 @@ type Transactions struct {
 	ReadLocked bool
 	// NoOffset is another (shardfsm.Config.NoOffset).
 	NoOffset bool
+	// NoAsking leaves a Group that has Locked keys waiting to be told the
+	// outcome, never asking for it. It exists so that the Locks this
+	// leaves behind stay reproducible.
+	NoAsking bool
 }
 
 // part is one Group's share of a Transaction.
@@ -34,9 +38,12 @@ type part struct {
 }
 
 const (
-	txnEvery    = 2   // how often a Node looks at the Transactions its Groups coordinate
-	txnAskAgain = 40  // how long it waits for an answer before sending a step again
-	txnGiveUp   = 400 // how long a Leader waits for every Group's answer before it aborts
+	txnEvery     = 2   // how often a Node looks at the Transactions its Groups coordinate
+	txnAskAgain  = 40  // how long it waits for an answer before sending a step again
+	txnGiveUp    = 400 // how long a Leader waits for every Group's answer before it aborts
+	lockAskAfter = 30  // how old a Lock is before its Group asks what was decided
+	lockAskAgain = 6   // how soon it asks again while a request is waiting
+	lockWait     = 12  // how long a request for a Locked key waits before it is refused
 )
 
 // split divides a Transaction between the Groups the table gives for its
@@ -96,10 +103,19 @@ func (c *Cluster) transact(n int, cmd fsm.Command, done func(Outcome, fsm.Respon
 
 	// tell sends every Group the decision, each until it answers, and
 	// calls then when all have.
+	type answer struct {
+		vote shardfsm.Vote
+		resp fsm.Response
+	}
+	answers := make([]*answer, len(parts))
 	tell := func(commit bool, version uint64, then func()) {
 		left := len(parts)
 		for i, p := range parts {
-			payload := shardfsm.FinishStep(id, i == 0, commit, version).Encode()
+			offer := uint64(0)
+			if a := answers[i]; a != nil && a.vote == shardfsm.VoteYes {
+				offer = a.resp.Version
+			}
+			payload := shardfsm.FinishStep(id, parts[0].group, i == 0, commit, version, offer).Encode()
 			var send func()
 			send = func() {
 				if !alive() {
@@ -119,11 +135,6 @@ func (c *Cluster) transact(n int, cmd fsm.Command, done func(Outcome, fsm.Respon
 		}
 	}
 
-	type answer struct {
-		vote shardfsm.Vote
-		resp fsm.Response
-	}
-	answers := make([]*answer, len(parts))
 	decided := false
 	decide := func() {
 		if decided || !alive() {
@@ -184,7 +195,7 @@ func (c *Cluster) transact(n int, cmd fsm.Command, done func(Outcome, fsm.Respon
 	}
 	for i, p := range parts {
 		build := func(storeTime int64) []byte {
-			return shardfsm.PrepareStep(id, i == 0, p.conds, p.writes, storeTime, cmd.Register).Encode()
+			return shardfsm.PrepareStep(id, parts[0].group, i == 0, p.conds, p.writes, storeTime, cmd.Register).Encode()
 		}
 		c.ask(n, p.group, false, build, func(o Outcome, raw []byte) {
 			vote, resp, err := shardfsm.DecodeVote(raw)
@@ -208,14 +219,8 @@ func (c *Cluster) begin(n int, cmd fsm.Command, done func(Outcome, fsm.Response)
 	id := shardfsm.TxnID{Session: cmd.Session, Seq: cmd.Seq}
 	split := split(nd.table, cmd)
 	parts := make([]shardfsm.Part, len(split))
-	if c.txnGroups == nil {
-		c.txnGroups = map[shardfsm.TxnID][]shard.GroupID{}
-	}
 	for i, p := range split {
 		parts[i] = shardfsm.Part{Group: p.group, Conds: p.conds, Writes: p.writes}
-		if !slices.Contains(c.txnGroups[id], p.group) {
-			c.txnGroups[id] = append(c.txnGroups[id], p.group)
-		}
 	}
 	lead := parts[0].Group
 
@@ -225,15 +230,16 @@ func (c *Cluster) begin(n int, cmd fsm.Command, done func(Outcome, fsm.Response)
 			if !nd.up || nd.boots != boot {
 				return
 			}
-			query := shardfsm.OutcomeQuery(id)
+			query := shardfsm.OutcomeQuery(id, 0)
 			c.ask(n, lead, true, func(int64) []byte { return query }, func(o Outcome, raw []byte) {
-				if o != Answered {
+				state, resp, _, err := shardfsm.DecodeOutcome(raw)
+				if o != Answered || err != nil {
 					// The Transaction is under way: whoever asks next must
 					// take its outcome as unknown.
 					done(Unknown, fsm.Response{})
 					return
 				}
-				settle(o, raw)
+				settle(o, shardfsm.EncodeState(state, resp))
 			})
 		})
 	}
@@ -297,6 +303,9 @@ func (c *Cluster) txnLoop(nd *node) {
 	if !c.NodeUp(nd.id) || !c.cfg.Transactions.On || c.cfg.Transactions.Memory {
 		return
 	}
+	if nd.coord == nil {
+		nd.coord = map[coordKey]*coordState{}
+	}
 	seen := map[coordKey]bool{}
 	for _, g := range nd.groups {
 		r := Replica(nd.id, g)
@@ -308,12 +317,62 @@ func (c *Cluster) txnLoop(nd *node) {
 			seen[key] = true
 			c.coordinate(nd, g, t, key)
 		}
+		for _, h := range c.machine(r).Holding() {
+			if c.cfg.Transactions.NoAsking {
+				break
+			}
+			key := coordKey{g, h.ID}
+			seen[key] = true
+			c.askOutcome(nd, g, h, key)
+		}
 	}
 	for key := range nd.coord {
 		if !seen[key] {
 			delete(nd.coord, key)
 		}
 	}
+	nd.nudged = false
+}
+
+// askOutcome has Group g, led from Node nd, ask the Coordinator Group of a
+// Transaction it has Locked keys for what was decided, once the Locks are
+// old enough or a request is waiting for them, and finish the Transaction
+// here if there is an answer (A§12.3).
+func (c *Cluster) askOutcome(nd *node, g shard.GroupID, h shardfsm.Held, key coordKey) {
+	now := c.S.Now()
+	st := nd.coord[key]
+	if st == nil {
+		st = &coordState{since: now, proposed: -txnAskAgain}
+		nd.coord[key] = st
+	}
+	switch {
+	case nd.nudged && now-st.proposed >= lockAskAgain:
+	case now-st.since >= lockAskAfter && now-st.proposed >= txnAskAgain:
+	default:
+		return
+	}
+	st.proposed = now
+	boot := nd.boots
+	query := shardfsm.OutcomeQuery(h.ID, g)
+	c.ask(nd.id, h.Coord, true, func(int64) []byte { return query }, func(o Outcome, raw []byte) {
+		state, resp, offer, err := shardfsm.DecodeOutcome(raw)
+		if o != Answered || err != nil || !nd.up || nd.boots != boot {
+			return
+		}
+		var finish shardfsm.TxnStep
+		switch state {
+		case shardfsm.TxnDecided:
+			finish = shardfsm.FinishStep(h.ID, h.Coord, false, resp.Status == fsm.StatusOK, resp.Version, offer)
+		case shardfsm.TxnNone:
+			// No record means abort: a begin is Committed before any
+			// prepare is sent.
+			finish = shardfsm.FinishStep(h.ID, h.Coord, false, false, 0, 0)
+		default:
+			return // not decided yet
+		}
+		c.LocksAsked++
+		c.S.Propose(Replica(nd.id, g), finish.Encode(), func(sim.Reply) {})
+	})
 }
 
 // coordinate takes the next step for one Transaction that Group g, led from
@@ -340,7 +399,7 @@ func (c *Cluster) coordinate(nd *node, g shard.GroupID, t shardfsm.Coordinated, 
 				continue
 			}
 			st.asked[p.Group] = now
-			finish := shardfsm.FinishStep(t.ID, false, t.Commit, t.Version).Encode()
+			finish := shardfsm.FinishStep(t.ID, g, false, t.Commit, t.Version, t.Offer(p.Group)).Encode()
 			c.ask(nd.id, p.Group, false, func(int64) []byte { return finish }, func(o Outcome, _ []byte) {
 				if o == Answered && nd.up && nd.boots == boot {
 					propose(shardfsm.ConfirmStep(t.ID, p.Group))
@@ -355,7 +414,7 @@ func (c *Cluster) coordinate(nd *node, g shard.GroupID, t shardfsm.Coordinated, 
 			continue
 		}
 		st.asked[p.Group] = now
-		prepare := shardfsm.PrepareStep(t.ID, false, p.Conds, p.Writes, t.Stamp, false).Encode()
+		prepare := shardfsm.PrepareStep(t.ID, g, false, p.Conds, p.Writes, t.Stamp, false).Encode()
 		c.ask(nd.id, p.Group, false, func(int64) []byte { return prepare }, func(o Outcome, raw []byte) {
 			vote, resp, err := shardfsm.DecodeVote(raw)
 			if o != Answered || err != nil || nd.boots != boot {
@@ -370,6 +429,7 @@ func (c *Cluster) coordinate(nd *node, g shard.GroupID, t shardfsm.Coordinated, 
 	commit := t.Own == shardfsm.VoteYes
 	version := t.OwnResp.Version
 	var failed []fsm.Item
+	var offers []shardfsm.Offer
 	conflict := false
 	for _, p := range t.Parts {
 		resp, voted := st.votes[p.Group]
@@ -381,6 +441,7 @@ func (c *Cluster) coordinate(nd *node, g shard.GroupID, t shardfsm.Coordinated, 
 			commit, conflict = false, true
 		case st.yes[p.Group]:
 			version = max(version, resp.Version)
+			offers = append(offers, shardfsm.Offer{Group: p.Group, Version: resp.Version})
 		case resp.Status == fsm.StatusVersionMismatch:
 			commit = false
 			failed = append(failed, resp.Items...)
@@ -394,7 +455,7 @@ func (c *Cluster) coordinate(nd *node, g shard.GroupID, t shardfsm.Coordinated, 
 	st.proposed = now
 	// A decision to abort over a conflict must not be reported as failed
 	// conditions, whatever this Group's own were.
-	propose(shardfsm.DecideStep(t.ID, commit, version, failed))
+	propose(shardfsm.DecideStep(t.ID, commit, version, offers, failed))
 }
 
 // MidTransaction lists the Nodes that are in the middle of a Transaction

@@ -149,6 +149,9 @@ type node struct {
 	// coord is what this Node remembers of the Transactions it is
 	// carrying on for Groups it leads (txn.go).
 	coord map[coordKey]*coordState
+	// nudged is set when a request found a key Locked in a Group this
+	// Node leads: its Locks are asked about at once.
+	nudged bool
 	// gossip is this Node's gossip, if the store uses it.
 	gossip *gossip.Node
 	// watch is how long this Node's gossip has thought each Node dead, and
@@ -179,6 +182,9 @@ type Cluster struct {
 	Locked, TxnConflict int
 	// TxnCommitted counts Transactions across Groups that committed.
 	TxnCommitted int
+	// LocksAsked counts the times a Group finished a Transaction on the
+	// answer to its own question, not on being told.
+	LocksAsked int
 	// MovesAsked counts the Moves requested, and MovesTaken those the Meta
 	// Group recorded the intent of.
 	MovesAsked, MovesTaken int
@@ -564,6 +570,10 @@ func (c *Cluster) rpcDelay() int64 { return rpcMin + c.S.Rand().Int64N(rpcMax-rp
 // definite refusal that changed nothing, or nothing known. If the reply is
 // lost, done is never called, and the client must time out.
 func (c *Cluster) Request(n int, cmd fsm.Command, done func(Outcome, fsm.Response)) {
+	c.request(n, cmd, done, false)
+}
+
+func (c *Cluster) request(n int, cmd fsm.Command, done func(Outcome, fsm.Response), waited bool) {
 	if !c.NodeUp(n) {
 		done(Refused, fsm.Response{})
 		return
@@ -622,6 +632,15 @@ func (c *Cluster) Request(n int, cmd fsm.Command, done func(Outcome, fsm.Respons
 			c.Moving++
 			done(Refused, resp)
 		case fsm.StatusLocked:
+			// The Group asks what was decided, and the request waits a
+			// little for the answer before it is refused (A§12.3).
+			if l, known := nd.leader[g]; known {
+				c.nodes[NodeOf(l)].nudged = true
+			}
+			if !waited && c.cfg.Transactions.On && !c.cfg.Transactions.Memory && !c.cfg.Transactions.NoAsking {
+				c.S.After(lockWait, func() { c.request(n, cmd, done, true) })
+				return
+			}
 			c.Locked++
 			done(Refused, resp)
 		default:

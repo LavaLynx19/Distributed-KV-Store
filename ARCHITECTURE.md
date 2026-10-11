@@ -549,19 +549,21 @@ A Transaction's id is its Session id and request number. Its **Coordinator Group
 
 Messages go Leader to Leader, name the Transaction and are repeated until answered. Every step may be applied twice without harm: a Group answers a step it has already taken the same way.
 
-**A prepare that arrives after the finish.** A prepare is sent again when no answer comes, and a copy can reach a Group after it has finished the Transaction and forgotten it. Taken as new, it would Lock the keys again, and the next finish would write the Transaction's values a second time, over whatever had been written since. So every Group that commits a Transaction records it in the Session's record, as it does a request of its own (§11.6), and answers no to a prepare numbered at or below what that record holds. The record moves with the Slot. This relies on a Session's record outliving any step still on its way. The decision lives in a table that belongs to the Group, not to a Slot, and is part of its Snapshot. A Move never carries it: no Group is ever dissolved, so the record stays reachable where it was written.
+**A prepare that arrives after the finish.** A prepare is sent again when no answer comes, and a copy can reach a Group after it has finished the Transaction and forgotten it. A Leader that has been replaced and doesn't know it can send one much later still. Taken as new, it would Lock the keys again, and the next finish would write the Transaction's values a second time, over whatever had been written since. So a yes carries the version the Group offered, which no two prepares share, the decision records the offer it counted from each Group, and a finish commits only the prepare that made that offer. A Group holding any other lets go and writes nothing. A Group that commits also notes the Transaction in the Session's record (§11.6), and turns away a prepare numbered at or below it at once; that saves Locking keys for nothing, and nothing depends on it, because a Session's record can be removed.
+
+**The same request under two Coordinator Groups.** A request whose first attempt was aborted can be sent again after a Move has given its lowest key to another Group, which takes it on as new. A Group that still holds the first attempt's Locks answers no to the second, and takes a finish only from the Coordinator Group whose prepare it holds.
 
 ### 12.3 Locks
 - A **Lock** covers one key for one Transaction. Clients can't take one.
 - A read, write, compare-and-set, scan or single-Group Transaction that touches a Locked key is not served from what the Group holds. The Group's Leader asks the Coordinator Group what was decided. If there is a decision, the Group commits its finish Entry first and then serves the request.
-- If the answer is "not decided yet", or none comes, the request waits a bounded time (*to settle*: about one election timeout) and is then refused with `locked`.
+- If the answer is "not decided yet", or none comes, the request waits a bounded time and is then refused with `locked`. In the Simulation it waits 12 units, about two round trips, and is tried once more; a client that is refused tries again as it would after `moving`.
 - The Coordinator Group answers the question as a Linearizable read. A Member that has been replaced as Leader may not have applied the begin Entry, and its "no record" would be wrong.
 - "No record" from the Coordinator Group means abort, and the Lock is released. This is safe because begin is Committed before any prepare is sent and a record is forgotten only after every Group confirmed. So a prepare that arrives late, after all that, Locks its keys only until the first question.
-- A Group's Leader also asks about every Lock older than a bound, whether or not a request is waiting, so no Lock outlives its Transaction.
+- A Group's Leader also asks about every Lock older than a bound (30 units in the Simulation), whether or not a request is waiting, so no Lock outlives its Transaction. The answer names the offer the decision counted (§12.2).
 
 ### 12.4 Crashes
 - Each step is an Entry. A new Leader of the Coordinator Group reads its table and carries on: prepares for a Transaction that has begun, finishes for one that is decided. A new Leader of another Group finds its Locks in its state and asks about them.
-- The Coordinator Group may decide abort at any time before it has decided commit. Its Leader does so when not every answer has come within a bound (*to settle*). A Group that says yes afterwards is sent the abort.
+- The Coordinator Group may decide abort at any time before it has decided commit. Its Leader does so when not every answer has come within a bound (400 units in the Simulation, a little more than a client waits for one attempt). A Group that says yes afterwards is sent the abort.
 - A client that loses its connection retries with the same request number. The Coordinator Group's Session record answers with the recorded outcome, or makes the retry wait while the Transaction is in flight. That record follows the Slot of the lowest key (§11.6), so it is still found after a Move.
 - **The limit.** A Coordinator Group that has lost its Majority can decide nothing, and the other Groups keep their Locks until its Members return or an operator runs Unsafe recovery. "Nothing stays undecided" holds while every Group involved has a Majority.
 
@@ -582,7 +584,7 @@ Messages go Leader to Leader, name the Transaction and are repeated until answer
 
 ### 12.7 Moves
 - Once the table shows an intent to move a Slot, its Group refuses new prepares for it, and a begin whose lowest key is in it.
-- **8a:** the Group freezes the Slot only when no key in it is Locked.
+- **8a:** the Group freezes the Slot only when no key in it is Locked. The freeze Entry itself is refused while one is, so the rule holds whoever proposes it.
 - **8b:** the Group asks the Coordinator Group of each Lock in the Slot to abort. A Transaction that had already committed is finished first. Then the Slot freezes. So a Move waits at most for commits already decided, and Transactions on a Slot being moved are refused with `txn_conflict` and retried.
 - A Move carries no Lock and no decision record. It carries Session records, with the outcome, as before.
 
@@ -593,7 +595,7 @@ Messages go Leader to Leader, name the Transaction and are repeated until answer
 
 ### 12.9 Verification
 - **Linearizability** over the whole store, with Transactions whose keys are in different Groups in every run (§8.2: such Histories stay small).
-- **Same outcome everywhere.** For every Transaction, every Group that took a step for it ends with the same outcome as the Coordinator Group's decision.
+- **Same outcome everywhere.** A Transaction that committed anywhere committed exactly once in every Group its begin named.
 - **Nothing left.** After Faults stop, no key is Locked and no Transaction is undecided; from 8b no record is left at all.
 - **Faults:** the Coordinator Group's Leader and each other Group's Leader crashed between every pair of steps, Partitions between Groups, and from 8b Moves and automation during Transactions.
 - **Client signals** add: requests refused `locked` and `txn_conflict`, attempts per Transaction, and the longest time a key stayed Locked.
