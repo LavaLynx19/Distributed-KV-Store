@@ -42,6 +42,11 @@ func Run(store Store, sc Scenario, seed uint64) Report {
 	s.Run(faultsEnd + cooldown)
 	rep := Judge(s, h, store.Mode)
 	rep.Scenario, rep.Seed = sc.Name, seed
+	for _, c := range h.Calls {
+		if c.Result == Done && c.Begin >= warmup && c.Begin < faultsEnd {
+			rep.WindowAnswered++
+		}
+	}
 	return rep
 }
 

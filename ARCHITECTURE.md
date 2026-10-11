@@ -656,10 +656,11 @@ A key holds a **set of strings**. The routes are those of §7.1 and they mean so
 - If a Home Node can't be reached, the write is given to the next Node on the ring that isn't one, as a **Hint**: that Node keeps it for the Home Node, on disk, and counts toward W.
 - If fewer than W Nodes in all have it in time, the client is told `too_few_nodes`. The write may be on some of them: the outcome is unknown, and sending it again is safe (§13.3).
 - A Node holding a Hint keeps trying to deliver it to the Home Node, and drops it once that Node has it on disk.
-- A write that reached W is still sent to the Home Nodes that hadn't answered, and sent again for a while if they don't.
+- A write that reached W is still sent to the Home Nodes that hadn't answered, and sent again for a while if they don't. Each of them gets a stand-in too: W says when to answer the client, not how many Nodes the write is meant for.
+- A write that brings a Node nothing new costs it no write to disk. A Home Node that has been away is sent what it missed many times over.
 
 ### 13.5 Two writes at once
-- **First, last-write-wins.** Each key has a counter. A write gives the key's whole set a number one above the highest the Node has seen for it, with the Node's id to break ties, and the higher number replaces the lower wherever they meet. Writes on one side of a Partition order correctly. Of two made on different sides, one side's whole set wins and the other's additions are gone, though their clients were told they succeeded.
+- **First, last-write-wins.** Each key has a counter. A write gives the key's whole set a number one above the highest the Node has seen for it, with the Node's id to break ties, and the higher number replaces the lower wherever they meet. A write reads the set, changes it and writes it back whole. Of two made on different sides of a Partition, one side's whole set wins and the other's additions are gone, though their clients were told they succeeded. Two made at the same moment on a healthy store do the same to each other.
 - **Then, a set where add wins.** Each addition is marked with the Node that took it and that Node's count for the key. A key keeps, beside its elements and their marks, a record of every mark it has seen. Two copies of a key are joined by keeping an element if either has a mark for it that the other hasn't seen, or both have. A remove deletes the marks it has seen and no others, so an addition made elsewhere at the same time survives it.
 - That record of marks seen is a version vector. It is what tells "never added here" from "added and removed", and it must outlive the elements (§13.7).
 
@@ -686,9 +687,10 @@ A write, a Hint, and what an Exchange brings are on disk before they count or ar
 ### 13.11 Verification
 The linearizability check doesn't apply. A run is judged on:
 - **Converged.** After Faults stop and a quiet period, every Home Node of every key holds the same set, and no Hint is left.
-- **No Acknowledged add lost.** Every element a client was told was added is in the final set, unless a remove of it was acknowledged that began after that add was acknowledged.
-- **Nothing comes back.** An element whose remove was acknowledged, and for which no add began after that remove began, is not in the final set.
-- **Availability,** a number: the share of requests answered while the Partition lasts, for this store at each W and R and for the consistent store of Rung 8 (5 Nodes, 3 Groups) under the same scenario and seeds.
+- **No Acknowledged add lost.** Every addition a client was told had succeeded is in the final set, unless a remove took it out. This is checked exactly: the Simulation is told the mark each addition was given and the marks each remove had seen.
+- **Nothing comes back.** No addition that an Acknowledged remove took out is in the final set.
+- For last-write-wins, which has no marks, both are judged by the times of the requests: an add is lost if its element is gone and no remove of it ended after the add began.
+- **Availability,** a number: the requests answered that began while the Partition lasted, as a share of those answered over the same time, from the same seeds, with no Fault. It is given for this store at each W and R and for the consistent store of Rung 8 (5 Nodes, 3 Groups). The share of requests answered would not do: a client kept waiting asks for little, and so fails little.
 - **Stale reads,** a rate: reads that missed an add acknowledged before the read began. Nothing here promises there are none.
 
 The comparison is the Rung's result: availability during the Partition, against Acknowledged adds lost, side by side.

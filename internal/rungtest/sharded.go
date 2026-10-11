@@ -484,3 +484,17 @@ var Rung8 = []ShardedScenario{
 		c.S.At(from+50, watch)
 	}},
 }
+
+// LongPartition cuts two Nodes off from the other three for the whole of
+// the Fault time. It is the run the consistent store and the Leaderless
+// variant are compared on (A§13.11).
+var LongPartition = ShardedScenario{"long-partition", func(c *cluster.Cluster, from, to int64) {
+	c.S.At(from, func() {
+		nodes := c.NodeIDs()
+		c.S.Rand().Shuffle(len(nodes), func(i, j int) { nodes[i], nodes[j] = nodes[j], nodes[i] })
+		c.PartitionNodes(nodes[:2], nodes[2:])
+	})
+}}
+
+// FaultWindow is when a scenario's Faults begin and when they are repaired.
+func FaultWindow() (from, to int64) { return warmup, warmup + faultSpan }

@@ -123,13 +123,13 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 
 ### Phase 9 — Rung 9: the Leaderless variant (§P9)
 - [x] P9.0 Confirm or replace the A§10 sketch; design the checks; write A§13 and Decision Log entries → §P9
-- [ ] P9a.1 The Leaderless core, naive: Home Nodes on a ring, writes to W with Hints that are kept and never delivered, reads joining R answers, last-write-wins by a counter per key, on disk; run in the Simulation with a workload of adds, removes and reads (A§13.2–13.5, A§13.10) → §P9
-- [ ] P9a.2 The four verdicts and the stale-read rate (A§13.11) → §P9
-- [ ] P9a.3 Expose: last-write-wins loses Acknowledged adds under a Partition → §P9
-- [ ] P9a.4 Expose: Hints never delivered leave Home Nodes apart after healing → §P9
-- [ ] P9a.5 Fix: the set where add wins (A§13.5) → §P9
-- [ ] P9a.6 Fix: Hints delivered; writes sent on and retried (A§13.4) → §P9
-- [ ] P9a.7 Stage 9a suite at W=1 R=1, W=2 R=2 and W=3 R=1; availability beside the consistent store of Rung 8 under the same scenarios; the 9a part of `retros/rung-9.md` → §P9
+- [x] P9a.1 The Leaderless core, naive: Home Nodes on a ring, writes to W with Hints that are kept and never delivered, reads joining R answers, last-write-wins by a counter per key, on disk; run in the Simulation with a workload of adds, removes and reads (A§13.2–13.5, A§13.10) → §P9
+- [x] P9a.2 The four verdicts and the stale-read rate (A§13.11) → §P9
+- [x] P9a.3 Expose: last-write-wins loses Acknowledged adds under a Partition → §P9
+- [x] P9a.4 Expose: Hints never delivered leave Home Nodes apart after healing → §P9
+- [x] P9a.5 Fix: the set where add wins (A§13.5) → §P9
+- [x] P9a.6 Fix: Hints delivered; writes sent on and retried (A§13.4) → §P9
+- [x] P9a.7 Stage 9a suite at W=1 R=1, W=2 R=2 and W=3 R=1; availability beside the consistent store of Rung 8 under the same scenarios; the 9a part of `retros/rung-9.md` → §P9
 - [ ] P9b.1 Expose: with no Exchange, a Home Node away longer than the retries last stays behind → §P9
 - [ ] P9b.2 Fix: the Exchange (A§13.6) → §P9
 - [ ] P9b.3 Expose: a remove forgotten at once lets an element come back; then keep the record (A§13.7) → §P9

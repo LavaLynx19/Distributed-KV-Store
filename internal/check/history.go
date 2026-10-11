@@ -229,3 +229,19 @@ func show(it fsm.Item, exists bool) string {
 	}
 	return fmt.Sprintf("%q v%d", it.Value, it.Version)
 }
+
+// Share counts the requests that began at or after from and before to, and
+// how many of them got a definite answer. It is how available the store
+// was to its clients over that time.
+func (h *History) Share(from, to int64) (answered, begun int) {
+	for _, c := range h.calls {
+		if c.start < from || c.start >= to {
+			continue
+		}
+		begun++
+		if c.done && c.result == Answered {
+			answered++
+		}
+	}
+	return answered, begun
+}

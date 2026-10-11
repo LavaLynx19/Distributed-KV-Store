@@ -25,6 +25,11 @@ type Report struct {
 	// count those that began during a Partition.
 	Requests, Answered       int
 	CutRequests, CutAnswered int
+	// WindowAnswered counts the requests answered that began in the time
+	// set aside for Faults, whether or not this run had any. Set beside
+	// the same count from a run with no Faults, it says how much of the
+	// store's work went on through them.
+	WindowAnswered int
 	// Reads counts reads that were answered, and Stale those that missed
 	// an element whose addition a client had been told of before the read
 	// began and which nothing could have removed.
