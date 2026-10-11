@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"cmp"
 	"fmt"
 	"slices"
 
@@ -69,6 +70,15 @@ func (c *Cluster) applied(id core.NodeID, index core.Index, m sim.Machine) {
 	if index <= c.owned[g].index {
 		return
 	}
+	if f := m.(*shardfsm.Machine).LastFinished(); f.OK {
+		if c.txnEnds == nil {
+			c.txnEnds = map[shardfsm.TxnID]map[shard.GroupID][]bool{}
+		}
+		if c.txnEnds[f.ID] == nil {
+			c.txnEnds[f.ID] = map[shard.GroupID][]bool{}
+		}
+		c.txnEnds[f.ID][g] = append(c.txnEnds[f.ID][g], f.Commit)
+	}
 	now := ownership{index: index}
 	for _, info := range m.(*shardfsm.Machine).Slots() {
 		now.serves = append(now.serves, info.Serves())
@@ -127,6 +137,9 @@ func (c *Cluster) EndState() []string {
 			diffs = append(diffs, fmt.Sprintf("Group %d: %s", g, d))
 		}
 		if first != nil {
+			if n := first.Locked(); n > 0 {
+				diffs = append(diffs, fmt.Sprintf("Group %d: %d keys still Locked, for Transactions %v", g, n, first.Prepared()))
+			}
 			for s, info := range first.Slots() {
 				if info.Serves() {
 					serving[shard.Slot(s)] = append(serving[shard.Slot(s)], g)
@@ -245,4 +258,45 @@ func (c *Cluster) membersSettled(table shard.Table) []string {
 		}
 	}
 	return diffs
+}
+
+// HalfCommitted lists the Transactions across Groups that didn't end the
+// same way everywhere (A§12.9): committed in one Group and not in another
+// it was put to, or committed more than once in a Group.
+func (c *Cluster) HalfCommitted() []string {
+	ids := make([]shardfsm.TxnID, 0, len(c.txnEnds))
+	for id := range c.txnEnds {
+		ids = append(ids, id)
+	}
+	slices.SortFunc(ids, func(a, b shardfsm.TxnID) int {
+		if a.Session != b.Session {
+			return cmp.Compare(a.Session, b.Session)
+		}
+		return cmp.Compare(a.Seq, b.Seq)
+	})
+	var out []string
+	for _, id := range ids {
+		commits := map[shard.GroupID]int{}
+		total := 0
+		for g, ends := range c.txnEnds[id] {
+			for _, commit := range ends {
+				if commit {
+					commits[g]++
+					total++
+				}
+			}
+		}
+		if total == 0 {
+			continue
+		}
+		for _, g := range c.txnGroups[id] {
+			switch n := commits[g]; {
+			case n == 0:
+				out = append(out, fmt.Sprintf("Transaction %d/%d committed elsewhere and not in Group %d", id.Session, id.Seq, g))
+			case n > 1:
+				out = append(out, fmt.Sprintf("Transaction %d/%d committed %d times in Group %d", id.Session, id.Seq, n, g))
+			}
+		}
+	}
+	return out
 }

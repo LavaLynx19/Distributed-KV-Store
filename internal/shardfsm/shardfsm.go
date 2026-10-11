@@ -115,6 +115,10 @@ type Machine struct {
 	// each Transaction it has prepared (A§12.3).
 	locks tree.Tree[TxnID]
 	txns  tree.Tree[prepared]
+	// finished is the Transaction the last Entry applied finished here,
+	// if it did. It is for whoever watches the Machine, and no part of
+	// the Group's state.
+	finished Finished
 }
 
 // New returns a Machine owning cfg.Owned.
@@ -197,6 +201,7 @@ func (m *Machine) slotsOf(cmd fsm.Command) []shard.Slot {
 
 // Apply executes a Committed Entry and returns its encoded fsm.Response.
 func (m *Machine) Apply(e core.Entry) []byte {
+	m.finished = Finished{}
 	if e.Kind != core.EntryCommand {
 		return nil
 	}

@@ -116,6 +116,7 @@ func RunSharded(store ShardedStore, sc ShardedScenario, seed uint64) Report {
 	rep.Diverged = append(rep.Diverged, c.GossipAgrees()...)
 	rep.TableLags, rep.GossipSent = c.TableLags, c.GossipSent
 	rep.MovedAt = c.MovedAt
+	rep.HalfCommitted = c.HalfCommitted()
 	rep.Replacements, rep.Drops = len(c.Replacements), len(c.Drops)
 	for _, r := range c.Replacements {
 		if r.Running {
@@ -418,5 +419,64 @@ var Rung7c = []ShardedScenario{
 			c.S.After(350+c.S.Rand().Int64N(100), step)
 		}
 		c.S.At(from+1000, step)
+	}},
+}
+
+// crashes stops a Node every so often and starts it again, between from
+// and to.
+func crashes(c *cluster.Cluster, from, to int64) {
+	var step func()
+	step = func() {
+		if c.S.Now() >= to {
+			return
+		}
+		nodes := c.NodeIDs()
+		n := nodes[c.S.Rand().IntN(len(nodes))]
+		c.CrashNode(n)
+		c.S.After(100+c.S.Rand().Int64N(250), func() { c.RestartNode(n) })
+		c.S.After(250+c.S.Rand().Int64N(300), step)
+	}
+	c.S.At(from+50, step)
+}
+
+// Rung8 lists the scenarios for Transactions across Groups (A§12.9). None
+// of them moves a Slot.
+var Rung8 = []ShardedScenario{
+	{"crashes", crashes},
+
+	// The network keeps splitting into two sides.
+	{"partitions", func(c *cluster.Cluster, from, to int64) {
+		var step func()
+		step = func() {
+			if c.S.Now() >= to {
+				return
+			}
+			nodes := c.NodeIDs()
+			c.S.Rand().Shuffle(len(nodes), func(i, j int) { nodes[i], nodes[j] = nodes[j], nodes[i] })
+			cut := 1 + c.S.Rand().IntN(2)
+			c.PartitionNodes(nodes[:cut], nodes[cut:])
+			c.S.After(150+c.S.Rand().Int64N(250), c.Heal)
+			c.S.After(400+c.S.Rand().Int64N(300), step)
+		}
+		c.S.At(from+50, step)
+	}},
+
+	// A Node that has told some Groups to commit a Transaction, and not
+	// yet heard from all of them, is stopped there and then.
+	{"stopped-mid-commit", func(c *cluster.Cluster, from, to int64) {
+		var watch func()
+		watch = func() {
+			if c.S.Now() >= to {
+				return
+			}
+			if n, ok := c.Finishing(); ok && c.S.Rand().IntN(4) == 0 {
+				c.CrashNode(n)
+				c.S.After(100+c.S.Rand().Int64N(200), func() { c.RestartNode(n) })
+				c.S.After(300+c.S.Rand().Int64N(200), watch)
+				return
+			}
+			c.S.After(1, watch)
+		}
+		c.S.At(from+50, watch)
 	}},
 }

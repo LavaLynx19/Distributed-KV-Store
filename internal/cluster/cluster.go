@@ -143,6 +143,9 @@ type node struct {
 	// boots counts the times the machine has stopped. What a Node was
 	// doing in memory before a stop is not carried on after it.
 	boots int
+	// finishing counts the Transactions this Node has decided to commit
+	// and not yet heard every Group finish (txn.go).
+	finishing int
 	// gossip is this Node's gossip, if the store uses it.
 	gossip *gossip.Node
 	// watch is how long this Node's gossip has thought each Node dead, and
@@ -191,6 +194,11 @@ type Cluster struct {
 	// two Groups served the same Slot by that measure (verdict.go).
 	owned     map[shard.GroupID]ownership
 	twoOwners string
+	// txnEnds is how each Transaction across Groups ended in each Group
+	// that prepared it, once per time it did, and txnGroups the Groups it
+	// was put to (txn.go).
+	txnEnds   map[shardfsm.TxnID]map[shard.GroupID][]bool
+	txnGroups map[shardfsm.TxnID][]shard.GroupID
 
 	// Replacements are the replacements the Meta Group took, and Drops the
 	// times a Node dropped a replica's data.
@@ -366,6 +374,7 @@ func (c *Cluster) CrashNode(n int) {
 	}
 	c.nodes[n].up = false
 	c.nodes[n].boots++
+	c.nodes[n].finishing = 0
 	c.nodes[n].mover.Reset()
 }
 

@@ -73,6 +73,14 @@ func (c *Cluster) transact(n int, cmd fsm.Command, done func(Outcome, fsm.Respon
 	alive := func() bool { return nd.up && nd.boots == boot }
 	id := shardfsm.TxnID{Session: cmd.Session, Seq: cmd.Seq}
 	parts := split(nd.table, cmd)
+	if c.txnGroups == nil {
+		c.txnGroups = map[shardfsm.TxnID][]shard.GroupID{}
+	}
+	for _, p := range parts {
+		if !slices.Contains(c.txnGroups[id], p.group) {
+			c.txnGroups[id] = append(c.txnGroups[id], p.group)
+		}
+	}
 
 	// tell sends every Group the decision, each until it answers, and
 	// calls then when all have.
@@ -147,7 +155,11 @@ func (c *Cluster) transact(n int, cmd fsm.Command, done func(Outcome, fsm.Respon
 		switch {
 		case commit:
 			c.TxnCommitted++
-			tell(true, version, func() { done(Answered, fsm.Response{Status: fsm.StatusOK, Version: version}) })
+			nd.finishing++
+			tell(true, version, func() {
+				nd.finishing--
+				done(Answered, fsm.Response{Status: fsm.StatusOK, Version: version})
+			})
 		case conflict:
 			c.TxnConflict++
 			tell(false, 0, func() {})
@@ -173,4 +185,15 @@ func (c *Cluster) transact(n int, cmd fsm.Command, done func(Outcome, fsm.Respon
 			decide()
 		})
 	}
+}
+
+// Finishing is a Node that has decided to commit a Transaction across
+// Groups and hasn't yet heard every Group finish it, if there is one.
+func (c *Cluster) Finishing() (n int, ok bool) {
+	for _, id := range c.NodeIDs() {
+		if nd := c.nodes[id]; nd.up && nd.finishing > 0 {
+			return id, true
+		}
+	}
+	return 0, false
 }

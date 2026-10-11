@@ -107,6 +107,18 @@ type prepared struct {
 	answer []byte
 }
 
+// Finished says how a Transaction ended in a Group that had prepared it.
+type Finished struct {
+	ID     TxnID
+	Commit bool
+	// OK is false when the last Entry finished no Transaction.
+	OK bool
+}
+
+// LastFinished is the Transaction the last Entry applied finished in this
+// Group, if it finished one the Group had prepared.
+func (m *Machine) LastFinished() Finished { return m.finished }
+
 // Locked reports how many keys are Locked in this Group.
 func (m *Machine) Locked() int { return m.locks.Len() }
 
@@ -238,6 +250,11 @@ func (m *Machine) finish(index core.Index, step TxnStep) fsm.Response {
 		m.locks = m.locks.Delete(name)
 	}
 	m.txns = m.txns.Delete(step.ID.key())
+	// A prepare that was told no for a failed condition is no part of a
+	// commit, whatever the finish says.
+	vote, _, _ := DecodeVote(p.answer)
+	step.Commit = step.Commit && vote == VoteYes
+	m.finished = Finished{ID: step.ID, Commit: step.Commit, OK: true}
 	if !step.Commit {
 		return ok
 	}
