@@ -1,6 +1,6 @@
 # Rung 8 retro: Transactions across Groups
 
-Status: **stage 8a done and approved. Stage 8b under way.** Rung 8 is built in two stages (A§12.1). This file has a part per stage, and the verdict for the whole Rung at the end.
+Status: **stage 8a done and approved. Stage 8b built and tested in the Simulation and in-process; its real runs and the numbers check are waiting for the user's go-ahead.** Rung 8 is built in two stages (A§12.1). This file has a part per stage, and the verdict for the whole Rung at the end.
 
 Stage 8a in one paragraph: a Transaction whose keys are in several Groups commits in all of them or none, with every step in the Log of its Coordinator Group. 5,400 simulated runs under crashes, Partitions and Moves committed 112,948 such Transactions with none half-committed, no History that isn't Linearizable, and nothing left Locked. Four shortcuts were shipped first and seen failing. Two bugs that none of the planned exposures would have shown were found by the suite and are described below. Nothing here has run as real processes yet: that is stage 8b.
 
@@ -97,3 +97,97 @@ Seeds kept as tests: decision in memory (stopped-mid-commit 66, 72, 89; crashes 
 ## Verdict (8a)
 
 Atomic under Coordinator and participant crashes, in the Simulation: yes, 5,400 runs. Nothing stays undecided: yes, while every Group has a Majority. Approved by the user.
+
+# Stage 8b: conflicts, Moves, forgetting, real Nodes
+
+Environment: as stage 8a, with Transactions over three keys so that they can span all three Groups, and clients that send an aborted Transaction again, with its age, up to five more times. The contention runs use 8 clients with half their requests Transactions.
+
+## Exposed: waiting with no order (P8b.1)
+
+100 seeds per cell, no Faults.
+
+| A Transaction that finds a key Locked | Keys | Runs failed | Committed | Aborted over a conflict | Clients that gave up | Requests never answered |
+|---|---|---|---|---|---|---|
+| Is refused at once (stage 8a) | 2 | 0 | 5,122 | 5,989 | 62 | 0 |
+| Waits, in no order | 2 | 0 | 5,302 | 0 | 0 | 0 |
+| Older wins | 2 | 0 | 5,053 | 638 | 0 | 3 |
+| Is refused at once | 3 | 0 | 4,084 | 14,592 | 597 | 0 |
+| Waits, in no order | 3 | **82** | 2,494 | 152 | 0 | 923 |
+| Older wins | 3 | 0 | 4,270 | 3,296 | 18 | 23 |
+
+- **Three keys, waiting in no order: 82 runs of 100 end with Transactions that are never decided.** One holds its keys in Group 2 and waits for Group 3, another the reverse. Their keys stay Locked and every client that touches them waits too.
+- **Two keys can't do it.** A Transaction's Coordinator Group owns its lowest key and Locks its own keys first, so each waits only for a key higher than one it holds, and no ring can close. Waiting with no order then beats everything: no aborts at all, and the most commits. The exposure the plan asked for ("two Transactions that never decide") doesn't exist with two keys; it took three Groups.
+- **Refusing at once, which stage 8a did, is the worst when keys are fought over:** more aborts than commits with two keys, and 597 Transactions given up after six attempts with three.
+
+## The fix (P8b.2–P8b.4)
+
+- **Older wins.** Age is the Store time the first attempt found, then the Session, then the request number. A prepare that finds a key Locked by a younger Transaction has it aborted by its own Coordinator Group; one that finds an older holder tries again for 80 units and then gives way. A Transaction that is aborted is told its age and sends it back.
+- **Moves abort.** A Slot ready to be frozen asks for the undecided Transactions holding its keys to be aborted.
+- **Forgetting.** A Coordinator Group drops its record once every Group has confirmed. The answer, abort or commit, is by then in the Session's record.
+
+"None loses for ever" is nearly true, not exactly: with three keys 18 Transactions of about 4,300 were still given up after six attempts. A retry keeps its age but can still lose to one that is older still.
+
+## How long a Move waits for Locks (P8b.3)
+
+300 seeds per row. A Move waits only if a key in its Slot is Locked at the moment its copy is done.
+
+| Faults | Moves that waited | Longest wait, Moves waiting | Longest wait, Moves aborting |
+|---|---|---|---|
+| Moves | about 150 of 2,430 | 360 | 60 |
+| Moves and crashes | about 133 of 1,845 | 400 | 240 |
+| Moves and Partitions | about 135 of 1,304 | 780 | 520 |
+| Moves interrupted | about 70 of 1,011 | 340 | 240 |
+| Moves, crashes and Partitions | about 110 of 1,265 | 2,080 | 1,980 |
+
+With nothing else wrong, aborting cuts the longest wait from 360 units to 60. Under Faults it helps little: the wait is then for a Coordinator Group that can't be reached, and asking it to abort waits just as long.
+
+## Results (P8b.6, Simulation)
+
+6,100 runs, none failing any verdict, 158,788 Transactions across Groups committed.
+
+| Store | Scenarios | Seeds each | Runs | Committed | Moves | Nodes replaced |
+|---|---|---|---|---|---|---|
+| Plain | the 9 of stage 8a | 300 | 2,700 | 68,363 | 7,854 | — |
+| Busy (time-to-live, scans, Sessions that expire) | the same | 300 | 2,700 | 66,915 | 7,852 | — |
+| Replacement on (stage 7c) | its 4 | 100 | 400 | 12,760 | 328 | 452 |
+| Balancer on, load skewed onto Group 1 | no Faults | 300 | 300 | 10,750 | 76 | — |
+
+## Real Nodes (P8b.5)
+
+The part a Leader plays, sending steps and proposing decisions, is one package (`internal/committer`) used by the Simulation and by a real Node. Two tests run five real Nodes in one process, with real disks and sockets:
+
+- A Transaction across two Groups commits with one version on both keys, a later write in the Group with the shorter Log gets a higher version, a failed condition in one Group stops the write in the other, and a retry in a Session is answered as before and carried out once.
+- Six clients send 90 Transactions over the same three keys in three Groups. All 90 commit, the three keys end with the same value and version, and nothing is left Locked.
+
+Measured in those tests, not under `kvbench`: a Transaction across three Groups with nobody else on its keys takes 88 ms, where a single write takes 16 ms. With six clients on the same three keys a commit takes about 200 ms.
+
+## Bugs found
+
+1. **A forgotten abort came back with the wrong key names.** Once records were forgotten, a retry was answered from the Session's record, which held the failed conditions under the plain names of the keys where the reading code expected internal ones. 7 runs of 100 with no Faults, 69 with crashes.
+2. **Finishes were sent late.** The Leader counted "when did I last send this Group a step" from the prepare, so a finish waited out the rest of that interval: 250 ms on real Nodes. The Simulation had the same delay and no test that could see it. Found by timing one Transaction on real Nodes: 267 ms before, 93 ms after.
+3. **Retries crowded out the Transaction they were waiting for.** Every try for a Locked key is an Entry in that Group's Log. Six real clients on the same keys took 350 ms a commit. Three changes: each try waits twice as long as the last; a Node asks only once in a while for the same Transaction to be aborted; and a Transaction that holds nothing yet waits before it has anybody aborted (it can't be part of a ring). 200 ms a commit after.
+4. **Requests outside a Session were named at random,** so of two Transactions of the same age a newcomer was the older half the time and had the one in front aborted for nothing. They are now named from the clock.
+5. **A Lock that had outlived its Transaction blocked others for 200 ms,** until its Group thought to ask. A blocked prepare now asks on its behalf.
+6. **Rung 7's Move, not Rung 8:** a Group that had given a Slot away, and was cut off before it dropped its copy, never dropped it if the Slot had since moved on again, and could then never take the Slot back. One run in 600. It drops the copy now whoever owns the Slot.
+
+## What the design got wrong
+
+- **"Two Transactions that never decide"** needs three Groups, as above.
+- **"An older Transaction makes a younger one abort" was too eager** for one that hasn't started. See bug 3.
+- **Who asks for the abort.** The design had the Group that holds the key ask. It answers the prepare with who holds it, and the Leader that sent the prepare asks: that Leader is the one waiting, and the Group holds nothing for the Transaction that was refused.
+
+## Not covered
+
+- **The numbers check, and any run under `kvbench`.** Waiting for the user's go-ahead.
+- **A crowd.** Twenty clients on 24 keys with Transactions over three of them commit 23 to 50 Transactions in a run where five clients commit about 37 each run on average, and leave some undecided when the run ends. Their steps and retries fill the Groups' Logs. Nothing in the design sheds that load. The linearizability check can't be run on a History that size either: it is over the whole store at once, and stops being feasible well before 20 clients. The balancer was therefore tested with 6 clients, not the 20 its load figures were measured with.
+- **`kvbench` doesn't check its Transactions.** They use keys of their own and are counted and timed. The History it checks has only the single-key requests.
+- A Coordinator Group without a Majority, and Docker, as in stage 8a.
+- Old data directories: a Snapshot from before Rung 8 opens; one from the middle of this stage's work doesn't.
+
+## Reproduce
+
+```
+go test ./internal/shardtest -run 'Rung8|Waiting|TwoKeys|OlderWins|AMove'
+go test ./internal/server -run 'Transaction'
+KV_MEASURE=1 go test ./internal/shardtest -run TestMeasureRung8b -v -timeout 40m
+```
