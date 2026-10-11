@@ -547,7 +547,9 @@ A Transaction's id is its Session id and request number. Its **Coordinator Group
 4. **Finish.** The Leader sends the decision to each other Group, which commits a finish Entry: on commit it applies its writes with that version, and either way it releases its Locks.
 5. **Confirmed.** Each Group's answer to finish is Committed in the Coordinator Group. When every Group has confirmed, the record is forgotten (8b).
 
-Messages go Leader to Leader, name the Transaction and are repeated until answered. Every step may be applied twice without harm: a Group answers a step it has already taken the same way. The decision lives in a table that belongs to the Group, not to a Slot, and is part of its Snapshot. A Move never carries it: no Group is ever dissolved, so the record stays reachable where it was written.
+Messages go Leader to Leader, name the Transaction and are repeated until answered. Every step may be applied twice without harm: a Group answers a step it has already taken the same way.
+
+**A prepare that arrives after the finish.** A prepare is sent again when no answer comes, and a copy can reach a Group after it has finished the Transaction and forgotten it. Taken as new, it would Lock the keys again, and the next finish would write the Transaction's values a second time, over whatever had been written since. So every Group that commits a Transaction records it in the Session's record, as it does a request of its own (§11.6), and answers no to a prepare numbered at or below what that record holds. The record moves with the Slot. This relies on a Session's record outliving any step still on its way. The decision lives in a table that belongs to the Group, not to a Slot, and is part of its Snapshot. A Move never carries it: no Group is ever dissolved, so the record stays reachable where it was written.
 
 ### 12.3 Locks
 - A **Lock** covers one key for one Transaction. Clients can't take one.

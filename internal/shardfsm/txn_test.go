@@ -196,3 +196,167 @@ func TestSnapshotKeepsLocks(t *testing.T) {
 		t.Errorf("a write after restore got version %d", got.Version)
 	}
 }
+
+func stateOf(t *testing.T, raw []byte) (TxnState, fsm.Response) {
+	t.Helper()
+	s, resp, err := DecodeState(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s, resp
+}
+
+func TestCoordStepRoundTrip(t *testing.T) {
+	id := TxnID{7, 3}
+	parts := []Part{
+		{Group: 1, Conds: []fsm.Cond{{Key: "a", Version: 9}}},
+		{Group: 2, Writes: []fsm.Write{{Op: fsm.OpPut, Key: "b", Value: []byte("v"), TTL: 5}}},
+	}
+	for _, s := range []CoordStep{
+		TxnBeginStep(id, parts, 40, true),
+		DecideStep(id, false, 0, []fsm.Item{{Key: "a", Version: 4}}),
+		DecideStep(id, true, 99, nil),
+		ConfirmStep(id, 2),
+	} {
+		got, err := DecodeCoordStep(s.Encode())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got.Encode(), s.Encode()) {
+			t.Errorf("round trip changed %+v into %+v", s, got)
+		}
+	}
+}
+
+// twoGroups is a Transaction that writes a in Group 1 and b in Group 2,
+// put to Group 1.
+func twoGroups(id TxnID, conds []fsm.Cond) CoordStep {
+	return TxnBeginStep(id, []Part{
+		{Group: 1, Conds: conds, Writes: []fsm.Write{{Op: fsm.OpPut, Key: "a", Value: []byte("x")}}},
+		{Group: 2, Writes: []fsm.Write{{Op: fsm.OpPut, Key: "b", Value: []byte("x")}}},
+	}, 0, true)
+}
+
+func TestCoordinatorGroupCarriesATransactionThrough(t *testing.T) {
+	m := whole(Config{})
+	id := TxnID{Session: 77, Seq: 4}
+	if s, _ := stateOf(t, m.Apply(entry(5, twoGroups(id, nil).Encode()))); s != TxnBegun {
+		t.Fatalf("begin: state %d", s)
+	}
+	open := m.Coordinating()
+	if len(open) != 1 || open[0].Own != VoteYes || open[0].OwnResp.Version != 5 || len(open[0].Parts) != 1 || open[0].Parts[0].Group != 2 {
+		t.Fatalf("coordinating: %+v", open)
+	}
+	if m.Locked() != 1 {
+		t.Fatalf("%d keys Locked after begin", m.Locked())
+	}
+	// A repeat changes nothing, and asking gets the same answer.
+	if s, _ := stateOf(t, m.Apply(entry(6, twoGroups(id, nil).Encode()))); s != TxnBegun || m.Records() != 1 {
+		t.Errorf("repeated begin: state %d, %d records", s, m.Records())
+	}
+	if s, _ := stateOf(t, m.Read(OutcomeQuery(id))); s != TxnBegun {
+		t.Errorf("outcome before the decision: state %d", s)
+	}
+
+	s, resp := stateOf(t, m.Apply(entry(7, DecideStep(id, true, 900, nil).Encode())))
+	if s != TxnDecided || resp.Status != fsm.StatusOK || resp.Version != 900 {
+		t.Fatalf("decision: state %d, %+v", s, resp)
+	}
+	if got := respOf(t, m.Read(fsm.Command{Op: fsm.OpGet, Key: "a"}.Encode())); string(got.Value) != "x" || got.Version != 900 {
+		t.Errorf("a after the decision: %+v", got)
+	}
+	// A second decision, from a Leader that hadn't heard, changes nothing.
+	if s, resp := stateOf(t, m.Apply(entry(8, DecideStep(id, false, 0, nil).Encode()))); s != TxnDecided || resp.Status != fsm.StatusOK {
+		t.Errorf("second decision: state %d, %+v", s, resp)
+	}
+	if open := m.Coordinating(); len(open) != 1 || !open[0].Decided || !open[0].Commit || open[0].Version != 900 {
+		t.Fatalf("after the decision: %+v", open)
+	}
+	m.Apply(entry(9, ConfirmStep(id, 2).Encode()))
+	if len(m.Coordinating()) != 0 || m.Records() != 1 {
+		t.Errorf("after every Group confirmed: %d open, %d records", len(m.Coordinating()), m.Records())
+	}
+	// A retry of the request is answered from the Session's record.
+	retry := twoGroups(id, nil)
+	retry.Register = false
+	if s, resp := stateOf(t, m.Apply(entry(10, retry.Encode()))); s != TxnDecided || resp.Version != 900 {
+		t.Errorf("retry: state %d, %+v", s, resp)
+	}
+}
+
+func TestCoordinatorGroupRefusesWhatItCannotStart(t *testing.T) {
+	m := whole(Config{})
+	held := TxnID{Session: 77, Seq: 1}
+	m.Apply(entry(5, twoGroups(held, nil).Encode()))
+	// A second Transaction wants the key the first has Locked.
+	s, resp := stateOf(t, m.Apply(entry(6, twoGroups(TxnID{Session: 78, Seq: 1}, nil).Encode())))
+	if s != TxnRefused || resp.Status != fsm.StatusTxnConflict || m.Records() != 1 || m.Locked() != 1 {
+		t.Errorf("state %d, %+v, %d records, %d Locked", s, resp, m.Records(), m.Locked())
+	}
+	// A begin put to a Group that isn't first among its parts is refused.
+	wrong := TxnBeginStep(TxnID{Session: 79, Seq: 1}, []Part{{Group: 2}, {Group: 1}}, 0, true)
+	if s, resp := stateOf(t, m.Apply(entry(7, wrong.Encode()))); s != TxnRefused || resp.Status != fsm.StatusWrongGroup {
+		t.Errorf("wrong Group: state %d, %+v", s, resp)
+	}
+}
+
+func TestFailedConditionsAreReportedTogether(t *testing.T) {
+	m := whole(Config{})
+	id := TxnID{Session: 77, Seq: 1}
+	// The Coordinator Group's own condition fails. It still takes the
+	// Transaction on, to hear what the other Group found.
+	if s, _ := stateOf(t, m.Apply(entry(5, twoGroups(id, []fsm.Cond{{Key: "a", Version: 3}}).Encode()))); s != TxnBegun {
+		t.Fatalf("begin: state %d", s)
+	}
+	if open := m.Coordinating(); open[0].Own != VoteNo || open[0].OwnResp.Status != fsm.StatusVersionMismatch {
+		t.Fatalf("own answer: %+v", open[0])
+	}
+	// Even told to commit, it doesn't: its own answer was no.
+	s, resp := stateOf(t, m.Apply(entry(6, DecideStep(id, true, 900, []fsm.Item{{Key: "b", Version: 8}}).Encode())))
+	if s != TxnDecided || resp.Status != fsm.StatusVersionMismatch || len(resp.Items) != 2 || resp.Items[0].Key != "a" || resp.Items[1].Key != "b" {
+		t.Errorf("decision: state %d, %+v", s, resp)
+	}
+	if got := respOf(t, m.Read(fsm.Command{Op: fsm.OpGet, Key: "a"}.Encode())); got.Status != fsm.StatusNotFound || m.Locked() != 0 {
+		t.Errorf("after the abort: %+v, %d Locked", got, m.Locked())
+	}
+}
+
+func TestLatePrepareAfterCommitIsRefused(t *testing.T) {
+	m := whole(Config{})
+	id := TxnID{Session: 77, Seq: 4}
+	prep := PrepareStep(id, false, nil, []fsm.Write{{Op: fsm.OpPut, Key: "b", Value: []byte("x")}}, 0, false)
+	m.Apply(entry(5, prep.Encode()))
+	m.Apply(entry(6, FinishStep(id, false, true, 900).Encode()))
+	m.Apply(entry(7, fsm.Command{Op: fsm.OpPut, Key: "b", Value: []byte("newer")}.Encode()))
+	// The same prepare again, sent by a Leader that hadn't heard.
+	if v, r := voteOf(t, m.Apply(entry(8, prep.Encode()))); v != VoteNo || r.Status != fsm.StatusInvalid || m.Locked() != 0 {
+		t.Fatalf("late prepare: vote %d, %+v, %d Locked", v, r, m.Locked())
+	}
+	m.Apply(entry(9, FinishStep(id, false, true, 900).Encode()))
+	if got := respOf(t, m.Read(fsm.Command{Op: fsm.OpGet, Key: "b"}.Encode())); string(got.Value) != "newer" {
+		t.Errorf("b was written a second time: %+v", got)
+	}
+}
+
+func TestSnapshotKeepsCoordinatedTransactions(t *testing.T) {
+	m := whole(Config{})
+	done, open := TxnID{Session: 77, Seq: 1}, TxnID{Session: 78, Seq: 1}
+	m.Apply(entry(5, twoGroups(done, nil).Encode()))
+	m.Apply(entry(6, DecideStep(done, true, 900, nil).Encode()))
+	m.Apply(entry(7, ConfirmStep(done, 2).Encode()))
+	m.Apply(entry(8, TxnBeginStep(open, []Part{{Group: 1, Writes: []fsm.Write{{Op: fsm.OpPut, Key: "c", Value: []byte("y")}}}, {Group: 3}}, 0, true).Encode()))
+
+	next := whole(Config{})
+	if err := next.Restore(m.Capture()()); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(next.Capture()(), m.Capture()()) {
+		t.Error("a restored Machine captures differently")
+	}
+	if got := next.Coordinating(); next.Records() != 2 || len(got) != 1 || got[0].ID != open || got[0].Own != VoteYes {
+		t.Errorf("restored: %d records, coordinating %+v", next.Records(), got)
+	}
+	if s, resp := stateOf(t, next.Read(OutcomeQuery(done))); s != TxnDecided || resp.Version != 900 {
+		t.Errorf("restored outcome: state %d, %+v", s, resp)
+	}
+}

@@ -437,7 +437,7 @@ func DecodeStep(payload []byte) (Step, error) {
 func (m *Machine) Capture() func() []byte {
 	inner := m.inner.Capture()
 	slots, dirty, incoming, lastSlots := m.Slots(), m.dirty, m.incoming, m.lastSlots
-	txns := m.txns
+	txns, coord := m.txns, &Machine{coord: m.coord}
 	return func() []byte {
 		b := appendBytes(nil, inner())
 		b = binary.AppendUvarint(b, uint64(len(slots)))
@@ -481,6 +481,7 @@ func (m *Machine) Capture() func() []byte {
 		for _, s := range slots {
 			b = binary.AppendUvarint(b, s.VOffset)
 		}
+		b = appendCoord(b, coord)
 		return b
 	}
 }
@@ -546,6 +547,7 @@ func (m *Machine) Restore(data []byte) error {
 		for i := range next.slots {
 			next.slots[i].VOffset = r.uvarint()
 		}
+		next.restoreCoord(r)
 	}
 	if r.bad || len(r.b) != 0 {
 		return errMalformed

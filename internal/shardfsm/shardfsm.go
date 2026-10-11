@@ -115,6 +115,10 @@ type Machine struct {
 	// each Transaction it has prepared (A§12.3).
 	locks tree.Tree[TxnID]
 	txns  tree.Tree[prepared]
+	// coord holds the Transactions this Group is or was the Coordinator
+	// Group of, and openTxns the ids of those that aren't over (A§12.2).
+	coord    tree.Tree[coordinated]
+	openTxns tree.Tree[struct{}]
 	// finished is the Transaction the last Entry applied finished here,
 	// if it did. It is for whoever watches the Machine, and no part of
 	// the Group's state.
@@ -207,6 +211,9 @@ func (m *Machine) Apply(e core.Entry) []byte {
 	}
 	if len(e.Payload) > 0 && e.Payload[0] >= moveOpBase {
 		return m.applyMove(e.Payload).Encode()
+	}
+	if len(e.Payload) > 0 && e.Payload[0] >= opTxnBegin {
+		return m.applyCoord(e.Index, e.Payload)
 	}
 	if len(e.Payload) > 0 && e.Payload[0] >= txnOpBase {
 		return m.applyTxn(e.Index, e.Payload)
@@ -303,6 +310,9 @@ func (m *Machine) markDirty(cmd fsm.Command) {
 
 // Read answers an encoded get or scan from the state as it stands.
 func (m *Machine) Read(query []byte) []byte {
+	if len(query) > 0 && query[0] == opOutcome {
+		return m.outcome(query)
+	}
 	cmd, err := fsm.DecodeCommand(query)
 	switch {
 	case err != nil:

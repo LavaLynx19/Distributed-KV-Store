@@ -198,6 +198,15 @@ func (m *Machine) prepare(index core.Index, step TxnStep) []byte {
 			return no(fsm.StatusInvalid)
 		}
 	}
+	if !step.Lead && step.ID.Session != 0 {
+		// A Group that committed a Transaction remembers it by the
+		// Session's record, as it would a request of its own. A prepare
+		// that arrives after the finish, sent again by a Leader that hadn't
+		// heard, must not start the Transaction a second time.
+		if rec, known := m.inner.SessionRecord(step.ID.Session); known && step.ID.Seq <= rec.LastSeq {
+			return no(fsm.StatusInvalid)
+		}
+	}
 	if p, again := m.txns.Get(step.ID.key()); again {
 		return p.answer
 	}
@@ -264,8 +273,15 @@ func (m *Machine) finish(index core.Index, step TxnStep) fsm.Response {
 	m.raise(index, slots, step.Version)
 	m.inner.Apply(core.Entry{Index: core.Index(step.Version), Kind: core.EntryCommand, Payload: m.store(cmd).Encode()})
 	m.markDirty(cmd)
-	if step.Lead && step.ID.Session != 0 {
-		rec, _ := m.inner.SessionRecord(step.ID.Session)
+	if step.ID.Session != 0 {
+		// Every Group that commits keeps the outcome with the Session: the
+		// Coordinator Group to answer a retry, the others to know a late
+		// prepare when they see one. The Coordinator Group has vouched for
+		// the Session (A§11.6).
+		rec, known := m.inner.SessionRecord(step.ID.Session)
+		if !known {
+			rec.Floor = step.ID.Seq
+		}
 		rec.ID, rec.LastSeq, rec.LastResp, rec.LastUsed = step.ID.Session, step.ID.Seq, ok.Encode(), m.inner.LogTime()
 		m.inner.PutSessionRecord(rec)
 		m.lastSlots = m.lastSlots.Put(sessionKey(step.ID.Session), slots)

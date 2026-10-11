@@ -146,6 +146,9 @@ type node struct {
 	// finishing counts the Transactions this Node has decided to commit
 	// and not yet heard every Group finish (txn.go).
 	finishing int
+	// coord is what this Node remembers of the Transactions it is
+	// carrying on for Groups it leads (txn.go).
+	coord map[coordKey]*coordState
 	// gossip is this Node's gossip, if the store uses it.
 	gossip *gossip.Node
 	// watch is how long this Node's gossip has thought each Node dead, and
@@ -324,6 +327,10 @@ func New(cfg Config) *Cluster {
 	})
 	for _, n := range c.NodeIDs() {
 		c.S.After(1+c.S.Rand().Int64N(agentEvery), func() { c.agent(c.nodes[n]) })
+		if cfg.Transactions.On && !cfg.Transactions.Memory {
+			c.nodes[n].coord = map[coordKey]*coordState{}
+			c.S.After(txnEvery, func() { c.txnLoop(c.nodes[n]) })
+		}
 	}
 	c.startGossip()
 	return c
@@ -375,6 +382,7 @@ func (c *Cluster) CrashNode(n int) {
 	c.nodes[n].up = false
 	c.nodes[n].boots++
 	c.nodes[n].finishing = 0
+	clear(c.nodes[n].coord)
 	c.nodes[n].mover.Reset()
 }
 
@@ -575,7 +583,11 @@ func (c *Cluster) Request(n int, cmd fsm.Command, done func(Outcome, fsm.Respons
 	}
 	g, same := c.groupOf(nd.table, cmd)
 	if !same && c.cfg.Transactions.On {
-		c.transact(n, cmd, done)
+		if c.cfg.Transactions.Memory {
+			c.transact(n, cmd, done)
+		} else {
+			c.begin(n, cmd, done)
+		}
 		return
 	}
 	if !same {

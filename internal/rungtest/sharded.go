@@ -461,15 +461,17 @@ var Rung8 = []ShardedScenario{
 		c.S.At(from+50, step)
 	}},
 
-	// A Node that has told some Groups to commit a Transaction, and not
-	// yet heard from all of them, is stopped there and then.
+	// A Node in the middle of a Transaction is stopped there and then: one
+	// carrying it out from memory, one leading its Coordinator Group, or
+	// one leading a Group that has Locked keys for it.
 	{"stopped-mid-commit", func(c *cluster.Cluster, from, to int64) {
 		var watch func()
 		watch = func() {
 			if c.S.Now() >= to {
 				return
 			}
-			if n, ok := c.Finishing(); ok && c.S.Rand().IntN(4) == 0 {
+			if mid := c.MidTransaction(); len(mid) > 0 && c.S.Rand().IntN(4) == 0 {
+				n := mid[c.S.Rand().IntN(len(mid))]
 				c.CrashNode(n)
 				c.S.After(100+c.S.Rand().Int64N(200), func() { c.RestartNode(n) })
 				c.S.After(300+c.S.Rand().Int64N(200), watch)

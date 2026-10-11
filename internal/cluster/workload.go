@@ -168,6 +168,16 @@ func (w Workload) next(c *Cluster, h *check.History, cl *client, until int64) {
 				finish(check.Lost, fsm.Response{})
 			case o == Refused && resp.Status == fsm.StatusCrossGroup:
 				finish(check.Rejected, resp)
+			case o == Refused && resp.Status == fsm.StatusTxnConflict && unknown:
+				// This attempt came to nothing, but an earlier one may still
+				// be carried out.
+				finish(check.Lost, fsm.Response{})
+			case o == Refused && resp.Status == fsm.StatusTxnConflict:
+				finish(check.Rejected, resp)
+			case o == Answered && resp.Status == fsm.StatusTxnConflict:
+				// The Transaction itself was aborted: that is its outcome,
+				// whichever attempt it was.
+				finish(check.Rejected, resp)
 			case o == Refused:
 				again()
 			case resp.Status == fsm.StatusSessionExpired:
