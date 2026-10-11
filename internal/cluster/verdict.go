@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"cmp"
 	"fmt"
 	"slices"
 
@@ -69,6 +70,20 @@ func (c *Cluster) applied(id core.NodeID, index core.Index, m sim.Machine) {
 	if index <= c.owned[g].index {
 		return
 	}
+	if f := m.(*shardfsm.Machine).LastFinished(); len(f.Began) > 0 {
+		if c.txnGroups == nil {
+			c.txnGroups = map[shardfsm.TxnID][]shard.GroupID{}
+		}
+		c.txnGroups[f.ID] = f.Began
+	} else if f.OK {
+		if c.txnEnds == nil {
+			c.txnEnds = map[shardfsm.TxnID]map[shard.GroupID][]bool{}
+		}
+		if c.txnEnds[f.ID] == nil {
+			c.txnEnds[f.ID] = map[shard.GroupID][]bool{}
+		}
+		c.txnEnds[f.ID][g] = append(c.txnEnds[f.ID][g], f.Commit)
+	}
 	now := ownership{index: index}
 	for _, info := range m.(*shardfsm.Machine).Slots() {
 		now.serves = append(now.serves, info.Serves())
@@ -127,6 +142,19 @@ func (c *Cluster) EndState() []string {
 			diffs = append(diffs, fmt.Sprintf("Group %d: %s", g, d))
 		}
 		if first != nil {
+			if n := first.Locked(); n > 0 {
+				diffs = append(diffs, fmt.Sprintf("Group %d: %d keys still Locked, for Transactions %v", g, n, first.Prepared()))
+			}
+			for _, t := range first.Coordinating() {
+				var groups []shard.GroupID
+				for _, p := range t.Parts {
+					groups = append(groups, p.Group)
+				}
+				diffs = append(diffs, fmt.Sprintf("Group %d: Transaction %d/%d isn't over: decided %v, commit %v, Groups %v, confirmed %v", g, t.ID.Session, t.ID.Seq, t.Decided, t.Commit, groups, t.Confirmed))
+			}
+			if n := first.Records(); n > 0 && c.cfg.Transactions.Forget {
+				diffs = append(diffs, fmt.Sprintf("Group %d: %d Transactions still on record", g, n))
+			}
 			for s, info := range first.Slots() {
 				if info.Serves() {
 					serving[shard.Slot(s)] = append(serving[shard.Slot(s)], g)
@@ -147,7 +175,14 @@ func (c *Cluster) EndState() []string {
 			diffs = append(diffs, fmt.Sprintf("Slot %d: the table says Group %d, and it is served by %v", s, row.Group, got))
 		}
 		if row.MovingTo != 0 {
-			diffs = append(diffs, fmt.Sprintf("Slot %d: still moving to Group %d", s, row.MovingTo))
+			at := func(g shard.GroupID) string {
+				if l := c.Leader(g); l != 0 {
+					m := c.machine(l)
+					return fmt.Sprintf("%+v with %d keys Locked", m.Slots()[s], m.LockedIn(shard.Slot(s)))
+				}
+				return "no Leader"
+			}
+			diffs = append(diffs, fmt.Sprintf("Slot %d: still moving from Group %d (%s) to Group %d (%s)", s, row.Group, at(row.Group), row.MovingTo, at(row.MovingTo)))
 		}
 	}
 	if c.cfg.Replacing.On {
@@ -245,4 +280,45 @@ func (c *Cluster) membersSettled(table shard.Table) []string {
 		}
 	}
 	return diffs
+}
+
+// HalfCommitted lists the Transactions across Groups that didn't end the
+// same way everywhere (A§12.9): committed in one Group and not in another
+// it was put to, or committed more than once in a Group.
+func (c *Cluster) HalfCommitted() []string {
+	ids := make([]shardfsm.TxnID, 0, len(c.txnEnds))
+	for id := range c.txnEnds {
+		ids = append(ids, id)
+	}
+	slices.SortFunc(ids, func(a, b shardfsm.TxnID) int {
+		if a.Session != b.Session {
+			return cmp.Compare(a.Session, b.Session)
+		}
+		return cmp.Compare(a.Seq, b.Seq)
+	})
+	var out []string
+	for _, id := range ids {
+		commits := map[shard.GroupID]int{}
+		total := 0
+		for g, ends := range c.txnEnds[id] {
+			for _, commit := range ends {
+				if commit {
+					commits[g]++
+					total++
+				}
+			}
+		}
+		if total == 0 {
+			continue
+		}
+		for _, g := range c.txnGroups[id] {
+			switch n := commits[g]; {
+			case n == 0:
+				out = append(out, fmt.Sprintf("Transaction %d/%d committed elsewhere and not in Group %d", id.Session, id.Seq, g))
+			case n > 1:
+				out = append(out, fmt.Sprintf("Transaction %d/%d committed %d times in Group %d", id.Session, id.Seq, n, g))
+			}
+		}
+	}
+	return out
 }

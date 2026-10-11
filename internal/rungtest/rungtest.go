@@ -119,6 +119,11 @@ type Report struct {
 	// replica as a Member (A§11.11).
 	Replacements, ReplacedRunning, Drops int
 	WrongDrop                            string
+	// LockWaits is how long each Slot ready to move waited for its Locks.
+	LockWaits []int64
+	// HalfCommitted lists the Transactions across Groups that didn't end
+	// the same way in every Group (A§12.9).
+	HalfCommitted []string
 	// MovedAt is when each Move finished. Busiest is the busiest Group's
 	// load over the mean of the Groups' loads, as the clients were about to
 	// stop, or 0 if load isn't measured (A§11.11).
@@ -131,7 +136,7 @@ type Report struct {
 // Safe is true when nothing false was ever said or done: the History is
 // Linearizable, no Term had two Leaders, and no core tripped its own check.
 func (r Report) Safe() bool {
-	return r.Linearizable && !r.TimedOut && r.TwoLeaders == "" && r.Panic == "" && r.TwoOwners == "" && r.WrongDrop == ""
+	return r.Linearizable && !r.TimedOut && r.TwoLeaders == "" && r.Panic == "" && r.TwoOwners == "" && r.WrongDrop == "" && len(r.HalfCommitted) == 0
 }
 
 // Routing counts what happened to requests on their way to a Group in a
@@ -143,6 +148,17 @@ type Routing struct {
 	// the Node's table was out of date. Moving were refused because the
 	// Slot was frozen for a Move.
 	WrongGroup, Moving int
+	// Locked were refused because a key was Locked by a Transaction not
+	// yet decided. TxnConflict counts Transactions across Groups aborted
+	// for a reason other than their own conditions (A§12).
+	Locked, TxnConflict int
+	// TxnCommitted counts Transactions across Groups that committed.
+	TxnCommitted int
+	// TxnWounded counts the times an older Transaction had a younger one
+	// aborted. TxnRetries counts Transactions sent again after an abort
+	// over a conflict, TxnGaveUp those whose client stopped trying, and
+	// TxnMaxTries is the most attempts any one took.
+	TxnWounded, TxnRetries, TxnGaveUp, TxnMaxTries int
 }
 
 // Passed is true when the run kept every guarantee: it was Safe, every
@@ -167,6 +183,9 @@ func (r Report) String() string {
 	}
 	if r.TwoOwners != "" {
 		s += " two-owners: " + r.TwoOwners
+	}
+	if len(r.HalfCommitted) > 0 {
+		s += fmt.Sprintf(" half-committed: %d, first: %s", len(r.HalfCommitted), r.HalfCommitted[0])
 	}
 	if r.WrongDrop != "" {
 		s += " wrong-drop: " + r.WrongDrop

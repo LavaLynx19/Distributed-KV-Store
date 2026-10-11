@@ -75,6 +75,9 @@ type txnRequest struct {
 		Value string `json:"value"`
 		TTL   int64  `json:"ttl"`
 	} `json:"writes"`
+	// Age is the age an earlier attempt of this Transaction was given in
+	// a txn_conflict answer (A§12.8). Zero for a first attempt.
+	Age int64 `json:"age,omitempty"`
 }
 
 // errorResponse is the body of every non-2xx answer (A§7.2).
@@ -86,6 +89,9 @@ type errorResponse struct {
 	// Failed lists the conditions a refused Transaction failed, each with
 	// the version found.
 	Failed []ItemJSON `json:"failed,omitempty"`
+	// Age, on txn_conflict, is the Transaction's age, to send with the
+	// next attempt.
+	Age int64 `json:"age,omitempty"`
 }
 
 type sessionResponse struct {
@@ -222,11 +228,22 @@ func (a *API) txn(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errorResponse{Reason: "invalid", Message: "body must be JSON like {\"if\": [{\"key\": …, \"version\": …}], \"writes\": [{\"op\": \"put\"|\"delete\", \"key\": …}]}"})
 		return
 	}
-	resp, ok := a.propose(w, r, cmd)
+	var resp fsm.Response
+	var ok bool
+	age := req.Age
+	if a.Store != nil {
+		resp, age, ok = a.Store.serveAged(w, r, cmd, req.Age)
+	} else {
+		resp, ok = a.propose(w, r, cmd)
+	}
 	if !ok {
 		return
 	}
 	switch resp.Status {
+	case fsm.StatusLocked:
+		writeError(w, http.StatusServiceUnavailable, errorResponse{Reason: "locked", Message: "a key is Locked by a Transaction not yet decided; nothing changed"})
+	case fsm.StatusTxnConflict:
+		writeError(w, http.StatusConflict, errorResponse{Reason: "txn_conflict", Message: "aborted to make way for another Transaction or a Move; nothing changed", Age: age})
 	case fsm.StatusOK:
 		writeJSON(w, http.StatusOK, kvResponse{Version: resp.Version})
 	case fsm.StatusVersionMismatch:
@@ -328,6 +345,8 @@ func (a *API) run(w http.ResponseWriter, r *http.Request, cmd fsm.Command) {
 			out.Value = &v
 		}
 		writeJSON(w, http.StatusOK, out)
+	case fsm.StatusLocked:
+		writeError(w, http.StatusServiceUnavailable, errorResponse{Reason: "locked", Message: "the key is Locked by a Transaction not yet decided; nothing changed"})
 	case fsm.StatusNotFound:
 		writeError(w, http.StatusNotFound, errorResponse{Reason: "not_found"})
 	case fsm.StatusVersionMismatch:

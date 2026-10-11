@@ -363,6 +363,32 @@ func table(httpc *http.Client, urls []string) error {
 		}
 		fmt.Println(line)
 	}
+	// Locks and Transactions not yet over, as each Group's Leader has them
+	// (A§12). Nothing is printed for a Group that has neither.
+	for _, u := range urls {
+		resp, err := httpc.Get(u + "/v1/status")
+		if err != nil {
+			continue
+		}
+		var st struct {
+			Groups []struct {
+				Group  uint64 `json:"group"`
+				Role   string `json:"role"`
+				Locked int    `json:"locked"`
+				Open   int    `json:"open"`
+			} `json:"groups"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&st)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		for _, g := range st.Groups {
+			if g.Role == "leader" && (g.Locked > 0 || g.Open > 0) {
+				fmt.Printf("  Group %d has %d keys Locked and coordinates %d Transactions that aren't over\n", g.Group, g.Locked, g.Open)
+			}
+		}
+	}
 	return nil
 }
 

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"distributed-kv-store/internal/automation"
+	"distributed-kv-store/internal/committer"
 	"distributed-kv-store/internal/core"
 	"distributed-kv-store/internal/fsm"
 	"distributed-kv-store/internal/gossip"
@@ -89,6 +90,15 @@ type Store struct {
 	loadAt   time.Time
 	balancer automation.Balancer
 	led      map[shard.GroupID]bool // touched only by the gossip goroutine
+
+	// committer carries on the Transactions of the Groups this Node leads
+	// (txn.go). It is touched only by the commit goroutine, which is given
+	// work through txnCalls and woken through txnKick.
+	committer *committer.Agent
+	txnCalls  chan func()
+	txnKick   chan struct{}
+	txnCtx    context.Context
+	txnLast   atomic.Uint64
 }
 
 // replica is this Node's replica of Group g, if it has one.
@@ -123,7 +133,14 @@ func (s *Store) Start(ctx context.Context, slots int) {
 	s.httpc = &http.Client{Timeout: s.Timeout, Transport: &http.Transport{
 		MaxIdleConns: 4096, MaxIdleConnsPerHost: 512, IdleConnTimeout: 30 * time.Second,
 	}}
+	s.committer = &committer.Agent{
+		Conflicts: committer.OlderWins,
+		AskAgain:  txnAskAgain, GiveUp: txnGiveUp, LockAskAfter: lockAskAfter, LockAskAgain: lockAskAgain,
+		Retry: txnRetry, Wait: txnWait, WoundAgain: txnWoundAgain,
+	}
+	s.txnCalls, s.txnKick, s.txnCtx = make(chan func(), 1024), make(chan struct{}, 1), ctx
 	go s.agent(ctx)
+	go s.commit(ctx)
 	go s.gossip(ctx)
 }
 
@@ -320,6 +337,9 @@ func (s *Store) local(ctx context.Context, g shard.GroupID, read bool, payload [
 		if l.slot > 0 && l.slot <= len(s.counts) {
 			s.counts[l.slot-1].Add(l.cost)
 		}
+		if g != shard.Meta && len(reply.Response) > 0 && fsm.Status(reply.Response[0]) == fsm.StatusLocked {
+			s.nudge() // the Group asks what was decided (A§12.3)
+		}
 		return answered, reply.Response, s.Node
 	case core.NotLeader, core.NoMajority:
 		return refused, nil, hint
@@ -454,6 +474,33 @@ func (s *Store) internal(w http.ResponseWriter, r *http.Request) {
 // that isn't the state machine's own response. It reports false if it has
 // written one.
 func (s *Store) serve(w http.ResponseWriter, r *http.Request, cmd fsm.Command) (fsm.Response, bool) {
+	resp, _, ok := s.serveAged(w, r, cmd, 0)
+	return resp, ok
+}
+
+// serveAged is serve for a Transaction that may have been tried before,
+// with the age its first attempt was given, or zero. It also returns the
+// Transaction's age (A§12.5).
+func (s *Store) serveAged(w http.ResponseWriter, r *http.Request, cmd fsm.Command, age int64) (fsm.Response, int64, bool) {
+	resp, age, ok := s.serveOnce(w, r, cmd, age)
+	if ok && resp.Status == fsm.StatusLocked {
+		// The Group is asking what was decided. Wait a little for the
+		// answer, and try once more (A§12.3).
+		select {
+		case <-time.After(lockWait * time.Millisecond):
+			return s.serveOnce(w, r, cmd, age)
+		case <-r.Context().Done():
+		}
+	}
+	return resp, age, ok
+}
+
+func (s *Store) serveOnce(w http.ResponseWriter, r *http.Request, cmd fsm.Command, age int64) (fsm.Response, int64, bool) {
+	resp, ok := s.serveTo(w, r, cmd, &age)
+	return resp, age, ok
+}
+
+func (s *Store) serveTo(w http.ResponseWriter, r *http.Request, cmd fsm.Command, age *int64) (fsm.Response, bool) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.Timeout)
 	defer cancel()
 	fail := func(o outcome) (fsm.Response, bool) {
@@ -493,10 +540,17 @@ func (s *Store) serve(w http.ResponseWriter, r *http.Request, cmd fsm.Command) (
 			return fsm.Response{Status: fsm.StatusInvalid}, true
 		}
 		g, slot = table.OwnerOf(keys[0]), shard.SlotOf(keys[0], len(table.Slots))
-		for _, k := range keys {
-			if table.OwnerOf(k) != g {
-				return fsm.Response{Status: fsm.StatusCrossGroup}, true
+		if slices.ContainsFunc(keys, func(k string) bool { return table.OwnerOf(k) != g }) {
+			// The keys are in more than one Group (A§12).
+			o, resp, was := s.transact(ctx, cmd, partsOf(table, cmd), *age)
+			*age = was
+			if o != answered {
+				return fail(o)
 			}
+			if resp.Status == fsm.StatusWrongGroup {
+				s.refresh(ctx)
+			}
+			return resp, true
 		}
 	}
 	read := cmd.Op == fsm.OpGet
@@ -569,7 +623,7 @@ func (s *Store) agent(ctx context.Context) {
 	defer ticker.Stop()
 	calls := make(chan func(), 256)
 	e := storeEnv{s: s, ctx: ctx, calls: calls}
-	agent := &mover.Agent{Patience: (20 * s.Tick).Milliseconds(), ChunkKeys: 256,
+	agent := &mover.Agent{Patience: (20 * s.Tick).Milliseconds(), ChunkKeys: 256, AbortForMoves: true,
 		OnHandover: func(g shard.GroupID, slot shard.Slot, frozenFor int64) {
 			log.Printf("store: node %d: Slot %d handed over by Group %d after being frozen for %d ms", s.Node, slot, g, frozenFor)
 		}}
@@ -674,6 +728,10 @@ type groupStatus struct {
 	Role   string        `json:"role"`
 	Term   core.Term     `json:"term"`
 	Commit core.Index    `json:"commit"`
+	// Locked is how many keys the Group has Locked for Transactions, and
+	// Open how many Transactions it coordinates that aren't over (A§12).
+	Locked int `json:"locked,omitempty"`
+	Open   int `json:"open,omitempty"`
 }
 
 type storeStatus struct {
@@ -696,7 +754,13 @@ func (s *Store) status(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if st, ok := n.Status(ctx); ok {
-			out.Groups = append(out.Groups, groupStatus{Group: shard.GroupID(g), Role: roles[st.Role], Term: st.Term, Commit: st.Commit})
+			gs := groupStatus{Group: shard.GroupID(g), Role: roles[st.Role], Term: st.Term, Commit: st.Commit}
+			if g != int(shard.Meta) {
+				n.Inspect(ctx, func(m Machine) {
+					gs.Locked, gs.Open = m.(*shardfsm.Machine).Locked(), len(m.(*shardfsm.Machine).Coordinating())
+				})
+			}
+			out.Groups = append(out.Groups, gs)
 		}
 	}
 	writeJSON(w, http.StatusOK, out)

@@ -22,6 +22,12 @@ type Workload struct {
 	// TxnPercent of requests are Transactions over two keys. Many of them
 	// span Groups and are refused (A§11.8).
 	TxnPercent int
+	// TxnKeys is how many keys a Transaction writes: two unless set.
+	TxnKeys int
+	// RetryTxn has a client whose Transaction was aborted to make way for
+	// another send it again, as a new request with the age it was given,
+	// up to this many times (A§12.5).
+	RetryTxn int
 	// ScanPercent of requests are range scans, merged from every Group.
 	// The History records each Group's part as a request of its own, since
 	// that is the unit the store promises is Linearizable.
@@ -47,6 +53,11 @@ type client struct {
 	count   int
 	session uint64
 	seq     uint64
+	// again is a Transaction to send again, age the age it was given and
+	// tries how often it has been sent.
+	again *fsm.Command
+	age   int64
+	tries int
 }
 
 // Start launches the clients. They stop issuing requests at time until.
@@ -112,7 +123,13 @@ func (w Workload) next(c *Cluster, h *check.History, cl *client, until int64) {
 		w.scan(c, h, cl, until)
 		return
 	}
-	cmd := w.choose(c, cl)
+	var cmd fsm.Command
+	if cl.again != nil {
+		cmd, cl.again = *cl.again, nil
+	} else {
+		cmd, cl.age, cl.tries = w.choose(c, cl), 0, 0
+	}
+	cl.tries++
 	cl.seq++
 	cmd.Session, cmd.Seq = cl.session, cl.seq
 	id := h.Begin(cl.id, cmd, c.S.Now())
@@ -128,6 +145,19 @@ func (w Workload) next(c *Cluster, h *check.History, cl *client, until int64) {
 		}
 		settled = true
 		h.End(id, result, resp, c.S.Now())
+		if cmd.Op == fsm.OpTxn && result != check.Lost {
+			switch {
+			case result == check.Rejected && resp.Status == fsm.StatusTxnConflict && cl.tries <= w.RetryTxn:
+				again := cmd
+				again.Session, again.Seq = 0, 0
+				cl.again = &again
+				c.TxnRetries++
+			case result == check.Rejected && resp.Status == fsm.StatusTxnConflict:
+				c.TxnGaveUp++
+			default:
+				c.TxnMaxTries = max(c.TxnMaxTries, cl.tries)
+			}
+		}
 		c.S.After(1+c.S.Rand().Int64N(w.Think), func() { w.next(c, h, cl, until) })
 	}
 	var attempt func()
@@ -153,10 +183,11 @@ func (w Workload) next(c *Cluster, h *check.History, cl *client, until int64) {
 		})
 		try := cmd
 		try.Register = !unknown
-		c.Request(w.node(c, cl), try, func(o Outcome, resp fsm.Response) {
+		c.RequestAged(w.node(c, cl), try, cl.age, func(o Outcome, resp fsm.Response, age int64) {
 			if over || settled {
 				return
 			}
+			cl.age = age
 			over = true
 			switch {
 			case o == Unknown:
@@ -167,6 +198,16 @@ func (w Workload) next(c *Cluster, h *check.History, cl *client, until int64) {
 				// through before a Move split the keys between Groups.
 				finish(check.Lost, fsm.Response{})
 			case o == Refused && resp.Status == fsm.StatusCrossGroup:
+				finish(check.Rejected, resp)
+			case o == Refused && resp.Status == fsm.StatusTxnConflict && unknown:
+				// This attempt came to nothing, but an earlier one may still
+				// be carried out.
+				finish(check.Lost, fsm.Response{})
+			case o == Refused && resp.Status == fsm.StatusTxnConflict:
+				finish(check.Rejected, resp)
+			case o == Answered && resp.Status == fsm.StatusTxnConflict:
+				// The Transaction itself was aborted: that is its outcome,
+				// whichever attempt it was.
 				finish(check.Rejected, resp)
 			case o == Refused:
 				again()
@@ -241,6 +282,9 @@ func (w Workload) choose(c *Cluster, cl *client) fsm.Command {
 	if w.TxnPercent > 0 && rng.IntN(100) < w.TxnPercent {
 		other := fmt.Sprintf("k%d", rng.IntN(w.Keys))
 		cmd := fsm.Command{Op: fsm.OpTxn, Writes: []fsm.Write{{Op: fsm.OpPut, Key: key, Value: value}, {Op: fsm.OpPut, Key: other, Value: value}}}
+		for i := 2; i < w.TxnKeys; i++ {
+			cmd.Writes = append(cmd.Writes, fsm.Write{Op: fsm.OpPut, Key: fmt.Sprintf("k%d", rng.IntN(w.Keys)), Value: value})
+		}
 		if rng.IntN(3) != 0 {
 			cmd.Conds = []fsm.Cond{{Key: key, Version: cl.seen[key]}}
 		}

@@ -57,6 +57,13 @@ type Agent struct {
 	// answered that it had taken over. That is the pause clients of the
 	// Slot see (A§11.4), to within how often the Agent looks.
 	OnHandover func(g shard.GroupID, slot shard.Slot, frozenFor int64)
+	// AbortForMoves has a Group ask for every undecided Transaction that
+	// has keys Locked in a Slot to be aborted, once the Slot is ready to
+	// be frozen. Without it the Move waits for them to end (A§12.7).
+	AbortForMoves bool
+	// OnLockWait, if set, is told how long a Slot that was ready to be
+	// frozen waited for its Locks to go.
+	OnLockWait func(g shard.GroupID, slot shard.Slot, waited int64)
 
 	copying map[moveKey]copyState
 	waiting map[moveKey]int64
@@ -68,6 +75,9 @@ type Agent struct {
 	// so that one handover is reported once however often its last step is
 	// sent again.
 	handed map[moveKey]uint32
+	// lockSince is when a Slot ready to be frozen was first seen to have
+	// Locked keys.
+	lockSince map[moveKey]int64
 }
 
 type moveKey struct {
@@ -95,6 +105,7 @@ func (a *Agent) Reset() {
 	// may still arrive and be recorded.
 	a.copying, a.waiting, a.frozen = map[moveKey]copyState{}, map[moveKey]int64{}, map[moveKey]int64{}
 	a.promised, a.handed = map[moveKey]int64{}, map[moveKey]uint32{}
+	a.lockSince = map[moveKey]int64{}
 }
 
 // Step moves each Move of Group g along by at most one step. It must be
@@ -182,6 +193,31 @@ func (a *Agent) slot(env Env, g shard.GroupID, term core.Term, slot shard.Slot, 
 			cp = copyState{term: term, epoch: info.Epoch} // start from the beginning
 		}
 		if cp.done {
+			// A Slot with Locked keys isn't frozen: look again shortly
+			// (A§12.7).
+			var held []shardfsm.Held
+			env.WithMachine(g, func(m *shardfsm.Machine) { held = m.LockedInBy(slot) })
+			if len(held) > 0 {
+				if _, seen := a.lockSince[key]; !seen {
+					a.lockSince[key] = env.Now()
+				}
+				if a.AbortForMoves {
+					// Each is aborted by its own Coordinator Group, unless
+					// it is decided already; then its finish is on the way.
+					for _, h := range held {
+						abort := shardfsm.DecideStep(h.ID, false, 0, nil, nil).Encode()
+						env.Ask(h.Coord, abort, func(bool, []byte) {})
+					}
+					a.waiting[key] = env.Now() + a.Patience/4
+				}
+				return
+			}
+			if since, seen := a.lockSince[key]; seen {
+				delete(a.lockSince, key)
+				if a.OnLockWait != nil {
+					a.OnLockWait(g, slot, env.Now()-since)
+				}
+			}
 			// Once the freeze is Committed the Slot is refusing its
 			// clients, so don't wait for the next look: send the rest now.
 			wait()
@@ -205,8 +241,11 @@ func (a *Agent) slot(env Env, g shard.GroupID, term core.Term, slot shard.Slot, 
 		}, nil)
 
 	case shardfsm.Frozen:
-		if row.Group == info.Peer && row.Epoch > info.Epoch {
-			// The table says the other Group has it: let go.
+		if row.Epoch > info.Epoch {
+			// The table has the Slot at a later Epoch, which it reaches
+			// only once the other Group has taken it: let go. The Slot may
+			// have moved on again since, even back towards this Group, and
+			// it can't be taken in here until this copy is dropped.
 			local(shardfsm.DropStep(slot, info.Epoch))
 			return
 		}

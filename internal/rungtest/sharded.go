@@ -38,6 +38,9 @@ type ShardedStore struct {
 	Replacing cluster.Replacing
 	// Balancing is how load is evened out (cluster.Config).
 	Balancing cluster.Balancing
+	// Transactions is how a Transaction across Groups is carried out
+	// (cluster.Config).
+	Transactions cluster.Transactions
 }
 
 // ShardedScenario injects Faults, and asks for Moves, between times from
@@ -59,6 +62,7 @@ func RunSharded(store ShardedStore, sc ShardedScenario, seed uint64) Report {
 		Gossip: store.Gossip, Spares: store.Spares, GossipLoss: store.GossipLoss,
 		SuspectAfter: store.SuspectAfter, DeadAfter: store.DeadAfter,
 		GossipDecides: store.GossipDecides, Replacing: store.Replacing, Balancing: store.Balancing,
+		Transactions: store.Transactions,
 	})
 	h := &check.History{}
 	rep := Report{Scenario: sc.Name, Seed: seed, Members: store.Nodes, History: h}
@@ -106,12 +110,15 @@ func RunSharded(store ShardedStore, sc ShardedScenario, seed uint64) Report {
 	rep.Diverged = c.EndState()
 	rep.Signals = h.Signals
 	rep.Recovery = h.Signals.RecoveryAfter(faultsEnd)
-	rep.Routing = Routing{Forwarded: c.Forwarded, WrongGroup: c.WrongGroup, Moving: c.Moving}
+	rep.Routing = Routing{Forwarded: c.Forwarded, WrongGroup: c.WrongGroup, Moving: c.Moving, Locked: c.Locked, TxnConflict: c.TxnConflict, TxnCommitted: c.TxnCommitted,
+		TxnWounded: c.TxnWounded, TxnRetries: c.TxnRetries, TxnGaveUp: c.TxnGaveUp, TxnMaxTries: c.TxnMaxTries}
 	rep.Pauses = c.Pauses
+	rep.LockWaits = c.LockWaits
 	rep.MovesAsked, rep.MovesTaken = c.MovesAsked, c.MovesTaken
 	rep.Diverged = append(rep.Diverged, c.GossipAgrees()...)
 	rep.TableLags, rep.GossipSent = c.TableLags, c.GossipSent
 	rep.MovedAt = c.MovedAt
+	rep.HalfCommitted = c.HalfCommitted()
 	rep.Replacements, rep.Drops = len(c.Replacements), len(c.Drops)
 	for _, r := range c.Replacements {
 		if r.Running {
@@ -414,5 +421,66 @@ var Rung7c = []ShardedScenario{
 			c.S.After(350+c.S.Rand().Int64N(100), step)
 		}
 		c.S.At(from+1000, step)
+	}},
+}
+
+// crashes stops a Node every so often and starts it again, between from
+// and to.
+func crashes(c *cluster.Cluster, from, to int64) {
+	var step func()
+	step = func() {
+		if c.S.Now() >= to {
+			return
+		}
+		nodes := c.NodeIDs()
+		n := nodes[c.S.Rand().IntN(len(nodes))]
+		c.CrashNode(n)
+		c.S.After(100+c.S.Rand().Int64N(250), func() { c.RestartNode(n) })
+		c.S.After(250+c.S.Rand().Int64N(300), step)
+	}
+	c.S.At(from+50, step)
+}
+
+// Rung8 lists the scenarios for Transactions across Groups (A§12.9). None
+// of them moves a Slot.
+var Rung8 = []ShardedScenario{
+	{"crashes", crashes},
+
+	// The network keeps splitting into two sides.
+	{"partitions", func(c *cluster.Cluster, from, to int64) {
+		var step func()
+		step = func() {
+			if c.S.Now() >= to {
+				return
+			}
+			nodes := c.NodeIDs()
+			c.S.Rand().Shuffle(len(nodes), func(i, j int) { nodes[i], nodes[j] = nodes[j], nodes[i] })
+			cut := 1 + c.S.Rand().IntN(2)
+			c.PartitionNodes(nodes[:cut], nodes[cut:])
+			c.S.After(150+c.S.Rand().Int64N(250), c.Heal)
+			c.S.After(400+c.S.Rand().Int64N(300), step)
+		}
+		c.S.At(from+50, step)
+	}},
+
+	// A Node in the middle of a Transaction is stopped there and then: one
+	// carrying it out from memory, one leading its Coordinator Group, or
+	// one leading a Group that has Locked keys for it.
+	{"stopped-mid-commit", func(c *cluster.Cluster, from, to int64) {
+		var watch func()
+		watch = func() {
+			if c.S.Now() >= to {
+				return
+			}
+			if mid := c.MidTransaction(); len(mid) > 0 && c.S.Rand().IntN(4) == 0 {
+				n := mid[c.S.Rand().IntN(len(mid))]
+				c.CrashNode(n)
+				c.S.After(100+c.S.Rand().Int64N(200), func() { c.RestartNode(n) })
+				c.S.After(300+c.S.Rand().Int64N(200), watch)
+				return
+			}
+			c.S.After(1, watch)
+		}
+		c.S.At(from+50, watch)
 	}},
 }

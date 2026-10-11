@@ -52,7 +52,7 @@ The History catches this in a fifth of the runs. The one-owner verdict catches i
 
 ### Reproduce
 ```
-go test -run 'TestUncheckedGroup|TestFlippedTable' -v ./internal/rungtest/
+go test -run 'TestUncheckedGroup|TestFlippedTable' -v ./internal/shardtest/
 ```
 
 ## Fix: the Move is confirmed by both Groups (P7a.7)
@@ -180,7 +180,7 @@ You asked for this to be tried once. Twelve Nodes, each Group on three of its ow
 
 ### Reproduce
 ```
-go test -run 'TestRung7a|TestUncheckedGroup|TestFlippedTable' ./internal/rungtest/
+go test -run 'TestRung7a|TestUncheckedGroup|TestFlippedTable' ./internal/shardtest/
 go test ./internal/shardfsm/ ./internal/meta/ ./internal/shard/ ./internal/cluster/
 CLIENTS=64 DATA_GROUPS=3 harness/run.sh local 5
 RETRY=1 DATA_GROUPS=3 harness/run.sh local 5 move-slots
@@ -253,7 +253,7 @@ This is Rung 6's failure, two Majorities, arrived at by a different road. It is 
 
 ### Reproduce
 ```
-go test -run 'TestOwnershipByGossip|TestMembersByGossip' -v ./internal/rungtest/
+go test -run 'TestOwnershipByGossip|TestMembersByGossip' -v ./internal/shardtest/
 ```
 
 ## Fix: gossip informs (P7b.1–P7b.2)
@@ -328,7 +328,7 @@ Throughput is what it was in 7a (700). Gossip costs nothing visible.
 
 ### Reproduce
 ```
-go test -run 'TestRung7b|TestOwnershipByGossip|TestMembersByGossip' ./internal/rungtest/
+go test -run 'TestRung7b|TestOwnershipByGossip|TestMembersByGossip' ./internal/shardtest/
 go test ./internal/gossip/ ./internal/cluster/
 RETRY=1 DATA_GROUPS=3 harness/run.sh local 5 move-and-kill
 DATA_GROUPS=3 harness/local.sh start 5 && harness/local.sh join 6 && harness/local.sh nodes
@@ -397,7 +397,7 @@ The Meta Leader moves the busiest Slot off the busiest Group whenever that Group
 
 ### Reproduce
 ```
-go test -run 'TestReplicasThatFollowTheTable|TestOneWordReplacement|TestNaiveRebalancing' ./internal/rungtest/
+go test -run 'TestReplicasThatFollowTheTable|TestOneWordReplacement|TestNaiveRebalancing' ./internal/shardtest/
 ```
 
 ## Fix: replacing a dead Node (P7c.1, P7c.3)
@@ -505,9 +505,9 @@ The same on Nodes in one process (`TestADeadNodeIsReplacedAndReturnsAsASpare`): 
 
 ### Reproduce
 ```
-go test -run 'TestRung7c' ./internal/rungtest/
+go test -run 'TestRung7c' ./internal/shardtest/
 go test ./internal/automation/ ./internal/cluster/ ./internal/server/
-KV_MEASURE=1 go test -run 'TestMeasure' -v ./internal/rungtest/
+KV_MEASURE=1 go test -run 'TestMeasure' -v ./internal/shardtest/
 RETRY=1 DATA_GROUPS=3 CLIENTS=64 harness/run.sh local 5 kill-for-good
 RETRY=1 DATA_GROUPS=3 SLOTS=8 CLIENTS=64 harness/run.sh local 5 skewed-load      # AUTO=0 to compare
 ```

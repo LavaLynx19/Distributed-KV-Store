@@ -44,17 +44,20 @@ type config struct {
 	// hotPct of requests go to hot, the keys of the Slots hotGroup starts
 	// with, in a store of slots Slots.
 	hotPct, hotGroup, slots int
-	hot                     []string
-	duration                time.Duration
-	timeout                 time.Duration
-	mark                    time.Duration
-	settle                  time.Duration
-	checkFor                time.Duration
-	seed                    uint64
-	retry                   bool
-	readPct                 int
-	ttlPct                  int
-	ttl                     time.Duration
+	// txnPct of requests are Transactions over two keys in different
+	// Groups (A§12).
+	txnPct   int
+	hot      []string
+	duration time.Duration
+	timeout  time.Duration
+	mark     time.Duration
+	settle   time.Duration
+	checkFor time.Duration
+	seed     uint64
+	retry    bool
+	readPct  int
+	ttlPct   int
+	ttl      time.Duration
 }
 
 func main() {
@@ -72,6 +75,7 @@ func main() {
 	flag.IntVar(&cfg.hotPct, "hot-pct", 0, "with -groups: percentage of requests that go to the keys of the Slots -hot-group starts with, to load one Group more than the rest (A§11.11)")
 	flag.IntVar(&cfg.hotGroup, "hot-group", 1, "with -hot-pct: the Group whose first Slots are the busy ones")
 	flag.IntVar(&cfg.slots, "slots", shard.DefaultSlots, "with -hot-pct: how many Slots the store has")
+	flag.IntVar(&cfg.txnPct, "txn-pct", 0, "with -groups: percentage of requests that are Transactions writing two keys in different Groups (A§12). They use keys of their own, t0, t1, …, and are counted and timed but not put in the History that is checked")
 	flag.IntVar(&cfg.readPct, "read-pct", 35, "percentage of requests that are gets; the rest keep the default write mix")
 	flag.IntVar(&cfg.ttlPct, "ttl-pct", 0, "percentage of puts that carry a time-to-live (A§6.7)")
 	flag.DurationVar(&cfg.ttl, "ttl", 200*time.Millisecond, "the longest time-to-live given; each is between a quarter of this and all of it")
@@ -106,6 +110,12 @@ type recorder struct {
 	latencies []time.Duration // of answered requests
 	reads     []time.Duration // of answered gets
 	writes    []time.Duration // of answered puts and deletes
+	// txns are the times committed Transactions across Groups took, each
+	// from its first attempt. conflicts counts attempts aborted to make
+	// way for another Transaction or a Move, and txnFailed Transactions
+	// that didn't commit.
+	txns                 []time.Duration
+	conflicts, txnFailed int
 }
 
 func (r *recorder) begin(client int, cmd fsm.Command) (int, time.Time) {
@@ -176,6 +186,10 @@ func run(cfg config) bool {
 	report("latency:", rec.latencies)
 	report("  reads:", rec.reads)
 	report("  writes:", rec.writes)
+	if cfg.txnPct > 0 {
+		fmt.Printf("transactions: %d committed across Groups (%.0f/s), %d attempts aborted over a conflict, %d not committed\n", len(rec.txns), float64(len(rec.txns))/elapsed.Seconds(), rec.conflicts, rec.txnFailed)
+		report("  each:", rec.txns)
+	}
 	if cfg.mark > 0 {
 		if pause := sig.LongestPauseAfter(int64(cfg.mark)); pause >= 0 {
 			fmt.Printf("recovery:    longest pause in successful writes after the mark at %s: %s\n", cfg.mark, round(time.Duration(pause)))
@@ -287,6 +301,10 @@ func (c *client) openSession(ctx context.Context) bool {
 // same request number, until it gets a definite answer or four timeouts
 // have passed; the History records one request either way.
 func (c *client) request() {
+	if c.cfg.txnPct > 0 && c.cfg.groups > 1 && c.rng.IntN(100) < c.cfg.txnPct {
+		c.transact()
+		return
+	}
 	cmd := c.pick()
 	if c.session != 0 {
 		c.seq++
@@ -316,6 +334,64 @@ func (c *client) request() {
 		case fsm.StatusNotFound:
 			c.seen[cmd.Key] = 0
 		}
+	}
+}
+
+// groupOf is the Group a key's Slot starts in.
+func (c *client) groupOf(key string) int {
+	return int(shard.SlotOf(key, c.cfg.slots))%c.cfg.groups + 1
+}
+
+// transact sends one Transaction that writes two keys in different Groups,
+// and sends it again with the age it was given for as long as it is
+// aborted to make way for another (A§12.5), up to 20 times.
+func (c *client) transact() {
+	a := fmt.Sprintf("t%d", c.rng.IntN(c.cfg.keys))
+	b := fmt.Sprintf("t%d", c.rng.IntN(c.cfg.keys))
+	for c.groupOf(b) == c.groupOf(a) {
+		b = fmt.Sprintf("t%d", c.rng.IntN(c.cfg.keys))
+	}
+	c.count++
+	value := fmt.Sprintf("c%d-%d", c.id, c.count)
+	began, age, conflicts, committed := time.Now(), int64(0), 0, false
+	for try := 0; try < 20 && !committed; try++ {
+		body := map[string]any{"writes": []map[string]string{{"op": "put", "key": a, "value": value}, {"op": "put", "key": b, "value": value}}}
+		if age != 0 {
+			body["age"] = age
+		}
+		raw, _ := json.Marshal(body) // strings and numbers always encode
+		resp, err := c.http.Post(c.target+"/v1/txn", "application/json", bytes.NewReader(raw))
+		if err != nil {
+			c.elsewhere()
+			break // outcome unknown: without a Session it can't be asked again
+		}
+		var ans struct {
+			Reason string `json:"reason"`
+			Age    int64  `json:"age"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&ans) // an unreadable answer leaves Reason empty
+		resp.Body.Close()
+		switch {
+		case resp.StatusCode == http.StatusOK:
+			committed = true
+		case ans.Reason == "txn_conflict":
+			age = ans.Age
+			conflicts++
+			time.Sleep(2 * time.Millisecond)
+		case resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusMisdirectedRequest:
+			c.elsewhere() // nothing changed: moving, or no Leader reached
+			time.Sleep(5 * time.Millisecond)
+		default:
+			try = 20 // outcome unknown
+		}
+	}
+	c.rec.mu.Lock()
+	defer c.rec.mu.Unlock()
+	c.rec.conflicts += conflicts
+	if committed {
+		c.rec.txns = append(c.rec.txns, time.Since(began))
+	} else {
+		c.rec.txnFailed++
 	}
 }
 

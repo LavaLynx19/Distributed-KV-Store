@@ -20,6 +20,7 @@ import (
 	"slices"
 
 	"distributed-kv-store/internal/automation"
+	"distributed-kv-store/internal/committer"
 	"distributed-kv-store/internal/core"
 	"distributed-kv-store/internal/fsm"
 	"distributed-kv-store/internal/gossip"
@@ -76,6 +77,9 @@ type Config struct {
 	Replacing Replacing
 	// Balancing is how load is measured and evened out (balance.go).
 	Balancing Balancing
+	// Transactions is how a Transaction across Groups is carried out
+	// (txn.go).
+	Transactions Transactions
 
 	// Unchecked makes data Groups answer for keys in Slots they don't own
 	// (shardfsm.Config.Unchecked), and FlipAtOnce makes a Move change the
@@ -137,6 +141,15 @@ type node struct {
 	// the machine is lost for good.
 	up, gone bool
 	side     int
+	// boots counts the times the machine has stopped. What a Node was
+	// doing in memory before a stop is not carried on after it.
+	boots int
+	// finishing counts the Transactions this Node has decided to commit
+	// and not yet heard every Group finish (txn.go).
+	finishing int
+	// committer carries on the Transactions of the Groups this Node
+	// leads (txn.go).
+	committer *committer.Agent
 	// gossip is this Node's gossip, if the store uses it.
 	gossip *gossip.Node
 	// watch is how long this Node's gossip has thought each Node dead, and
@@ -161,6 +174,23 @@ type Cluster struct {
 	nodes map[int]*node
 	// Signals count what the routing layer did.
 	Forwarded, WrongGroup, Moving int
+	// Locked counts requests refused because a key was Locked, and
+	// TxnConflict Transactions across Groups that were aborted for a reason
+	// other than their own conditions.
+	Locked, TxnConflict int
+	// TxnCommitted counts Transactions across Groups that committed.
+	TxnCommitted int
+	// TxnWounded counts the times an older Transaction had a younger one
+	// aborted.
+	TxnWounded int
+	// TxnRetries counts Transactions sent again after being aborted over
+	// a conflict, TxnGaveUp those whose client stopped sending them, and
+	// TxnMaxTries is the most attempts any Transaction took to be decided
+	// on its own conditions.
+	TxnRetries, TxnGaveUp, TxnMaxTries int
+	// LocksAsked counts the times a Group finished a Transaction on the
+	// answer to its own question, not on being told.
+	LocksAsked int
 	// MovesAsked counts the Moves requested, and MovesTaken those the Meta
 	// Group recorded the intent of.
 	MovesAsked, MovesTaken int
@@ -173,12 +203,20 @@ type Cluster struct {
 	// Pauses is how long each Slot that was handed over stayed frozen
 	// (mover.Agent.OnHandover).
 	Pauses []int64
+	// LockWaits is how long each Slot that was ready to be frozen waited
+	// for Transactions to let go of its keys.
+	LockWaits []int64
 
 	// owned is, per data Group, which Slots it serves as of the latest
 	// Entry any of its replicas has applied, and twoOwners the first moment
 	// two Groups served the same Slot by that measure (verdict.go).
 	owned     map[shard.GroupID]ownership
 	twoOwners string
+	// txnEnds is how each Transaction across Groups ended in each Group
+	// that prepared it, once per time it did, and txnGroups the Groups it
+	// was put to (txn.go).
+	txnEnds   map[shardfsm.TxnID]map[shard.GroupID][]bool
+	txnGroups map[shardfsm.TxnID][]shard.GroupID
 
 	// Replacements are the replacements the Meta Group took, and Drops the
 	// times a Node dropped a replica's data.
@@ -277,7 +315,9 @@ func New(cfg Config) *Cluster {
 			mover: &mover.Agent{Patience: patience, ChunkKeys: chunkKeys,
 				FlipAtOnce:            cfg.FlipAtOnce || cfg.GossipDecides.Ownership,
 				TakeWhatTheTableGives: cfg.GossipDecides.Ownership,
-				OnHandover:            func(_ shard.GroupID, _ shard.Slot, frozenFor int64) { c.Pauses = append(c.Pauses, frozenFor) }}}
+				OnHandover:            func(_ shard.GroupID, _ shard.Slot, frozenFor int64) { c.Pauses = append(c.Pauses, frozenFor) },
+				AbortForMoves:         cfg.Transactions.MovesAbort,
+				OnLockWait:            func(_ shard.GroupID, _ shard.Slot, waited int64) { c.LockWaits = append(c.LockWaits, waited) }}}
 	}
 	for _, g := range c.Groups() {
 		for _, r := range c.Founders(g) {
@@ -304,6 +344,10 @@ func New(cfg Config) *Cluster {
 	})
 	for _, n := range c.NodeIDs() {
 		c.S.After(1+c.S.Rand().Int64N(agentEvery), func() { c.agent(c.nodes[n]) })
+		c.nodes[n].committer = c.newCommitter()
+		if cfg.Transactions.On && !cfg.Transactions.Memory {
+			c.S.After(txnEvery, func() { c.txnLoop(c.nodes[n]) })
+		}
 	}
 	c.startGossip()
 	return c
@@ -324,7 +368,7 @@ func (c *Cluster) newMachine(id core.NodeID) sim.Machine {
 			owned = append(owned, shard.Slot(s))
 		}
 	}
-	return shardfsm.New(shardfsm.Config{Group: g, Slots: c.cfg.Slots, Owned: owned, SessionTTL: c.cfg.SessionTTL, Unchecked: c.cfg.Unchecked})
+	return shardfsm.New(shardfsm.Config{Group: g, Slots: c.cfg.Slots, Owned: owned, SessionTTL: c.cfg.SessionTTL, Unchecked: c.cfg.Unchecked, ReadLocked: c.cfg.Transactions.ReadLocked, NoOffset: c.cfg.Transactions.NoOffset, ForgetTxns: c.cfg.Transactions.Forget})
 }
 
 // Table is the Slot table Node n has cached.
@@ -353,6 +397,9 @@ func (c *Cluster) CrashNode(n int) {
 		c.S.Crash(r)
 	}
 	c.nodes[n].up = false
+	c.nodes[n].boots++
+	c.nodes[n].finishing = 0
+	c.nodes[n].committer.Reset()
 	c.nodes[n].mover.Reset()
 }
 
@@ -534,6 +581,19 @@ func (c *Cluster) rpcDelay() int64 { return rpcMin + c.S.Rand().Int64N(rpcMax-rp
 // definite refusal that changed nothing, or nothing known. If the reply is
 // lost, done is never called, and the client must time out.
 func (c *Cluster) Request(n int, cmd fsm.Command, done func(Outcome, fsm.Response)) {
+	c.request(n, cmd, 0, func(o Outcome, resp fsm.Response, _ int64) { done(o, resp) }, false)
+}
+
+// RequestAged is Request for a Transaction that may have been tried before:
+// age is the age its first attempt was given, or zero for a first attempt.
+// done is also told the Transaction's age, to send with the next attempt
+// if this one is aborted to make way for another (A§12.5).
+func (c *Cluster) RequestAged(n int, cmd fsm.Command, age int64, done func(Outcome, fsm.Response, int64)) {
+	c.request(n, cmd, age, done, false)
+}
+
+func (c *Cluster) request(n int, cmd fsm.Command, age int64, answer func(Outcome, fsm.Response, int64), waited bool) {
+	done := func(o Outcome, resp fsm.Response) { answer(o, resp, age) }
 	if !c.NodeUp(n) {
 		done(Refused, fsm.Response{})
 		return
@@ -552,6 +612,14 @@ func (c *Cluster) Request(n int, cmd fsm.Command, done func(Outcome, fsm.Respons
 		return
 	}
 	g, same := c.groupOf(nd.table, cmd)
+	if !same && c.cfg.Transactions.On {
+		if c.cfg.Transactions.Memory {
+			c.transact(n, cmd, done)
+		} else {
+			c.begin(n, cmd, age, answer)
+		}
+		return
+	}
 	if !same {
 		// The keys are owned by more than one Group (A§11.8).
 		done(Refused, fsm.Response{Status: fsm.StatusCrossGroup})
@@ -582,6 +650,18 @@ func (c *Cluster) Request(n int, cmd fsm.Command, done func(Outcome, fsm.Respons
 			done(Refused, resp)
 		case fsm.StatusMoving:
 			c.Moving++
+			done(Refused, resp)
+		case fsm.StatusLocked:
+			// The Group asks what was decided, and the request waits a
+			// little for the answer before it is refused (A§12.3).
+			if l, known := nd.leader[g]; known {
+				c.nodes[NodeOf(l)].committer.Nudge()
+			}
+			if !waited && c.cfg.Transactions.On && !c.cfg.Transactions.Memory && !c.cfg.Transactions.NoAsking {
+				c.S.After(lockWait, func() { c.request(n, cmd, age, answer, true) })
+				return
+			}
+			c.Locked++
 			done(Refused, resp)
 		default:
 			if l, known := nd.leader[g]; known {
