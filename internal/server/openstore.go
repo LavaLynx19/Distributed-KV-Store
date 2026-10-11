@@ -124,7 +124,7 @@ func OpenStore(ctx context.Context, cfg StoreConfig) (*Store, func(), error) {
 					owned = append(owned, shard.Slot(slot))
 				}
 			}
-			machine = shardfsm.New(shardfsm.Config{Group: g, Slots: cfg.Slots, Owned: owned, SessionTTL: cfg.SessionTTL.Milliseconds()})
+			machine = shardfsm.New(shardfsm.Config{Group: g, Slots: cfg.Slots, Owned: owned, SessionTTL: cfg.SessionTTL.Milliseconds(), ForgetTxns: true})
 		}
 		h := &handle{done: make(chan struct{})}
 		var stored core.Stored

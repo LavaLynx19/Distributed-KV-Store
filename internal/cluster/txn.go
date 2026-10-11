@@ -243,7 +243,7 @@ func (c *Cluster) begin(n int, cmd fsm.Command, age int64, answer func(Outcome, 
 		// found, and no older than a client can honestly say (A§12.5).
 		age = max(nd.table.StoreTime, 1)
 	}
-	started := c.S.Now()
+	started, tries := c.S.Now(), 0
 	done := func(o Outcome, resp fsm.Response) { answer(o, resp, age) }
 	id := shardfsm.TxnID{Session: cmd.Session, Seq: cmd.Seq}
 	split := split(nd.table, cmd)
@@ -290,14 +290,15 @@ func (c *Cluster) begin(n int, cmd fsm.Command, age int64, answer func(Outcome, 
 			wait()
 		case state == shardfsm.TxnRefused && resp.Status == fsm.StatusSessionExpired:
 			done(Answered, resp)
-		case state == shardfsm.TxnRefused && resp.Status == fsm.StatusTxnConflict && nd.committer.Yield(txnEnv{c, nd}, shardfsm.Held{ID: id, Coord: lead, Age: age}, resp, started):
+		case state == shardfsm.TxnRefused && resp.Status == fsm.StatusTxnConflict && nd.committer.Yield(txnEnv{c, nd}, shardfsm.Held{ID: id, Coord: lead, Age: age}, resp, started, false):
 			// The Coordinator Group's own keys are Locked, and nothing is
 			// held for this Transaction yet: try again shortly.
-			c.S.After(txnRetry, func() {
+			c.S.After(committer.Backoff(txnRetry, tries), func() {
 				if nd.up && nd.boots == boot {
 					c.ask(n, lead, false, build, settle)
 				}
 			})
+			tries++
 		case state == shardfsm.TxnRefused:
 			if resp.Status == fsm.StatusWrongGroup {
 				c.WrongGroup++

@@ -21,6 +21,12 @@ import (
 // Group, each on 3 Nodes, with 8 Slots, and returns each Node's URL.
 func startStore(t *testing.T, nodes int) map[int]string {
 	t.Helper()
+	return startStoreOf(t, nodes, 2)
+}
+
+// startStoreOf is startStore with the number of data Groups given.
+func startStoreOf(t *testing.T, nodes, groups int) map[int]string {
+	t.Helper()
 	listeners, peers, clients := map[int]net.Listener{}, map[int]string{}, map[int]string{}
 	apis := map[int]*httptest.Server{}
 	for n := 1; n <= nodes; n++ {
@@ -38,7 +44,7 @@ func startStore(t *testing.T, nodes int) map[int]string {
 	for n := 1; n <= nodes; n++ {
 		ctx, cancel := context.WithCancel(context.Background())
 		store, stop, err := server.OpenStore(ctx, server.StoreConfig{
-			Node: n, Nodes: nodes, Groups: 2, Replicas: 3, Slots: 8,
+			Node: n, Nodes: nodes, Groups: groups, Replicas: 3, Slots: 8,
 			Peers: peers, Clients: clients, Listener: listeners[n], Data: t.TempDir(),
 			Tick: 5 * time.Millisecond, ElectionTicks: 40, HeartbeatTicks: 1,
 			SnapshotEvery: 50, Timeout: 2 * time.Second, GossipEvery: 20 * time.Millisecond,
@@ -109,12 +115,10 @@ func TestStoreRoutesMovesAndRefuses(t *testing.T) {
 	}
 
 	// Slot 0 starts in Group 1 and Slot 1 in Group 2. A Transaction over
-	// both is refused; one inside a Group works.
+	// both is carried out by both (A§12); so is one inside a Group.
 	a, b := keyInSlot(0, 0), keyInSlot(1, 0)
 	across := fmt.Sprintf(`{"writes":[{"op":"put","key":%q,"value":"x"},{"op":"put","key":%q,"value":"x"}]}`, a, b)
-	if r := eventually(t, 400, "POST", urls[1]+"/v1/txn", across); r.body["reason"] != "cross_group" {
-		t.Fatalf("a Transaction across Groups: %+v", r)
-	}
+	eventually(t, 200, "POST", urls[1]+"/v1/txn", across)
 	within := fmt.Sprintf(`{"writes":[{"op":"put","key":%q,"value":"x"},{"op":"put","key":%q,"value":"x"}]}`, a, keyInSlot(2, 0))
 	eventually(t, 200, "POST", urls[1]+"/v1/txn", within)
 

@@ -241,8 +241,11 @@ func (a *Agent) slot(env Env, g shard.GroupID, term core.Term, slot shard.Slot, 
 		}, nil)
 
 	case shardfsm.Frozen:
-		if row.Group == info.Peer && row.Epoch > info.Epoch {
-			// The table says the other Group has it: let go.
+		if row.Epoch > info.Epoch {
+			// The table has the Slot at a later Epoch, which it reaches
+			// only once the other Group has taken it: let go. The Slot may
+			// have moved on again since, even back towards this Group, and
+			// it can't be taken in here until this copy is dropped.
 			local(shardfsm.DropStep(slot, info.Epoch))
 			return
 		}

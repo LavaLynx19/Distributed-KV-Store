@@ -81,6 +81,9 @@ type Agent struct {
 
 	open    map[txnKey]*state
 	wounded map[shardfsm.TxnID]int64
+	// settled is when the Agent last asked what became of each
+	// Transaction that was in another's way.
+	settled map[txnKey]int64
 	nudged  bool
 }
 
@@ -104,6 +107,10 @@ type state struct {
 	// blocked is when each Group first answered that a key was Locked by
 	// another Transaction, while this one is still trying for it.
 	blocked map[shard.GroupID]int64
+	// tries is how often each Group has given that answer in a row.
+	tries map[shard.GroupID]int
+	// finishing is set once the Agent has seen the Transaction decided.
+	finishing bool
 }
 
 // Reset forgets everything, as a Node that restarts does.
@@ -111,6 +118,7 @@ func (a *Agent) Reset() {
 	// New maps, not nil: an answer to something asked before the restart
 	// may still arrive and be recorded.
 	a.open, a.wounded, a.nudged = map[txnKey]*state{}, map[shardfsm.TxnID]int64{}, false
+	a.settled = map[txnKey]int64{}
 }
 
 // Nudge has the Agent ask about Locks at its next Step without waiting for
@@ -198,7 +206,7 @@ func (a *Agent) coordinate(env Env, g shard.GroupID, t shardfsm.Coordinated, key
 	now := env.Now()
 	st := a.open[key]
 	if st == nil {
-		st = &state{since: now, votes: map[shard.GroupID]fsm.Response{}, yes: map[shard.GroupID]bool{}, asked: map[shard.GroupID]int64{}, blocked: map[shard.GroupID]int64{}, proposed: now - a.AskAgain}
+		st = &state{since: now, votes: map[shard.GroupID]fsm.Response{}, yes: map[shard.GroupID]bool{}, asked: map[shard.GroupID]int64{}, blocked: map[shard.GroupID]int64{}, tries: map[shard.GroupID]int{}, proposed: now - a.AskAgain}
 		a.open[key] = st
 	}
 	due := func(p shardfsm.Part) bool {
@@ -207,6 +215,12 @@ func (a *Agent) coordinate(env Env, g shard.GroupID, t shardfsm.Coordinated, key
 	}
 
 	if t.Decided {
+		if !st.finishing {
+			// The finishes are a new step: when the prepares were sent has
+			// no bearing on when these are due.
+			st.finishing = true
+			clear(st.asked)
+		}
 		for _, p := range t.Parts {
 			if slices.Contains(t.Confirmed, p.Group) || !due(p) {
 				continue
@@ -237,9 +251,14 @@ func (a *Agent) coordinate(env Env, g shard.GroupID, t shardfsm.Coordinated, key
 				if _, was := st.blocked[p.Group]; !was {
 					st.blocked[p.Group] = env.Now()
 				}
-				if a.Yield(env, shardfsm.Held{ID: t.ID, Coord: g, Age: t.Age}, resp, st.blocked[p.Group]) {
-					// Nothing is held there: try for the key again shortly.
-					st.asked[p.Group] = env.Now() - a.AskAgain + a.Retry
+				a.settle(env, p.Group, resp)
+				if a.Yield(env, shardfsm.Held{ID: t.ID, Coord: g, Age: t.Age}, resp, st.blocked[p.Group], true) {
+					// Nothing is held there: try for the key again shortly,
+					// and less often each time. Every try is an Entry in
+					// that Group's Log, which the Transaction in the way
+					// needs room in to finish.
+					st.asked[p.Group] = env.Now() - a.AskAgain + Backoff(a.Retry, st.tries[p.Group])
+					st.tries[p.Group]++
 					return
 				}
 			}
@@ -285,13 +304,53 @@ func (a *Agent) coordinate(env Env, g shard.GroupID, t shardfsm.Coordinated, key
 	env.Local(g, shardfsm.DecideStep(t.ID, commit, version, offers, failed).Encode())
 }
 
+// Backoff is how long to wait before the try after tries failed ones: the
+// first wait, doubled each time up to eight times over.
+func Backoff(first int64, tries int) int64 { return first << min(tries, 3) }
+
+// settle is what a prepare does about the Transaction that has its key
+// Locked in Group g, before it thinks of waiting: it asks that
+// Transaction's Coordinator Group what was decided, and if it is over,
+// tells g so. A Lock can outlive its Transaction where a prepare arrived
+// after the finish, and g would otherwise find out only when the Lock had
+// grown old (A§12.3).
+func (a *Agent) settle(env Env, g shard.GroupID, resp fsm.Response) {
+	holder, named := shardfsm.DecodeHeld(resp.Value)
+	now, key := env.Now(), txnKey{g, holder.ID}
+	if at, asked := a.settled[key]; !named || holder.Coord == g || a.NoAsking || (asked && now-at < a.LockAskAgain) {
+		return
+	}
+	for k, at := range a.settled {
+		if now-at >= a.AskAgain {
+			delete(a.settled, k)
+		}
+	}
+	a.settled[key] = now
+	env.Ask(holder.Coord, true, shardfsm.OutcomeQuery(holder.ID, g), func(answered bool, raw []byte) {
+		state, was, offer, err := shardfsm.DecodeOutcome(raw)
+		if !answered || err != nil || state == shardfsm.TxnBegun {
+			return
+		}
+		commit := state == shardfsm.TxnDecided && was.Status == fsm.StatusOK
+		finish := shardfsm.FinishStep(holder.ID, holder.Coord, false, commit, was.Version, offer)
+		env.Ask(g, false, finish.Encode(), func(bool, []byte) {})
+	})
+}
+
 // Yield decides what a Transaction does on finding a key Locked by
 // another, and reports whether it should try for the key again. resp is
 // the answer that said the key was Locked, and since is when this
 // Transaction first found it so. With OlderWins, the older of the two has
 // the younger aborted and tries again; the younger tries again for a while
 // and then gives way.
-func (a *Agent) Yield(env Env, me shardfsm.Held, resp fsm.Response, since int64) bool {
+//
+// holding says whether this Transaction has keys Locked anywhere yet. One
+// that has none can't be part of a ring of Transactions waiting for each
+// other, so it has no need to abort anybody at once: it would only throw
+// away the work of one that may be a moment from done. It waits as long as
+// a younger one would, and has the other aborted only then, so that it
+// isn't kept out for ever.
+func (a *Agent) Yield(env Env, me shardfsm.Held, resp fsm.Response, since int64, holding bool) bool {
 	holder, named := shardfsm.DecodeHeld(resp.Value)
 	now := env.Now()
 	switch a.Conflicts {
@@ -303,6 +362,9 @@ func (a *Agent) Yield(env Env, me shardfsm.Held, resp fsm.Response, since int64)
 		}
 		if !me.Older(holder) {
 			return now-since < a.Wait
+		}
+		if !holding && now-since < a.Wait {
+			return true
 		}
 		// The younger one is aborted by its own Coordinator Group, if it
 		// isn't decided yet. Either way its Locks go. It is asked once,

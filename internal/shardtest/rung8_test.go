@@ -119,7 +119,7 @@ var readLocked = sharded(func(s *rungtest.ShardedStore) {
 // and another Group may not have heard yet. A read of its key in between
 // gets the old value: a Stale read. No Fault is needed.
 func TestReadableLockIsExposed(t *testing.T) {
-	for _, seed := range []uint64{35, 39, 42} {
+	for _, seed := range []uint64{28, 29, 53} {
 		if r := rungtest.RunSharded(readLocked, shardedScenario(t, "no-moves"), seed); r.Linearizable {
 			t.Errorf("seed %d: expected a History that isn't Linearizable, got %v", seed, r)
 		}
@@ -166,7 +166,7 @@ func TestLocksNobodyAsksAboutAreLeft(t *testing.T) {
 	for _, c := range []struct {
 		scenario string
 		seed     uint64
-	}{{"crashes", 82}, {"stopped-mid-commit", 76}, {"stopped-mid-commit", 150}} {
+	}{{"crashes", 158}, {"crashes", 297}, {"stopped-mid-commit", 38}} {
 		if r := rungtest.RunSharded(noAsking, scenario8(t, c.scenario), c.seed); len(r.Diverged) == 0 {
 			t.Errorf("%s, seed %d: expected keys left Locked, got %v", c.scenario, c.seed, r)
 		}
@@ -210,6 +210,12 @@ func TestRung8aRegressions(t *testing.T) {
 		// prepare long after the Transaction had committed and the Group
 		// had forgotten the Session. The Group committed it again.
 		{busy8, shardedScenario(t, "moves-and-everything"), 56},
+		// Not a Transaction at all: a Group that had given a Slot away was
+		// cut off before it dropped its copy, the Slot moved on twice, and
+		// it was to come back. The Group never dropped the old copy, since
+		// the table no longer named the Group it had given the Slot to,
+		// and so could never take the Slot in. Rung 7's Move, found here.
+		{busy8, shardedScenario(t, "moves-and-everything"), 14},
 	} {
 		if r := rungtest.RunSharded(c.store, c.scenario, c.seed); !r.Passed() {
 			t.Errorf("%v %v", r, r.Diverged)

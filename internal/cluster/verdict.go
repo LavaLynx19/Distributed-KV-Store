@@ -175,7 +175,14 @@ func (c *Cluster) EndState() []string {
 			diffs = append(diffs, fmt.Sprintf("Slot %d: the table says Group %d, and it is served by %v", s, row.Group, got))
 		}
 		if row.MovingTo != 0 {
-			diffs = append(diffs, fmt.Sprintf("Slot %d: still moving to Group %d", s, row.MovingTo))
+			at := func(g shard.GroupID) string {
+				if l := c.Leader(g); l != 0 {
+					m := c.machine(l)
+					return fmt.Sprintf("%+v with %d keys Locked", m.Slots()[s], m.LockedIn(shard.Slot(s)))
+				}
+				return "no Leader"
+			}
+			diffs = append(diffs, fmt.Sprintf("Slot %d: still moving from Group %d (%s) to Group %d (%s)", s, row.Group, at(row.Group), row.MovingTo, at(row.MovingTo)))
 		}
 	}
 	if c.cfg.Replacing.On {
