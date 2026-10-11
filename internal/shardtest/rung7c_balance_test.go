@@ -1,4 +1,4 @@
-package rungtest_test
+package shardtest
 
 import (
 	"fmt"

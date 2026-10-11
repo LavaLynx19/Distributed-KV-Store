@@ -144,6 +144,7 @@ internal/server/   HTTP API
 internal/sim/      Simulation: scheduler, clock, network, disk
 internal/check/    History, Porcupine model, End-state comparison, signals
 internal/rungtest/ Fault scenarios per Rung, run against any core in the Simulation
+internal/shardtest/ the Rung tests for several Groups (Rungs 7–8), apart so that no package's tests outrun Go's limit
 harness/           run scripts for real runs
 deploy/            Docker Compose
 retros/            one retro per Rung

@@ -1,6 +1,6 @@
 # Rung 8 retro: Transactions across Groups
 
-Status: **stage 8a done, waiting for approval. Stage 8b not started.** Rung 8 is built in two stages (A§12.1). This file has a part per stage, and the verdict for the whole Rung at the end.
+Status: **stage 8a done and approved. Stage 8b under way.** Rung 8 is built in two stages (A§12.1). This file has a part per stage, and the verdict for the whole Rung at the end.
 
 Stage 8a in one paragraph: a Transaction whose keys are in several Groups commits in all of them or none, with every step in the Log of its Coordinator Group. 5,400 simulated runs under crashes, Partitions and Moves committed 112,948 such Transactions with none half-committed, no History that isn't Linearizable, and nothing left Locked. Four shortcuts were shipped first and seen failing. Two bugs that none of the planned exposures would have shown were found by the suite and are described below. Nothing here has run as real processes yet: that is stage 8b.
 
@@ -83,17 +83,17 @@ Two more were found by reading, not by a failing run, and are fixed and unit-tes
 - Records in the Coordinator Group are never removed, so its Snapshots grow with every Transaction (stage 8b).
 - A Coordinator Group without a Majority leaves the other Groups' keys Locked (A§12.4). No scenario here loses a Majority for good.
 - The longest pause of a moving Slot under crashes and Partitions together reached 2,698 units. Whether Locks made that worse than in Rung 7 was not compared.
-- The whole suite now takes 524 s, against Go's limit of 600 s for one package.
+- The Rung tests ran for 524 s in one package, against Go's limit of 600 s. The tests of Rungs 7 and 8 now have a package of their own, `internal/shardtest`.
 
 ## Reproduce
 
 ```
-go test ./internal/rungtest -run 'Rung8a|Txn|Decision|ReadableLock|NoOffset|Locks'
-KV_MEASURE=1 go test ./internal/rungtest -run TestMeasureRung8a -v -timeout 30m
+go test ./internal/shardtest -run 'Rung8a|Txn|Decision|ReadableLock|NoOffset|Locks'
+KV_MEASURE=1 go test ./internal/shardtest -run TestMeasureRung8a -v -timeout 30m
 ```
 
 Seeds kept as tests: decision in memory (stopped-mid-commit 66, 72, 89; crashes 24, 25; partitions 67, 94), readable Lock (no Faults 35, 39, 42), no offset (1–3), no asking (crashes 82; stopped-mid-commit 76, 80, 150), and the regressions above.
 
 ## Verdict (8a)
 
-Atomic under Coordinator and participant crashes, in the Simulation: yes, 5,400 runs. Nothing stays undecided: yes, while every Group has a Majority. Waiting for approval before stage 8b.
+Atomic under Coordinator and participant crashes, in the Simulation: yes, 5,400 runs. Nothing stays undecided: yes, while every Group has a Majority. Approved by the user.

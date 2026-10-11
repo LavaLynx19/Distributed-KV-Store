@@ -1,4 +1,4 @@
-package rungtest_test
+package shardtest
 
 import (
 	"testing"
@@ -20,8 +20,8 @@ func sharded(tune func(*rungtest.ShardedStore)) rungtest.ShardedStore {
 		},
 		Workload: cluster.DefaultWorkload,
 		Nodes:    5, Groups: 3, Replicas: 3, Slots: 8,
-		DiskDelay:     rung3Store.DiskDelay,
-		SnapshotEvery: rung3Store.SnapshotEvery,
+		DiskDelay:     [2]int64{1, 6}, // as from Rung 3
+		SnapshotEvery: 20,
 		TearWrites:    true,
 	}
 	tune(&s)
