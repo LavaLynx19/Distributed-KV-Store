@@ -13,16 +13,21 @@ import (
 )
 
 // The waits of a Transaction across Groups between real Nodes (A§12), in
-// milliseconds. They stand in the same order as the Simulation's.
+// milliseconds. They stand in the same order as the Simulation's, and are
+// sized for a step that takes about 100 ms, which is what one takes here
+// with 64 clients and twelve replicas on one disk. With the waits first
+// chosen, for a step of 16 ms, a younger Transaction gave way after 400 ms
+// to an older one that needed that long just to finish, and a step was sent
+// a second time while the first was still on its way.
 const (
-	txnAskAgain   = 250  // before a step is sent again
-	txnGiveUp     = 3000 // before a Leader aborts for want of an answer
-	lockAskAfter  = 200  // how old a Lock is before its Group asks about it
+	txnAskAgain   = 1000 // before a step is sent again
+	txnGiveUp     = 4000 // before a Leader aborts for want of an answer
+	lockAskAfter  = 400  // how old a Lock is before its Group asks about it
 	lockAskAgain  = 20   // how soon it asks again while a request waits
 	lockWait      = 60   // how long a request for a Locked key waits
 	txnRetry      = 20   // before a Transaction tries again for a Locked key
-	txnWait       = 400  // how long a younger one keeps trying
-	txnWoundAgain = 500  // before the same Transaction is asked to abort again
+	txnWait       = 1500 // how long a younger one keeps trying
+	txnWoundAgain = 1000 // before the same Transaction is asked to abort again
 )
 
 // txnEnv is what the committer sees of a real Node. Answers to what it

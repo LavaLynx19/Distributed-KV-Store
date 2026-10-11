@@ -47,6 +47,7 @@
 #              by itself
 #   TXN_PCT=0  with DATA_GROUPS: percentage of requests that are Transactions
 #              writing two keys in different Groups (A§12)
+#   KEYS=50    number of distinct keys the clients use
 #
 # Output is also saved to harness/out/run-<backend>-<members>-<fault>.txt.
 set -euo pipefail
@@ -130,6 +131,7 @@ log="$OUT/run-$BACKEND-$N-$FAULT${TAG:+-$TAG}.txt"
   [[ -n "${TTL_PCT:-}" ]] && bench+=(-ttl-pct "$TTL_PCT")
   [[ -n "${DATA_GROUPS:-}" ]] && bench+=(-groups "$DATA_GROUPS")
   [[ -n "${TXN_PCT:-}" ]] && bench+=(-txn-pct "$TXN_PCT" -slots "${SLOTS:-64}")
+  [[ -n "${KEYS:-}" ]] && bench+=(-keys "$KEYS")
   if [[ $FAULT == none ]]; then
     "${bench[@]}"
     status=$?
