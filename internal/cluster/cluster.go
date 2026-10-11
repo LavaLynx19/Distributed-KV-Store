@@ -20,6 +20,7 @@ import (
 	"slices"
 
 	"distributed-kv-store/internal/automation"
+	"distributed-kv-store/internal/committer"
 	"distributed-kv-store/internal/core"
 	"distributed-kv-store/internal/fsm"
 	"distributed-kv-store/internal/gossip"
@@ -146,15 +147,9 @@ type node struct {
 	// finishing counts the Transactions this Node has decided to commit
 	// and not yet heard every Group finish (txn.go).
 	finishing int
-	// coord is what this Node remembers of the Transactions it is
-	// carrying on for Groups it leads (txn.go).
-	coord map[coordKey]*coordState
-	// wounded is when this Node last asked for each Transaction to be
-	// aborted, for an older one.
-	wounded map[shardfsm.TxnID]int64
-	// nudged is set when a request found a key Locked in a Group this
-	// Node leads: its Locks are asked about at once.
-	nudged bool
+	// committer carries on the Transactions of the Groups this Node
+	// leads (txn.go).
+	committer *committer.Agent
 	// gossip is this Node's gossip, if the store uses it.
 	gossip *gossip.Node
 	// watch is how long this Node's gossip has thought each Node dead, and
@@ -349,8 +344,8 @@ func New(cfg Config) *Cluster {
 	})
 	for _, n := range c.NodeIDs() {
 		c.S.After(1+c.S.Rand().Int64N(agentEvery), func() { c.agent(c.nodes[n]) })
+		c.nodes[n].committer = c.newCommitter()
 		if cfg.Transactions.On && !cfg.Transactions.Memory {
-			c.nodes[n].coord = map[coordKey]*coordState{}
 			c.S.After(txnEvery, func() { c.txnLoop(c.nodes[n]) })
 		}
 	}
@@ -404,8 +399,7 @@ func (c *Cluster) CrashNode(n int) {
 	c.nodes[n].up = false
 	c.nodes[n].boots++
 	c.nodes[n].finishing = 0
-	clear(c.nodes[n].coord)
-	clear(c.nodes[n].wounded)
+	c.nodes[n].committer.Reset()
 	c.nodes[n].mover.Reset()
 }
 
@@ -661,7 +655,7 @@ func (c *Cluster) request(n int, cmd fsm.Command, age int64, answer func(Outcome
 			// The Group asks what was decided, and the request waits a
 			// little for the answer before it is refused (A§12.3).
 			if l, known := nd.leader[g]; known {
-				c.nodes[NodeOf(l)].nudged = true
+				c.nodes[NodeOf(l)].committer.Nudge()
 			}
 			if !waited && c.cfg.Transactions.On && !c.cfg.Transactions.Memory && !c.cfg.Transactions.NoAsking {
 				c.S.After(lockWait, func() { c.request(n, cmd, age, answer, true) })
