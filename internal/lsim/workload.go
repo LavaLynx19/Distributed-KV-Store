@@ -31,6 +31,10 @@ type Call struct {
 	Values []string
 	// Cut is whether a Partition was in force when the request began.
 	Cut bool
+	// TTL is the time-to-live an addition was given, or zero.
+	TTL int64
+	// Items is how many keys a scan returned.
+	Items int
 }
 
 // History is every Call of a run, in the order they began.
@@ -45,6 +49,11 @@ type Workload struct {
 	Keys, Elems int
 	Timeout     int64 // how long a client waits for an answer
 	Think       int64 // a client pauses 1..Think units between requests
+	// TTLPercent of additions carry a time-to-live of TTL[0]..TTL[1]
+	// units, and ScanPercent of requests are scans of every key.
+	TTLPercent  int
+	TTL         [2]int64
+	ScanPercent int
 }
 
 // DefaultWorkload has five clients, each talking to one Node, so that a
@@ -68,12 +77,16 @@ func (w Workload) next(s *Sim, h *History, client int, node leaderless.NodeID, u
 	}
 	call := &Call{Client: client, Begin: s.now, Cut: s.Cut(s.now),
 		Key: fmt.Sprintf("k%d", s.rng.IntN(w.Keys)), Elem: fmt.Sprintf("e%d", s.rng.IntN(w.Elems))}
-	switch roll := s.rng.IntN(100); {
-	case roll < 40:
+	if w.ScanPercent > 0 && s.rng.IntN(100) < w.ScanPercent {
+		call.Op, call.Key, call.Elem = leaderless.Scan, "", ""
+	} else if roll := s.rng.IntN(100); roll < 40 {
 		call.Op, call.Elem = leaderless.Get, ""
-	case roll < 80:
+	} else if roll < 80 {
 		call.Op = leaderless.Add
-	default:
+		if w.TTLPercent > 0 && s.rng.IntN(100) < w.TTLPercent {
+			call.TTL = w.TTL[0] + s.rng.Int64N(w.TTL[1]-w.TTL[0]+1)
+		}
+	} else {
 		call.Op = leaderless.Remove
 	}
 	h.Calls = append(h.Calls, call)
@@ -87,8 +100,9 @@ func (w Workload) next(s *Sim, h *History, client int, node leaderless.NodeID, u
 		call.End, call.Result, call.Values = s.now, r, values
 		again()
 	}
-	ref, made := s.Request(node, call.Op, call.Key, call.Elem, func(r leaderless.Reply) {
+	ref, made := s.RequestTTL(node, call.Op, call.Key, call.Elem, call.TTL, func(r leaderless.Reply) {
 		if r.OK {
+			call.Items = len(r.Items)
 			end(Done, r.Values)
 		} else {
 			end(Unknown, nil)

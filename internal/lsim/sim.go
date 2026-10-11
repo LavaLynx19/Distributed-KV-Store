@@ -23,6 +23,11 @@ type Config struct {
 	W, R                 int
 	Mode                 leaderless.Mode
 	DeliverHints, Resend bool
+	// Exchange, Repair and Forgetful are passed on too.
+	Exchange, Repair, Forgetful bool
+	// Skew is how far each Node's wall clock is from the true time, by
+	// Node. A Node not named keeps true time.
+	Skew map[leaderless.NodeID]int64
 }
 
 const (
@@ -94,6 +99,7 @@ func (s *Sim) start(m *member) {
 	m.node = leaderless.New(leaderless.Config{
 		ID: m.id, Nodes: s.ids, W: s.cfg.W, R: s.cfg.R, Mode: s.cfg.Mode,
 		DeliverHints: s.cfg.DeliverHints, Resend: s.cfg.Resend,
+		Exchange: s.cfg.Exchange, Repair: s.cfg.Repair, Forgetful: s.cfg.Forgetful,
 		Stored: cloneStored(m.disk), Seed: s.rng.Uint64() >> 1,
 	})
 }
@@ -193,6 +199,15 @@ func (s *Sim) send(msg leaderless.Message) {
 // Node's Reply, and never if the Node stops first. It reports false, and
 // never calls done, if the Node isn't running: the request was never made.
 func (s *Sim) Request(id leaderless.NodeID, op leaderless.Op, key, elem string, done func(leaderless.Reply)) (ref uint64, made bool) {
+	return s.RequestTTL(id, op, key, elem, 0, done)
+}
+
+// Clock is a Node's wall clock.
+func (s *Sim) Clock(id leaderless.NodeID) int64 { return s.now + s.cfg.Skew[id] }
+
+// RequestTTL is Request for an addition that is to show for ttl units of
+// the Node's clock.
+func (s *Sim) RequestTTL(id leaderless.NodeID, op leaderless.Op, key, elem string, ttl int64, done func(leaderless.Reply)) (ref uint64, made bool) {
 	m := s.members[id]
 	if !m.up {
 		return 0, false
@@ -200,7 +215,7 @@ func (s *Sim) Request(id leaderless.NodeID, op leaderless.Op, key, elem string, 
 	s.nextRef++
 	ref = s.nextRef
 	m.waiting[ref] = done
-	s.step(m, leaderless.Request{Ref: ref, Op: op, Key: key, Elem: elem})
+	s.step(m, leaderless.Request{Ref: ref, Op: op, Key: key, Elem: elem, Now: s.Clock(id), TTL: ttl})
 	return ref, true
 }
 

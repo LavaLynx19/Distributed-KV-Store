@@ -130,12 +130,12 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P9a.5 Fix: the set where add wins (A§13.5) → §P9
 - [x] P9a.6 Fix: Hints delivered; writes sent on and retried (A§13.4) → §P9
 - [x] P9a.7 Stage 9a suite at W=1 R=1, W=2 R=2 and W=3 R=1; availability beside the consistent store of Rung 8 under the same scenarios; the 9a part of `retros/rung-9.md` → §P9
-- [ ] P9b.1 Expose: with no Exchange, a Home Node away longer than the retries last stays behind → §P9
-- [ ] P9b.2 Fix: the Exchange (A§13.6) → §P9
-- [ ] P9b.3 Expose: a remove forgotten at once lets an element come back; then keep the record (A§13.7) → §P9
-- [ ] P9b.4 Repair on read; the stale-read rate at R=1 before and after (A§13.6) → §P9
-- [ ] P9b.5 Time-to-live by stamped deadline, with the disagreement under clock skew measured; scans (A§13.8, A§13.9) → §P9
-- [ ] P9b.6 Stage 9b suite and the 9b part of the retro → §P9
+- [x] P9b.1 Expose: with no Exchange, a Home Node away longer than the retries last stays behind → §P9
+- [x] P9b.2 Fix: the Exchange (A§13.6) → §P9
+- [x] P9b.3 Expose: a remove forgotten at once lets an element come back; then keep the record (A§13.7) → §P9
+- [x] P9b.4 Repair on read; the stale-read rate at R=1 before and after (A§13.6) → §P9
+- [x] P9b.5 Time-to-live by stamped deadline, with the disagreement under clock skew measured; scans (A§13.8, A§13.9) → §P9
+- [x] P9b.6 Stage 9b suite and the 9b part of the retro → §P9
 - [ ] P9c.1 Real processes: a `kvnode` mode with HTTP, TCP and disk; `kvbench` workload and verdicts; local harness (A§13.12) → §P9
 - [~] P9c.2 Docker with the network cut, for the Leaderless variant and for the store of Rung 8 → blocked by: the user's leave to edit `deploy/docker-compose.yml`, asked with the exact change
 - [ ] P9c.3 The comparison runs, the 9c part and the Rung 9 verdict in the retro → §P9

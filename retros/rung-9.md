@@ -1,6 +1,6 @@
 # Rung 9 retro: the Leaderless variant
 
-Status: **stage 9a done, waiting for approval. Stages 9b and 9c not started.** Rung 9 is built in three stages (A§13.1). This file has a part per stage, and the verdict for the whole Rung at the end.
+Status: **stage 9a done and approved. Stage 9b done, waiting for approval. Stage 9c not started.** Rung 9 is built in three stages (A§13.1). This file has a part per stage, and the verdict for the whole Rung at the end.
 
 Stage 9a in one paragraph: a second store with no Leader, in which a key is a set of strings kept on three Home Nodes of five, a write is acknowledged when W Nodes have it, and a Node that isn't a Home Node stands in for one that can't be reached. With two Nodes cut off from three, the consistent store of Rung 8 gets 19% of its usual work done and the Leaderless variant at W=1 R=1 gets 92% done. With sets where add wins, 4,500 simulated runs lose no Acknowledged add. It does not yet always end Converged: that is stage 9b.
 
@@ -90,4 +90,85 @@ Seeds kept as tests: last-write-wins (long Partition 2, 4, 5; no Faults 10, 13, 
 
 ## Verdict (9a)
 
-No Acknowledged add lost and nothing back, at all three settings: yes, 4,500 runs. Converged: only with no Faults. Waiting for approval before stage 9b.
+No Acknowledged add lost and nothing back, at all three settings: yes, 4,500 runs. Converged: only with no Faults. Approved by the user.
+
+# Stage 9b: the Exchange, repair on read, removes, time-to-live, scans
+
+Environment: as stage 9a, with one more scenario: a Node down for most of the Fault time, far longer than any write is sent again for. The busy store gives 30% of additions a time-to-live, makes one request in ten a scan, and sets two Nodes' clocks 80 units slow and 120 fast.
+
+## Exposed
+
+300 seeds per cell, runs of 300 that failed a verdict.
+
+| Shortcut | No Faults | Long Partition | Partitions | Crashes | Long outage | Partitions and crashes |
+|---|---|---|---|---|---|---|
+| No Exchange, no repair, W=2 R=2: not Converged | 0 | 300 | 3 | 9 | 0 | 134 |
+| A remove forgotten at once: an element back | 276 | 295 | 287 | 278 | 285 | 282 |
+
+**No Exchange.** After a Partition that outlasts the sending again, Home Nodes stay apart for good, in every run.
+
+- **A long outage of one Node doesn't show it** (0 of 300). The Node's stand-ins hold everything it missed and hand it over when it returns. It takes a Partition, where the stand-in can be on the far side as well.
+
+**A remove forgotten at once.** Nearly every run, with or without Faults, ends with an element back that a client was told was removed. A Node that drops its record of a remove can't tell that element from one it has never heard of, and Home Nodes hear of things in different orders all the time.
+
+## The fix
+
+- **The Exchange (P9b.2).** Every 10 ticks a Node offers the next Node in turn a fingerprint of each key the two are both Home Nodes of. The other sends back what it holds of the keys that differ and asks for the rest. Three messages; a key is compared whole, by one fingerprint, not by ranges.
+- **The record of a remove is kept (P9b.3),** for good.
+- **Repair on read (P9b.4).** A read is answered at R, waits for the other Home Nodes, and sends what it found to those that had less.
+- **Time-to-live (P9b.5).** An addition carries a deadline from the clock of the Node that took it. Each Node shows the element until its own clock passes that. Nothing is removed from what is stored.
+- **Scans (P9b.5).** Every Node is asked for the keys in the range it is a Home Node of. The scan answers when all have, or after 10 ticks with what it has.
+
+## Results
+
+7,200 runs, 300 seeds per cell: the three settings and the busy store under the six scenarios. Every run ended Converged, with no Acknowledged add lost and nothing back.
+
+**What each way of converging is worth,** at W=1 R=1, runs of 300 not Converged:
+
+| | Long Partition | Partitions | Crashes | Partitions and crashes |
+|---|---|---|---|---|
+| Sending again and Hints only | 300 | 11 | 8 | 199 |
+| With repair on read | 0 | 0 | 0 | 0 |
+| With the Exchange | 0 | 0 | 0 | 0 |
+
+- **Repair on read alone converged every run.** That is the test, not the store: there are 6 keys and clients read all of them all the time. A key nobody reads would never be repaired, and no run here has one.
+- **Neither repair nor the Exchange lowers the stale-read rate.** At W=1 R=1 under the long Partition it is 2.96% with neither, 2.76% with repair, 2.87% with the Exchange, 2.69% with both. A read is stale while its side of the Partition hasn't got the write, and nothing can carry it across until the Partition ends.
+
+**Stale reads and removes that missed,** stage 9b, 300 seeds:
+
+| Setting | Stale reads, no Faults | Stale reads, long Partition | Removes that missed, long Partition |
+|---|---|---|---|
+| W=1 R=1 | 0.10% | 2.69% | 2.85% |
+| W=2 R=2 | 0.00% | 2.36% | 3.43% |
+| W=3 R=1 | 0.00% | 1.57% | 0.07% |
+
+- **A remove that missed** is one the client was told succeeded and that took nothing out, though an addition of that element had been acknowledged before it began and is there at the end. The Home Nodes it read from hadn't got the addition. About 3% of removes during a long Partition at the first two settings. It is the cost of add wins that a client can see: "removed" means "what this side had seen of it is removed".
+
+**Expiry.** With one Node's clock 100 units slow and another's 150 fast, an element given 400 units to live stopped showing 250 units apart on those two Nodes: exactly as far as their clocks are. What is stored stayed the same on every Home Node.
+
+## What the design got wrong
+
+- **"Comparing by hashes of ranges"** was left to settle and wasn't done. Every shared key's fingerprint is sent in every Exchange. With 6 keys that is nothing; with a million it is the whole cost of the Exchange.
+- **Repair on read was expected to lower stale reads.** It doesn't, measurably.
+
+## Not covered
+
+- **A Node that loses its disk.** It would come back counting its additions from one again, and its new additions would carry marks the others have already seen, and be taken for old news. A Node that loses its disk can't return under the same number. Not built, and no scenario loses a disk.
+- **A key nobody reads** and repair on read without the Exchange, as above.
+- **The cost of the Exchange** with many keys.
+- **Time-to-live under last-write-wins** isn't offered: the deadline belongs to an addition's mark, and last-write-wins has none.
+- An expired element is hidden and never deleted. What is stored only grows.
+- Real processes and Docker: stage 9c.
+
+## Reproduce
+
+```
+go test ./internal/leaderless ./internal/lsim
+KV_MEASURE=1 go test ./internal/lsim -run TestMeasureRung9b -v -timeout 30m
+```
+
+Seeds kept as tests: no Exchange (long Partition 1, 2, 3), a remove forgotten (no Faults 2, 4, 5).
+
+## Verdict (9b)
+
+Replicas converge after healing: yes, 7,200 runs. Waiting for approval before stage 9c.

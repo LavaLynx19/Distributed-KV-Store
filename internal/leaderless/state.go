@@ -150,13 +150,34 @@ type State struct {
 	Seen Dots
 	// Stamp is the number of the write that made this set (LastWriteWins).
 	Stamp Stamp
+	// Due is, for an addition made with a time-to-live, the wall-clock
+	// time at which it stops showing (A§13.8).
+	Due map[Dot]int64
 }
 
-// Values lists the elements, in order.
+// Values lists the elements, in order, whether or not they have expired.
 func (s State) Values() []string {
 	values := make([]string, 0, len(s.Elems))
 	for e := range s.Elems {
 		values = append(values, e)
+	}
+	slices.Sort(values)
+	return values
+}
+
+// Showing lists the elements that show at wall-clock time now: those with
+// an addition that has no deadline, or one that hasn't passed.
+func (s State) Showing(now int64) []string {
+	var values []string
+	for e, dots := range s.Elems {
+		live := len(dots) == 0
+		for _, d := range dots {
+			due, mortal := s.Due[d]
+			live = live || !mortal || due > now
+		}
+		if live {
+			values = append(values, e)
+		}
 	}
 	slices.Sort(values)
 	return values
@@ -173,6 +194,11 @@ func (s State) Canon() string {
 		dots := slices.Clone(s.Elems[e])
 		slices.SortFunc(dots, compareDots)
 		fmt.Fprintf(&b, "%q%v;", e, dots)
+		for _, d := range dots {
+			if due, mortal := s.Due[d]; mortal {
+				fmt.Fprintf(&b, "due %v:%d;", d, due)
+			}
+		}
 	}
 	for _, n := range s.Seen.nodes() {
 		if sp := s.Seen[n]; sp.UpTo > 0 || len(sp.More) > 0 {
@@ -202,6 +228,16 @@ func Join(mode Mode, a, b State) State {
 		}
 		if !slices.Contains(out.Elems[e], d) {
 			out.Elems[e] = append(out.Elems[e], d)
+		}
+		// A deadline belongs to the addition, and is the same wherever
+		// the addition is known.
+		for _, from := range []State{a, b} {
+			if due, mortal := from.Due[d]; mortal {
+				if out.Due == nil {
+					out.Due = map[Dot]int64{}
+				}
+				out.Due[d] = due
+			}
 		}
 	}
 	// A Dot stays if both have it, or if one has it and the other has
@@ -238,6 +274,20 @@ func (s State) with(elem string, add bool, stamp Stamp) State {
 		out.Elems[elem] = nil
 	} else {
 		delete(out.Elems, elem)
+	}
+	return out
+}
+
+// forgetful returns the State with its record of additions cut down to the
+// ones still there: what a Node that drops its record of a remove as soon
+// as it has applied it would hold. A copy of the key that missed the remove
+// then looks, to this one, like news.
+func (s State) forgetful() State {
+	out := State{Elems: s.Elems, Due: s.Due, Stamp: s.Stamp}
+	for _, dots := range s.Elems {
+		for _, d := range dots {
+			out.Seen = out.Seen.With(d)
+		}
 	}
 	return out
 }

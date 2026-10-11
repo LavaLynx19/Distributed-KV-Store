@@ -668,7 +668,7 @@ A key holds a **set of strings**. The routes are those of §7.1 and they mean so
 Three ways, each covering what the one before can't:
 1. Writes sent on and retried (§13.4) reach a Home Node that was briefly away.
 2. Hints reach one that was away while the write was made.
-3. **The Exchange.** Every so often each Node picks another, and for the keys they are both Home Nodes of, each takes what the other has and it lacks. This reaches a Node that was away longer than any retry lasts, or whose Hint-holder died (*to settle*: comparing by hashes of ranges, not key by key).
+3. **The Exchange.** Every so often each Node picks another, and for the keys they are both Home Nodes of, each takes what the other has and it lacks. This reaches a Node that was away longer than any retry lasts, or whose Hint-holder died. As built, a key is compared whole, by one fingerprint, and every shared key's fingerprint is sent each time: comparing by ranges was not done.
 
 **Repair on read.** A read asks R Home Nodes, joins their answers, returns that, and sends the joined set back to any that had less.
 
@@ -679,7 +679,7 @@ A Node that has applied a remove keeps the key's record of marks seen, even when
 An element added with a time-to-live carries a deadline: the wall clock of the Node that took the write, plus the time-to-live. Each Node stops showing the element once its own clock passes the deadline, and may then remove it locally. What is stored converges all the same. Under clock skew two Nodes disagree, for as long as the skew, about whether the element shows. This is Rung 5's naive store kept on purpose; the disagreement is measured.
 
 ### 13.9 Scans (9b)
-A scan asks every Node for the keys in the range that it is a Home Node of, joins the answers key by key, and returns keys whose set isn't empty. It is as current as the least current Node that answered for each key.
+A scan asks every Node for the keys in the range that it is a Home Node of, joins the answers key by key, and returns keys whose set isn't empty. It is as current as the least current Node that answered for each key. It answers when every Node has, or after a short wait with what it has.
 
 ### 13.10 Disk
 A write, a Hint, and what an Exchange brings are on disk before they count or are acknowledged, as in the consistent store. A Node that restarts has what it had. The on-disk form is *to settle*; it is hand-written, as §3 requires.
@@ -705,6 +705,8 @@ The comparison is the Rung's result: availability during the Partition, against 
 - With W=1 a write acknowledged by one Node, which is then lost for good before sending it on, is gone. No Partition is needed.
 - Expiry disagrees under clock skew (§13.8).
 - The Node set is fixed. Adding or removing a Node moves keys between Home Nodes, and that is not built.
+- A Node that loses its disk can't come back under the same number: it would count its additions from one again, and the others would take its new additions for ones they had already seen.
+- A remove takes out only what the Home Nodes it read from had seen. During a long Partition about 3% of removes that succeed take nothing out (`retros/rung-9.md`).
 
 ## Decision Log
 

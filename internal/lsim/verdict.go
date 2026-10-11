@@ -38,6 +38,11 @@ type Report struct {
 	Adds, Removes int
 	// HintsLeft is how many Hints were still held at the end.
 	HintsLeft int
+	// Missed counts removes the store said succeeded that took nothing
+	// out, though an addition of the element had been acknowledged before
+	// the remove began and is there at the end: the Home Nodes the remove
+	// read from hadn't got it. Scans counts scans answered.
+	Missed, Scans int
 }
 
 // Passed reports whether the run ended Converged with nothing lost and
@@ -126,6 +131,9 @@ func Judge(s *Sim, h *History, mode leaderless.Mode) Report {
 		if c.End == 0 {
 			c.End = s.now // never answered: it may yet have taken effect
 		}
+		if c.Op == leaderless.Scan && c.Result == Done {
+			rep.Scans++
+		}
 		switch c.Op {
 		case leaderless.Add:
 			adds[target{c.Key, c.Elem}] = append(adds[target{c.Key, c.Elem}], c)
@@ -163,6 +171,14 @@ func Judge(s *Sim, h *History, mode leaderless.Mode) Report {
 					rep.Lost = append(rep.Lost, fmt.Sprintf("%s in %s, added by client %d at %d", c.Elem, c.Key, c.Client, c.Begin))
 				}
 			case c.Op == leaderless.Remove && c.Result == Done:
+				if len(tr.Observed) == 0 {
+					for _, a := range adds[target{c.Key, c.Elem}] {
+						if dot := s.Traces[a.Ref].Added; a.Result == Done && a.End < c.Begin && dot != nil && slices.Contains(final[c.Key].Elems[c.Elem], *dot) {
+							rep.Missed++
+							break
+						}
+					}
+				}
 				for _, d := range tr.Observed {
 					if slices.Contains(final[c.Key].Elems[c.Elem], d) {
 						rep.Back = append(rep.Back, fmt.Sprintf("%s in %s, removed by client %d at %d", c.Elem, c.Key, c.Client, c.Begin))
@@ -208,7 +224,8 @@ func Judge(s *Sim, h *History, mode leaderless.Mode) Report {
 				continue
 			}
 			for _, a := range list {
-				if a.Result == Done && a.End < c.Begin && !mayHaveRemoved(t, a) {
+				// An addition with a time-to-live may rightly have gone.
+				if a.Result == Done && a.TTL == 0 && a.End < c.Begin && !mayHaveRemoved(t, a) {
 					stale = true
 				}
 			}

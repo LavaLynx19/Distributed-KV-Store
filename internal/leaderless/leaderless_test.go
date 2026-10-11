@@ -212,3 +212,70 @@ func TestTooFewNodes(t *testing.T) {
 		t.Errorf("the other Home Node holds %v", got)
 	}
 }
+
+func TestScanAsksEveryNodeAndJoins(t *testing.T) {
+	n := newNet(AddWins, 2, 2, true)
+	for i, key := range []string{"a", "b", "c", "d"} {
+		n.step(NodeID(1+i%5), Request{Ref: uint64(10 + i), Op: Add, Key: key, Elem: "x" + key})
+	}
+	n.step(1, Request{Ref: 20, Op: Remove, Key: "c", Elem: "xc"})
+	n.step(3, Request{Ref: 21, Op: Scan, Key: "b", Elem: "d"})
+	r := n.reply(t, 21)
+	// From b up to, not including, d; c is empty now and isn't listed.
+	if !r.OK || len(r.Items) != 1 || r.Items[0].Key != "b" || !slices.Equal(r.Items[0].Values, []string{"xb"}) {
+		t.Fatalf("scan b..d: %+v", r)
+	}
+	n.step(4, Request{Ref: 22, Op: Scan})
+	if r := n.reply(t, 22); len(r.Items) != 3 {
+		t.Errorf("scan of everything: %+v", r)
+	}
+	// With a Node cut off the scan answers, after a wait, from the rest.
+	n.cut[5] = true
+	n.step(1, Request{Ref: 23, Op: Scan})
+	n.ticks(scanWait)
+	if r := n.reply(t, 23); !r.OK || len(r.Items) != 3 {
+		t.Errorf("scan with a Node away: %+v", r)
+	}
+}
+
+func TestAReadRepairsAHomeNodeThatHadLess(t *testing.T) {
+	ids := []NodeID{1, 2, 3, 4, 5}
+	n := &net{nodes: map[NodeID]*Node{}, cut: map[NodeID]bool{}}
+	for _, id := range ids {
+		n.nodes[id] = New(Config{ID: id, Nodes: ids, W: 1, R: 1, Mode: AddWins, Repair: true, Seed: uint64(id) * 1000})
+	}
+	homes := n.nodes[1].Ring().Homes("k")
+	n.cut[homes[2]] = true
+	n.step(homes[0], Request{Ref: 1, Op: Add, Key: "k", Elem: "x"})
+	n.cut[homes[2]] = false
+	if got := n.nodes[homes[2]].Holds("k").Values(); len(got) != 0 {
+		t.Fatalf("the Home Node that was away holds %v", got)
+	}
+	n.step(homes[1], Request{Ref: 2, Op: Get, Key: "k"})
+	if got := n.nodes[homes[2]].Holds("k").Values(); !slices.Equal(got, []string{"x"}) {
+		t.Errorf("after a read the Home Node that was away holds %v", got)
+	}
+}
+
+func TestExchangeBringsTwoNodesTogether(t *testing.T) {
+	ids := []NodeID{1, 2, 3, 4, 5}
+	n := &net{nodes: map[NodeID]*Node{}, cut: map[NodeID]bool{}}
+	for _, id := range ids {
+		n.nodes[id] = New(Config{ID: id, Nodes: ids, W: 1, R: 1, Mode: AddWins, Exchange: true, Seed: uint64(id) * 1000})
+	}
+	homes := n.nodes[1].Ring().Homes("k")
+	// Each of two Home Nodes takes a write the other never hears of.
+	for i, h := range homes[:2] {
+		for _, other := range ids {
+			n.cut[other] = other != h
+		}
+		n.step(h, Request{Ref: uint64(1 + i), Op: Add, Key: "k", Elem: fmt.Sprintf("x%d", i)})
+	}
+	clear(n.cut)
+	n.ticks(exchangeEvery * len(ids))
+	for _, h := range homes {
+		if got := n.nodes[h].Holds("k").Values(); !slices.Equal(got, []string{"x0", "x1"}) {
+			t.Errorf("Home Node %d holds %v", h, got)
+		}
+	}
+}

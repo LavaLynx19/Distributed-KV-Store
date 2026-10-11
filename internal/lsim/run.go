@@ -8,7 +8,10 @@ type Store struct {
 	W, R                 int
 	Mode                 leaderless.Mode
 	DeliverHints, Resend bool
-	Workload             Workload
+	// Exchange, Repair, Forgetful and Skew are passed on (Config).
+	Exchange, Repair, Forgetful bool
+	Skew                        map[leaderless.NodeID]int64
+	Workload                    Workload
 }
 
 // Scenario injects Faults between times from and to. It must leave repair
@@ -28,7 +31,8 @@ const (
 // middle, then repair and a quiet period before the verdicts (A§13.11).
 func Run(store Store, sc Scenario, seed uint64) Report {
 	s := New(Config{Seed: seed, Nodes: store.Nodes, W: store.W, R: store.R, Mode: store.Mode,
-		DeliverHints: store.DeliverHints, Resend: store.Resend})
+		DeliverHints: store.DeliverHints, Resend: store.Resend,
+		Exchange: store.Exchange, Repair: store.Repair, Forgetful: store.Forgetful, Skew: store.Skew})
 	h := &History{}
 	faultsEnd := int64(warmup + faultSpan)
 	store.Workload.Start(s, h, faultsEnd+cooldown/3)
@@ -84,6 +88,17 @@ var Scenarios = []Scenario{
 
 	// Nodes stop and start again.
 	{"crashes", func(s *Sim, from, to int64) { crashes(s, from, to) }},
+
+	// One Node is down for most of the Fault time: far longer than any
+	// write is sent again for.
+	{"long-outage", func(s *Sim, from, to int64) {
+		s.At(from+100, func() {
+			ids := s.IDs()
+			id := ids[s.Rand().IntN(len(ids))]
+			s.Crash(id)
+			s.At(to-300, func() { s.Restart(id) })
+		})
+	}},
 
 	// Both.
 	{"partitions-and-crashes", func(s *Sim, from, to int64) {
