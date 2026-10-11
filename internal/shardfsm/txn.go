@@ -410,31 +410,11 @@ func (m *Machine) finish(index core.Index, step TxnStep) fsm.Response {
 	m.raise(index, slots, step.Version)
 	m.inner.Apply(core.Entry{Index: core.Index(step.Version), Kind: core.EntryCommand, Payload: m.store(cmd).Encode()})
 	m.markDirty(cmd)
-	if step.ID.Session != 0 {
-		// Every Group that commits keeps the outcome with the Session: the
-		// Coordinator Group to answer a retry, the others to know a late
-		// prepare when they see one. The Coordinator Group has vouched for
-		// the Session (A§11.6). A client that gave up on the Transaction
-		// may have moved on: its record is never taken back to an earlier
-		// request.
-		rec, known := m.inner.SessionRecord(step.ID.Session)
-		if !known {
-			rec = fsm.SessionRecord{ID: step.ID.Session, Floor: step.ID.Seq}
-		}
-		if step.ID.Seq > rec.LastSeq {
-			rec.LastSeq, rec.LastResp, rec.LastUsed = step.ID.Seq, ok.Encode(), m.inner.LogTime()
-			m.inner.PutSessionRecord(rec)
-			// The record goes wherever any key the Transaction named here
-			// goes, written or only looked at.
-			var named []shard.Slot
-			for _, name := range p.keys {
-				if s := shard.Slot(name[0])<<8 | shard.Slot(name[1]); !slices.Contains(named, s) {
-					named = append(named, s)
-				}
-			}
-			m.lastSlots = m.lastSlots.Put(sessionKey(step.ID.Session), named)
-		}
-	}
+	// Every Group that commits keeps the outcome with the Session: the
+	// Coordinator Group to answer a retry, the others to turn away a late
+	// prepare at once. The Coordinator Group has vouched for the Session
+	// (A§11.6).
+	m.remember(step.ID, ok.Encode(), slotsOfNames(p.keys))
 	return ok
 }
 
@@ -501,4 +481,43 @@ func DecodeTxnStep(payload []byte) (TxnStep, error) {
 		return TxnStep{}, errMalformed
 	}
 	return s, nil
+}
+
+// slotsOfNames lists the Slots of keys given by their stored names.
+func slotsOfNames(names []string) []shard.Slot {
+	var slots []shard.Slot
+	for _, name := range names {
+		if s := shard.Slot(name[0])<<8 | shard.Slot(name[1]); !slices.Contains(slots, s) {
+			slots = append(slots, s)
+		}
+	}
+	return slots
+}
+
+// remember puts a Transaction's answer in its Session's record, which then
+// goes wherever any of slots goes. A client that gave up on the Transaction
+// may have moved on: its record is never taken back to an earlier request.
+func (m *Machine) remember(id TxnID, resp []byte, slots []shard.Slot) {
+	if id.Session == 0 {
+		return
+	}
+	rec, known := m.inner.SessionRecord(id.Session)
+	if !known {
+		rec = fsm.SessionRecord{ID: id.Session, Floor: id.Seq}
+	}
+	if id.Seq <= rec.LastSeq {
+		return
+	}
+	// A Session's record holds keys under their stored names, as the
+	// answers of this Group's own requests are held.
+	if answer, err := fsm.DecodeResponse(resp); err == nil && len(answer.Items) > 0 {
+		answer.Items = slices.Clone(answer.Items)
+		for i, it := range answer.Items {
+			answer.Items[i].Key = stored(m.slotOf(it.Key), it.Key)
+		}
+		resp = answer.Encode()
+	}
+	rec.LastSeq, rec.LastResp, rec.LastUsed = id.Seq, resp, m.inner.LogTime()
+	m.inner.PutSessionRecord(rec)
+	m.lastSlots = m.lastSlots.Put(sessionKey(id.Session), slots)
 }

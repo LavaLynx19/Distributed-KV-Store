@@ -545,7 +545,7 @@ A Transaction's id is its Session id and request number. Its **Coordinator Group
 2. **Prepare.** The Coordinator Group's Leader sends each other Group its part. That Group commits a prepare Entry. It answers yes only if it owns every Slot named by its own Log, none is frozen or about to move, every condition holds and no key is Locked by another Transaction. A yes Locks every key named, in a condition or a write, records the writes, and carries the version the Group would have given. A no says why. A no for a failed condition names the versions found and Locks the keys all the same, until the finish: otherwise what two Groups report about their conditions would be true at two different moments, and the answer to the client would describe a store that never existed. Any other no holds nothing.
 3. **Decision.** When every Group has answered, or one has said no, the Coordinator Group commits a decision Entry: commit only if all said yes. It carries the Transaction's version (§12.6). The same Entry applies the Coordinator Group's own writes and releases its own Locks. The client is answered once this Entry is Committed.
 4. **Finish.** The Leader sends the decision to each other Group, which commits a finish Entry: on commit it applies its writes with that version, and either way it releases its Locks.
-5. **Confirmed.** Each Group's answer to finish is Committed in the Coordinator Group. When every Group has confirmed, the record is forgotten (8b).
+5. **Confirmed.** Each Group's answer to finish is Committed in the Coordinator Group. When every Group has confirmed, the record is forgotten (8b). The answer is by then in the Session's record, for an abort as much as a commit, so a begin for the same request that arrives afterwards, late or as a retry, is answered from it and doesn't start the Transaction over.
 
 Messages go Leader to Leader, name the Transaction and are repeated until answered. Every step may be applied twice without harm: a Group answers a step it has already taken the same way.
 
@@ -569,7 +569,7 @@ Messages go Leader to Leader, name the Transaction and are repeated until answer
 
 ### 12.5 Two Transactions and one key (8b)
 - **Age.** A Transaction's age is the Store time the Node that took its first attempt had heard, then its Session id, then its request number. Every Group compares ages the same way. Store time moves in steps, so many Transactions share an age and the Session id then decides.
-- **Older wins.** A prepare that finds a key Locked answers no, holds nothing, and says who holds the key and how old it is. If the holder is younger, the Leader that sent the prepare asks the holder's Coordinator Group to abort it, with an abort decision of its own that is ignored if the Transaction is already decided. Either way the Lock goes, and the prepare is sent again every 10 units until it does.
+- **Older wins.** A prepare that finds a key Locked answers no, holds nothing, and says who holds the key and how old it is. If the holder is younger, the Leader that sent the prepare asks the holder's Coordinator Group to abort it, with an abort decision of its own that is ignored if the Transaction is already decided. Either way the Lock goes, and the prepare is sent again every 10 units until it does. A Node asks for a given Transaction to be aborted once, and not again for 100 units: each asking is an Entry in that Group's Log.
 - If the holder is older, the prepare is sent again for 80 units, and then the Transaction aborts.
 - **Two keys need none of this.** A Transaction's Coordinator Group owns its lowest key and Locks its own keys first. With two keys, each Transaction waits only for a key higher than one it holds, so no ring of waiting Transactions can close, even with no order. It takes three Groups prepared side by side.
 - So no two Transactions can wait for each other: of any two, only the younger waits.
@@ -586,7 +586,7 @@ Messages go Leader to Leader, name the Transaction and are repeated until answer
 ### 12.7 Moves
 - Once the table shows an intent to move a Slot, its Group refuses new prepares for it, and a begin whose lowest key is in it.
 - **8a:** the Group freezes the Slot only when no key in it is Locked. The freeze Entry itself is refused while one is, so the rule holds whoever proposes it.
-- **8b:** the Group asks the Coordinator Group of each Lock in the Slot to abort. A Transaction that had already committed is finished first. Then the Slot freezes. So a Move waits at most for commits already decided, and Transactions on a Slot being moved are refused with `txn_conflict` and retried.
+- **8b:** once the Slot's copy is done, the Group asks the Coordinator Group of each Lock in the Slot to abort, in the way an older Transaction does (§12.5). A Transaction that had already committed is finished first. Then the Slot freezes. So a Move waits at most for commits already decided, and Transactions on a Slot being moved are refused with `txn_conflict` and retried.
 - A Move carries no Lock and no decision record. It carries Session records, with the outcome, as before.
 
 ### 12.8 Client API
@@ -608,6 +608,7 @@ Messages go Leader to Leader, name the Transaction and are repeated until answer
 - A client can lie about a Transaction's age (§12.5).
 - A scan across Groups is still not one moment (§11.8).
 - Moves made by the balancer now cost Transactions a retry.
+- Under heavy contention the steps of Transactions, and of their retries, fill a Group's Log, and everything in that Group waits behind them. Nothing in the design sheds that load.
 
 ## Decision Log
 

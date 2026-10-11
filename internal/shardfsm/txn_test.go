@@ -501,3 +501,24 @@ func TestAConflictSaysWhoHoldsTheKey(t *testing.T) {
 		t.Error("ages don't order Transactions")
 	}
 }
+
+func TestAForgottenAbortIsStillTheRequestsAnswer(t *testing.T) {
+	m := whole(Config{ForgetTxns: true})
+	id := TxnID{Session: 77, Seq: 1}
+	m.Apply(entry(5, twoGroups(id, []fsm.Cond{{Key: "a", Version: 3}}).Encode()))
+	m.Apply(entry(6, DecideStep(id, false, 0, nil, nil).Encode()))
+	m.Apply(entry(7, ConfirmStep(id, 2).Encode()))
+	if m.Records() != 0 {
+		t.Fatalf("%d records after every Group confirmed", m.Records())
+	}
+	if s, _ := outcomeOf(t, m.Read(OutcomeQuery(id, 0))); s != TxnNone {
+		t.Errorf("outcome of a forgotten Transaction: state %d", s)
+	}
+	// The same begin again, late or as a retry, doesn't start it over.
+	retry := twoGroups(id, []fsm.Cond{{Key: "a", Version: 3}})
+	retry.Register = false
+	s, resp := stateOf(t, m.Apply(entry(8, retry.Encode())))
+	if s != TxnDecided || resp.Status != fsm.StatusVersionMismatch || len(resp.Items) != 1 || resp.Items[0].Key != "a" || m.Records() != 0 || m.Locked() != 0 {
+		t.Errorf("retry: state %d, %+v, %d records, %d Locked", s, resp, m.Records(), m.Locked())
+	}
+}

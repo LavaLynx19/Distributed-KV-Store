@@ -94,6 +94,10 @@ type Config struct {
 	// Groups brought from a Group with a longer Log can be followed by a
 	// lower one. It is another of the stores Rung 8 starts from.
 	NoOffset bool
+	// ForgetTxns removes a Coordinator Group's record of a Transaction
+	// once every Group has confirmed it finished (A§12.2). Without it
+	// records are kept for good, as in stage 8a.
+	ForgetTxns bool
 }
 
 // Machine is a data Group's state.

@@ -149,6 +149,9 @@ type node struct {
 	// coord is what this Node remembers of the Transactions it is
 	// carrying on for Groups it leads (txn.go).
 	coord map[coordKey]*coordState
+	// wounded is when this Node last asked for each Transaction to be
+	// aborted, for an older one.
+	wounded map[shardfsm.TxnID]int64
 	// nudged is set when a request found a key Locked in a Group this
 	// Node leads: its Locks are asked about at once.
 	nudged bool
@@ -205,6 +208,9 @@ type Cluster struct {
 	// Pauses is how long each Slot that was handed over stayed frozen
 	// (mover.Agent.OnHandover).
 	Pauses []int64
+	// LockWaits is how long each Slot that was ready to be frozen waited
+	// for Transactions to let go of its keys.
+	LockWaits []int64
 
 	// owned is, per data Group, which Slots it serves as of the latest
 	// Entry any of its replicas has applied, and twoOwners the first moment
@@ -314,7 +320,9 @@ func New(cfg Config) *Cluster {
 			mover: &mover.Agent{Patience: patience, ChunkKeys: chunkKeys,
 				FlipAtOnce:            cfg.FlipAtOnce || cfg.GossipDecides.Ownership,
 				TakeWhatTheTableGives: cfg.GossipDecides.Ownership,
-				OnHandover:            func(_ shard.GroupID, _ shard.Slot, frozenFor int64) { c.Pauses = append(c.Pauses, frozenFor) }}}
+				OnHandover:            func(_ shard.GroupID, _ shard.Slot, frozenFor int64) { c.Pauses = append(c.Pauses, frozenFor) },
+				AbortForMoves:         cfg.Transactions.MovesAbort,
+				OnLockWait:            func(_ shard.GroupID, _ shard.Slot, waited int64) { c.LockWaits = append(c.LockWaits, waited) }}}
 	}
 	for _, g := range c.Groups() {
 		for _, r := range c.Founders(g) {
@@ -365,7 +373,7 @@ func (c *Cluster) newMachine(id core.NodeID) sim.Machine {
 			owned = append(owned, shard.Slot(s))
 		}
 	}
-	return shardfsm.New(shardfsm.Config{Group: g, Slots: c.cfg.Slots, Owned: owned, SessionTTL: c.cfg.SessionTTL, Unchecked: c.cfg.Unchecked, ReadLocked: c.cfg.Transactions.ReadLocked, NoOffset: c.cfg.Transactions.NoOffset})
+	return shardfsm.New(shardfsm.Config{Group: g, Slots: c.cfg.Slots, Owned: owned, SessionTTL: c.cfg.SessionTTL, Unchecked: c.cfg.Unchecked, ReadLocked: c.cfg.Transactions.ReadLocked, NoOffset: c.cfg.Transactions.NoOffset, ForgetTxns: c.cfg.Transactions.Forget})
 }
 
 // Table is the Slot table Node n has cached.
@@ -397,6 +405,7 @@ func (c *Cluster) CrashNode(n int) {
 	c.nodes[n].boots++
 	c.nodes[n].finishing = 0
 	clear(c.nodes[n].coord)
+	clear(c.nodes[n].wounded)
 	c.nodes[n].mover.Reset()
 }
 

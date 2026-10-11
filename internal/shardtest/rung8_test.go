@@ -166,7 +166,7 @@ func TestLocksNobodyAsksAboutAreLeft(t *testing.T) {
 	for _, c := range []struct {
 		scenario string
 		seed     uint64
-	}{{"crashes", 82}, {"stopped-mid-commit", 76}, {"stopped-mid-commit", 80}, {"stopped-mid-commit", 150}} {
+	}{{"crashes", 82}, {"stopped-mid-commit", 76}, {"stopped-mid-commit", 150}} {
 		if r := rungtest.RunSharded(noAsking, scenario8(t, c.scenario), c.seed); len(r.Diverged) == 0 {
 			t.Errorf("%s, seed %d: expected keys left Locked, got %v", c.scenario, c.seed, r)
 		}

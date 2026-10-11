@@ -145,6 +145,16 @@ func (c *Cluster) EndState() []string {
 			if n := first.Locked(); n > 0 {
 				diffs = append(diffs, fmt.Sprintf("Group %d: %d keys still Locked, for Transactions %v", g, n, first.Prepared()))
 			}
+			for _, t := range first.Coordinating() {
+				var groups []shard.GroupID
+				for _, p := range t.Parts {
+					groups = append(groups, p.Group)
+				}
+				diffs = append(diffs, fmt.Sprintf("Group %d: Transaction %d/%d isn't over: decided %v, commit %v, Groups %v, confirmed %v", g, t.ID.Session, t.ID.Seq, t.Decided, t.Commit, groups, t.Confirmed))
+			}
+			if n := first.Records(); n > 0 && c.cfg.Transactions.Forget {
+				diffs = append(diffs, fmt.Sprintf("Group %d: %d Transactions still on record", g, n))
+			}
 			for s, info := range first.Slots() {
 				if info.Serves() {
 					serving[shard.Slot(s)] = append(serving[shard.Slot(s)], g)

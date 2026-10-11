@@ -291,7 +291,18 @@ func (m *Machine) applyCoord(index core.Index, payload []byte) []byte {
 		default:
 			rec.outcome = fsm.Response{Status: fsm.StatusTxnConflict}.Encode()
 		}
+		var named []shard.Slot
+		if p, held := m.txns.Get(key); held {
+			named = slotsOfNames(p.keys)
+		}
 		m.finish(index, FinishStep(st.ID, m.cfg.Group, true, rec.commit, st.Version, own.Version))
+		if !rec.commit {
+			// An abort is the request's answer as much as a commit is. With
+			// it in the Session's record, a begin for the same request that
+			// arrives after this record is forgotten can't start the
+			// Transaction over.
+			m.remember(st.ID, rec.outcome, named)
+		}
 
 	case opConfirm:
 		if !known || !rec.decided || slices.Contains(rec.confirmed, st.Group) {
@@ -305,6 +316,9 @@ func (m *Machine) applyCoord(index core.Index, payload []byte) []byte {
 	m.coord = m.coord.Put(key, rec)
 	if !rec.open() {
 		m.openTxns = m.openTxns.Delete(key)
+		if m.cfg.ForgetTxns {
+			m.coord = m.coord.Delete(key)
+		}
 	}
 	return rec.state()
 }

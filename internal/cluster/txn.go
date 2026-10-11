@@ -27,6 +27,11 @@ type Transactions struct {
 	// Conflicts is what a Transaction does when it finds a key Locked by
 	// another.
 	Conflicts ConflictMode
+	// MovesAbort has a Move abort the undecided Transactions that hold
+	// keys in its Slot, and not wait for them (A§12.7). Forget has a
+	// Coordinator Group drop its record of a Transaction once every Group
+	// has confirmed (A§12.2).
+	MovesAbort, Forget bool
 	// NoAsking leaves a Group that has Locked keys waiting to be told the
 	// outcome, never asking for it. It exists so that the Locks this
 	// leaves behind stay reproducible.
@@ -56,14 +61,15 @@ type part struct {
 }
 
 const (
-	txnEvery     = 2   // how often a Node looks at the Transactions its Groups coordinate
-	txnAskAgain  = 40  // how long it waits for an answer before sending a step again
-	txnGiveUp    = 400 // how long a Leader waits for every Group's answer before it aborts
-	lockAskAfter = 30  // how old a Lock is before its Group asks what was decided
-	lockAskAgain = 6   // how soon it asks again while a request is waiting
-	lockWait     = 12  // how long a request for a Locked key waits before it is refused
-	txnRetry     = 10  // how soon a Transaction that found a key Locked tries for it again
-	txnWait      = 80  // how long a younger Transaction waits for an older one's keys
+	txnEvery      = 2   // how often a Node looks at the Transactions its Groups coordinate
+	txnAskAgain   = 40  // how long it waits for an answer before sending a step again
+	txnGiveUp     = 400 // how long a Leader waits for every Group's answer before it aborts
+	lockAskAfter  = 30  // how old a Lock is before its Group asks what was decided
+	lockAskAgain  = 6   // how soon it asks again while a request is waiting
+	lockWait      = 12  // how long a request for a Locked key waits before it is refused
+	txnRetry      = 10  // how soon a Transaction that found a key Locked tries for it again
+	txnWait       = 80  // how long a younger Transaction waits for an older one's keys
+	txnWoundAgain = 100 // how long before a Node asks again for the same Transaction to be aborted
 )
 
 // split divides a Transaction between the Groups the table gives for its
@@ -337,9 +343,23 @@ func (c *Cluster) yield(nd *node, me shardfsm.Held, resp fsm.Response, since int
 		}
 		// The younger one is aborted by its own Coordinator Group, if it
 		// isn't decided yet. Either way its Locks go.
-		c.TxnWounded++
-		abort := shardfsm.DecideStep(holder.ID, false, 0, nil, nil).Encode()
-		c.ask(nd.id, holder.Coord, false, func(int64) []byte { return abort }, func(Outcome, []byte) {})
+		// It is asked once, and again only after a good while: each asking
+		// is an Entry in that Group's Log, and a crowd of Transactions
+		// asking every time they look would leave it room for little else.
+		if at, asked := nd.wounded[holder.ID]; !asked || c.S.Now()-at >= txnWoundAgain {
+			if nd.wounded == nil {
+				nd.wounded = map[shardfsm.TxnID]int64{}
+			}
+			for id, at := range nd.wounded {
+				if c.S.Now()-at >= txnWoundAgain {
+					delete(nd.wounded, id)
+				}
+			}
+			nd.wounded[holder.ID] = c.S.Now()
+			c.TxnWounded++
+			abort := shardfsm.DecideStep(holder.ID, false, 0, nil, nil).Encode()
+			c.ask(nd.id, holder.Coord, false, func(int64) []byte { return abort }, func(Outcome, []byte) {})
+		}
 		return c.S.Now()-since < txnGiveUp
 	}
 	return false

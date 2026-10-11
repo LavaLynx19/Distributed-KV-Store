@@ -119,6 +119,8 @@ type Report struct {
 	// replica as a Member (A§11.11).
 	Replacements, ReplacedRunning, Drops int
 	WrongDrop                            string
+	// LockWaits is how long each Slot ready to move waited for its Locks.
+	LockWaits []int64
 	// HalfCommitted lists the Transactions across Groups that didn't end
 	// the same way in every Group (A§12.9).
 	HalfCommitted []string
