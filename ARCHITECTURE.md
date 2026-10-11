@@ -697,7 +697,9 @@ The comparison is the Rung's result: availability during the Partition, against 
 
 ### 13.12 Real processes and Docker (9c)
 - `kvnode` gets a mode for the Leaderless variant, with the same HTTP routes, TCP between Nodes and the disk of §13.10. `kvbench` gets its workload and its verdicts.
-- The local harness can pause and kill Nodes. A real Partition needs Docker with the network cut. `deploy/docker-compose.yml` is edited only after saying what will change and getting the user's leave. The consistent store of Rung 8 has no Docker setup either, and needs one for the comparison to be made there.
+- The local harness can pause and kill Nodes (`harness/leaderless.sh`). A real Partition needs Docker with the network cut (`harness/partition.sh`): every link between Nodes goes through a proxy that can be switched off.
+- As built: the compose file gives every Node extra flags from `KVNODE_ARGS`, a change the user agreed to. The Leaderless variant's Nodes talk only over the links that were already proxied. The store of Rung 8 also forwards requests and gossips over HTTP, so each link has a second proxy and a Node is told to reach the others through it (`kvnode -forward-via`).
+- `kvbench -pin` keeps each client on one Node, as the Simulation's clients are, so that what is measured is whether the Node a client can reach will serve it.
 
 ### 13.13 Risks accepted
 - A client must know that a value is a set. Nothing written for the consistent store works unchanged.

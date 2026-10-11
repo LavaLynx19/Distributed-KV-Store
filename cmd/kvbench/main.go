@@ -44,6 +44,10 @@ type config struct {
 	// hotPct of requests go to hot, the keys of the Slots hotGroup starts
 	// with, in a store of slots Slots.
 	hotPct, hotGroup, slots int
+	// pin keeps each client on the Node it starts with, whatever that Node
+	// answers. markFor is how long the Fault after mark lasts.
+	pin     bool
+	markFor time.Duration
 	// txnPct of requests are Transactions over two keys in different
 	// Groups (A§12).
 	txnPct   int
@@ -81,7 +85,8 @@ func main() {
 	flag.DurationVar(&cfg.ttl, "ttl", 200*time.Millisecond, "the longest time-to-live given; each is between a quarter of this and all of it")
 	leaderlessMode := flag.Bool("leaderless", false, "the store is the Leaderless variant (A§13): clients add to, remove from and read sets, each talking to one Node, and the run is judged on whether the Nodes end Converged and whether an Acknowledged add was lost")
 	elems := flag.Int("elems", 8, "with -leaderless: how many different elements clients add to and remove from each key")
-	markFor := flag.Duration("mark-for", 0, "with -leaderless and -mark: how long the Fault lasts; answers per second through it are reported against before it")
+	flag.DurationVar(&cfg.markFor, "mark-for", 0, "with -mark: how long the Fault lasts; answers per second through it are reported against before it")
+	flag.BoolVar(&cfg.pin, "pin", false, "each client keeps to the Node it starts with and never tries another: what is measured is then whether the Node a client can reach will serve it")
 	flag.BoolVar(&cfg.retry, "retry", false, "open a Session per client and retry requests that get no definite answer (A§6.3)")
 	flag.Parse()
 	for _, n := range strings.Split(*nodes, ",") {
@@ -101,7 +106,7 @@ func main() {
 		}
 	}
 	if *leaderlessMode {
-		if !runLeaderless(cfg, *elems, cfg.mark, *markFor) {
+		if !runLeaderless(cfg, *elems, cfg.mark, cfg.markFor) {
 			os.Exit(1)
 		}
 		return
@@ -205,6 +210,13 @@ func run(cfg config) bool {
 		} else {
 			fmt.Printf("recovery:    no write succeeded after the mark at %s\n", cfg.mark)
 		}
+	}
+
+	if cfg.mark > 0 && cfg.markFor > 0 {
+		before, _ := rec.history.Share(0, int64(cfg.mark))
+		during, _ := rec.history.Share(int64(cfg.mark), int64(cfg.mark+cfg.markFor))
+		was, is := float64(before)/cfg.mark.Seconds(), float64(during)/cfg.markFor.Seconds()
+		fmt.Printf("through the Fault: %.0f answered/s for the %s from %s, against %.0f/s before: %.0f%%\n", is, cfg.markFor, cfg.mark, was, 100*is/was)
 	}
 
 	ok := true
@@ -441,7 +453,11 @@ type answer struct {
 	Leader  string `json:"leader"`
 }
 
-func (c *client) elsewhere() { c.target = c.cfg.nodes[c.rng.IntN(len(c.cfg.nodes))] }
+func (c *client) elsewhere() {
+	if !c.cfg.pin {
+		c.target = c.cfg.nodes[c.rng.IntN(len(c.cfg.nodes))]
+	}
+}
 
 // send performs cmd against the client's current Member and classifies the
 // answer by A§7.2.

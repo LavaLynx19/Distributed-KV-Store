@@ -35,7 +35,13 @@ import (
 	"distributed-kv-store/internal/transport"
 )
 
+// forwardVia is the -forward-via flag.
+var forwardVia string
+
 func main() {
+	// A harness that can't change a Node's command line can add to it.
+	os.Args = append(os.Args, strings.Fields(os.Getenv("KVNODE_ARGS"))...)
+	flag.StringVar(&forwardVia, "forward-via", "", "with -data-groups: reach other Nodes' client APIs at host:base, where Node j's port as seen from Node i is base + 100*i + j, and not at their -clients addresses. For a harness that puts a proxy on every link between Nodes")
 	id := flag.Uint64("id", 0, "this Node's id (must appear in -peers and -clients)")
 	peersFlag := flag.String("peers", "", "every Member's address for other Members: id=host:port,…")
 	clientsFlag := flag.String("clients", "", "every Member's client API address: id=host:port,…")
@@ -258,7 +264,7 @@ func runStore(id int, peersFlag, clientsFlag, listenPeer, listenClient string, g
 		Peers: peers, Clients: clients, Listener: ln, Data: data,
 		Tick: tick, ElectionTicks: electionTicks, HeartbeatTicks: heartbeatTicks,
 		SnapshotEvery: snapshotEvery, SessionTTL: sessionTTL, Timeout: timeout, SharedSync: sharedSync,
-		Auto: auto, DeadWait: deadWait,
+		Auto: auto, DeadWait: deadWait, Via: via(id),
 	})
 	if err != nil {
 		return err
@@ -354,4 +360,20 @@ func runLeaderless(id int, peersFlag, clientsFlag, listenPeer, listenClient stri
 		return fmt.Errorf("client API: %w", err)
 	}
 	return nil
+}
+
+// via is the rule -forward-via gives Node id for reaching the others, or
+// nil without the flag.
+func via(id int) func(int) string {
+	host, base, ok := strings.Cut(forwardVia, ":")
+	port, err := strconv.Atoi(base)
+	if !ok || err != nil {
+		return nil
+	}
+	return func(n int) string {
+		if n == id {
+			return ""
+		}
+		return fmt.Sprintf("http://%s:%d", host, port+100*id+n)
+	}
 }

@@ -4,6 +4,7 @@
 #   harness/docker.sh up [members] [direct]   # default 3; "direct" skips toxiproxy
 #   harness/docker.sh status
 #   harness/docker.sh isolate <id>            # cut every link to and from one Member
+#   harness/docker.sh split "<ids>"           # cut those Members off from the rest, both ways
 #   harness/docker.sh cut <from> <to>         # cut one direction of one link
 #   harness/docker.sh heal                    # restore every link
 #   harness/docker.sh pause <id>              # freeze one Member
@@ -25,7 +26,14 @@ TOXI=http://127.0.0.1:8474
 
 members() { cat "$OUT/members" 2>/dev/null || { echo "no Group running" >&2; exit 1; }; }
 port() { echo $((20000 + $1 * 100 + $2)); } # toxiproxy port for the link from $1 to $2
-toggle() { curl -sf -o /dev/null -X POST "$TOXI/proxies/$1" -d "{\"enabled\":$2}"; }
+# A second proxy per link, for what Nodes of a store with several Groups
+# send each other over HTTP (kvnode -forward-via toxiproxy:30000).
+hport() { echo $((30000 + $1 * 100 + $2)); }
+# toggle turns both proxies of a link on or off.
+toggle() {
+  curl -sf -o /dev/null -X POST "$TOXI/proxies/$1" -d "{\"enabled\":$2}"
+  curl -sf -o /dev/null -X POST "$TOXI/proxies/h$1" -d "{\"enabled\":$2}"
+}
 
 case "${1:-}" in
   up)
@@ -49,7 +57,7 @@ case "${1:-}" in
     "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
     "${COMPOSE[@]}" build --quiet node1
     # restart must bring a Member up with the same command line.
-    { echo "export CLIENTS='$CLIENTS'"; for i in $(seq 1 "$n"); do v="PEERS_$i"; echo "export $v='${!v}'"; done; } >"$OUT/env"
+    { echo "export CLIENTS='$CLIENTS'"; echo "export KVNODE_ARGS='${KVNODE_ARGS:-}'"; for i in $(seq 1 "$n"); do v="PEERS_$i"; echo "export $v='${!v}'"; done; } >"$OUT/env"
     if [[ $mode != direct ]]; then
       "${COMPOSE[@]}" up -d toxiproxy >/dev/null 2>&1
       for _ in $(seq 1 50); do curl -sf -o /dev/null "$TOXI/version" && break; sleep 0.2; done
@@ -57,6 +65,8 @@ case "${1:-}" in
         [[ $i == "$j" ]] && continue
         curl -sf -o /dev/null -X POST "$TOXI/proxies" \
           -d "{\"name\":\"$i-$j\",\"listen\":\"0.0.0.0:$(port "$i" "$j")\",\"upstream\":\"node$j:7000\"}"
+        curl -sf -o /dev/null -X POST "$TOXI/proxies" \
+          -d "{\"name\":\"h$i-$j\",\"listen\":\"0.0.0.0:$(hport "$i" "$j")\",\"upstream\":\"node$j:8000\"}"
       done; done
     fi
     "${COMPOSE[@]}" up -d "${services[@]}" >/dev/null 2>&1
@@ -75,6 +85,17 @@ case "${1:-}" in
       toggle "$id-$j" false; toggle "$j-$id" false
     done
     echo "isolated node $id"
+    ;;
+  split)
+    # shellcheck disable=SC2206
+    side=(${2:?usage: docker.sh split "<ids>"})
+    for i in $(seq 1 "$(members)"); do for j in $(seq 1 "$(members)"); do
+      [[ $i == "$j" ]] && continue
+      in_i=0; in_j=0
+      for s in "${side[@]}"; do [[ $s == "$i" ]] && in_i=1; [[ $s == "$j" ]] && in_j=1; done
+      [[ $in_i == "$in_j" ]] || toggle "$i-$j" false
+    done; done
+    echo "cut nodes ${side[*]} off from the rest"
     ;;
   cut)
     toggle "${2:?usage: docker.sh cut <from> <to>}-${3:?usage: docker.sh cut <from> <to>}" false
