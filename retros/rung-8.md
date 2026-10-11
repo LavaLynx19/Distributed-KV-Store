@@ -1,6 +1,6 @@
 # Rung 8 retro: Transactions across Groups
 
-Status: **stage 8a done and approved. Stage 8b done, waiting for approval.** Rung 8 is built in two stages (A§12.1). This file has a part per stage, and the verdict for the whole Rung at the end.
+Status: **both stages done and approved.** Rung 8 is built in two stages (A§12.1). This file has a part per stage, and the verdict for the whole Rung at the end.
 
 Stage 8a in one paragraph: a Transaction whose keys are in several Groups commits in all of them or none, with every step in the Log of its Coordinator Group. 5,400 simulated runs under crashes, Partitions and Moves committed 112,948 such Transactions with none half-committed, no History that isn't Linearizable, and nothing left Locked. Four shortcuts were shipped first and seen failing. Two bugs that none of the planned exposures would have shown were found by the suite and are described below. Nothing here has run as real processes yet: that is stage 8b.
 
@@ -220,7 +220,7 @@ KV_MEASURE=1 go test ./internal/shardtest -run TestMeasureRung8b -v -timeout 40m
 
 ## Verdict (8b)
 
-Done, waiting for approval.
+Done and approved by the user.
 
 # Rung 8 verdict
 
