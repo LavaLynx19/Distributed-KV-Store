@@ -13,6 +13,9 @@ x-node: &node
     dockerfile: deploy/Dockerfile
   # A named volume is owned by root, so the Node runs as root to write to it.
   user: "0:0"
+  # Extra flags for every Node, for the modes harness/partition.sh runs.
+  environment:
+    KVNODE_ARGS: "${KVNODE_ARGS:-}"
 
 services:
   toxiproxy:

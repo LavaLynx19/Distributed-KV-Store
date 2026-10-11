@@ -56,6 +56,9 @@ type Store struct {
 	// a URL. It starts with what the Node was told and grows as gossip
 	// brings more (A§11.10). Read it with clientURL.
 	Clients map[int]string
+	// Via, if set, is where this Node reaches another's client API when
+	// that isn't the address clients use (StoreConfig.Via).
+	Via func(n int) string
 	// Gossip is this Node's gossip. GossipEvery is the length of a round.
 	Gossip      *gossip.Node
 	GossipEvery time.Duration
@@ -147,6 +150,11 @@ func (s *Store) Start(ctx context.Context, slots int) {
 // clientURL is where Node n's client API is, or "" if this Node hasn't
 // heard.
 func (s *Store) clientURL(n int) string {
+	if s.Via != nil {
+		if url := s.Via(n); url != "" {
+			return url
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.Clients[n]

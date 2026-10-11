@@ -122,8 +122,23 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P8b.6 Stage 8b suite with Moves and automation on, real runs, the 8b part and the Rung 8 verdict in `retros/rung-8.md` → §P8
 
 ### Phase 9 — Rung 9: the Leaderless variant (§P9)
-- [>] P9.0 Confirm or replace the A§10 sketch; design the convergence check → defer until: Rung 6 retro is done (independent of Rungs 7–8)
-- [>] P9.1 Last-write-wins, then version vectors; comparison against the consistent store → defer until: P9.0 is approved
+- [x] P9.0 Confirm or replace the A§10 sketch; design the checks; write A§13 and Decision Log entries → §P9
+- [x] P9a.1 The Leaderless core, naive: Home Nodes on a ring, writes to W with Hints that are kept and never delivered, reads joining R answers, last-write-wins by a counter per key, on disk; run in the Simulation with a workload of adds, removes and reads (A§13.2–13.5, A§13.10) → §P9
+- [x] P9a.2 The four verdicts and the stale-read rate (A§13.11) → §P9
+- [x] P9a.3 Expose: last-write-wins loses Acknowledged adds under a Partition → §P9
+- [x] P9a.4 Expose: Hints never delivered leave Home Nodes apart after healing → §P9
+- [x] P9a.5 Fix: the set where add wins (A§13.5) → §P9
+- [x] P9a.6 Fix: Hints delivered; writes sent on and retried (A§13.4) → §P9
+- [x] P9a.7 Stage 9a suite at W=1 R=1, W=2 R=2 and W=3 R=1; availability beside the consistent store of Rung 8 under the same scenarios; the 9a part of `retros/rung-9.md` → §P9
+- [x] P9b.1 Expose: with no Exchange, a Home Node away longer than the retries last stays behind → §P9
+- [x] P9b.2 Fix: the Exchange (A§13.6) → §P9
+- [x] P9b.3 Expose: a remove forgotten at once lets an element come back; then keep the record (A§13.7) → §P9
+- [x] P9b.4 Repair on read; the stale-read rate at R=1 before and after (A§13.6) → §P9
+- [x] P9b.5 Time-to-live by stamped deadline, with the disagreement under clock skew measured; scans (A§13.8, A§13.9) → §P9
+- [x] P9b.6 Stage 9b suite and the 9b part of the retro → §P9
+- [x] P9c.1 Real processes: a `kvnode` mode with HTTP, TCP and disk; `kvbench` workload and verdicts; local harness (A§13.12) → §P9
+- [x] P9c.2 Docker with the network cut, for the Leaderless variant and for the store of Rung 8: `harness/partition.sh`. The compose file gained `KVNODE_ARGS`, with the user's leave; the store of Rung 8 reaches other Nodes' HTTP through a second proxy per link (`kvnode -forward-via`) → §P9
+- [x] P9c.3 The comparison runs, the 9c part and the Rung 9 verdict in the retro → §P9
 
 ### Phase 10 — Writeup (§P10)
 - [>] P10.1 `RESULTS.md` via `/docs`: Rung results and a Decision Log walkthrough → defer until: the last Rung in scope passes
@@ -200,8 +215,14 @@ Design is A§12. Two stages (A§12.1), each ending with a retro part and the use
 
 **Verify (8b):** P8b.1's seed fails naive and can't be reproduced after. Under steady contention every Transaction is decided and none loses for ever. A Move during Transactions waits only for commits already decided. No record is left at the end. The Rung 7 load reaches 0.9× of Rung 7 on real processes, and the cost of a Transaction across Groups is stated.
 
-## §P9
-Starts with its `.0` task: revisit the A§10 sketch with what the earlier Rungs taught, update ARCHITECTURE.md, and get approval. Tasks are broken down then.
+## §P9 — Rung 9
+Design is A§13. Three stages (A§13.1), each ending with a retro part and the user's approval. The Leaderless variant is its own packages and touches none of the consensus core.
+
+**Verify (9a):** P9a.3's and P9a.4's seeds fail naive and can't be reproduced after. With add-wins sets, no run loses an Acknowledged add or brings back a removed element, at any of the three settings, under Partitions and crashes. Availability during a Partition is reported for each setting beside the consistent store's.
+
+**Verify (9b):** P9b.1's and P9b.3's seeds fail naive and can't be reproduced after. Every run ends Converged, including after outages longer than any retry. The stale-read rate and the time two Nodes disagree about an expired element are reported.
+
+**Verify (9c):** the same verdicts on real processes, and under a real Partition in Docker. The comparison table is in the retro.
 
 ## §P10 — Writeup
 **Verify:** each Decision Log entry is walked through with the evidence from its Rung.

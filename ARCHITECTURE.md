@@ -303,6 +303,8 @@ Requests carry `Session-Id` and `Request-Seq` headers so that a retry takes effe
 | 503 | `locked` | From Rung 8: a key is Locked by a Transaction that is not yet decided (§12.3). Nothing changed | Retry shortly, same request number |
 | 409 | `txn_conflict` | From Rung 8: a Transaction across Groups was aborted for an older Transaction, a Move, or a table that had changed (§12.5, §12.7). This attempt changed nothing. Carries `age` | Send it again as a new request, with that `age` |
 | 503 | `member_unreachable` | The Node to be added didn't catch up with the Log. Nothing changed | Check the Node is running as a Spare, then retry |
+| 400 | `not_offered` | From Rung 9, the Leaderless variant only: compare-and-set, Transactions and Sessions don't exist there (§13.3) | Use the consistent store |
+| 503 | `too_few_nodes` | From Rung 9, the Leaderless variant only: fewer than W Nodes took a write, or fewer than R answered a read, in time (§13.4). A write may be on some of them | Send it again: adding or removing an element twice changes nothing |
 | 500 | `internal` | A bug in the store | Report it; the outcome is unknown |
 
 New reasons are added here first.
@@ -377,7 +379,7 @@ These are hypotheses chosen by the user, to be confirmed or replaced when the Ru
 |---|---|
 | 7 | Confirmed and replaced by §11. |
 | 8 | Confirmed and replaced by §12. |
-| 9 | The **Leaderless variant** first settles conflicts by last-write-wins, to expose Acknowledged writes disappearing, then by version vectors that keep both values. A convergence check replaces the linearizability check. |
+| 9 | Confirmed and replaced by §13. |
 
 What earlier Rungs must leave room for: Entry kinds are extensible (§5.1); a Node can host more than one core; the state machine can refuse a key it doesn't own; the client API can carry a routing-table version.
 
@@ -616,6 +618,100 @@ Messages go Leader to Leader, name the Transaction and are repeated until answer
 - Moves made by the balancer now cost Transactions a retry.
 - Under heavy contention the steps of Transactions, and of their retries, fill a Group's Log, and everything in that Group waits behind them. Nothing in the design sheds that load.
 
+## 13. Rung 9: the Leaderless variant
+
+Confirmed with the user at P9.0. It replaces the Rung 9 row of §10. Details marked *to settle* are decided in the task that builds them. The Leaderless variant is a second store, built beside the consistent one and sharing none of its consensus: no Leader, no Term, no Log, no Group, no Slot table. It exists to be compared with it.
+
+### 13.1 Stages
+Three stages. Each ships its naive versions first, is measured, gets a part in `retros/rung-9.md`, and needs the user's approval before the next. The user asked for two; the third holds what was added afterwards, real processes and Docker.
+
+| Stage | Adds | Shipped first, to be seen failing |
+|---|---|---|
+| 9a | Home Nodes, writes to W of them with Hints, reads from R, a set as the value, the four verdicts | Last-write-wins; Hints kept and never delivered |
+| 9b | The Exchange, repair on read, time-to-live, scans | No Exchange; a remove forgotten at once; reads that trust one Node |
+| 9c | Real processes, Docker with the network cut, the comparison | — |
+
+### 13.2 Shape
+- Five Nodes, a fixed set. Each key has three **Home Nodes**, chosen by the key's hash on a ring of the Nodes (*to settle*: how many points each Node has on the ring).
+- Any Node takes any request and carries it out with the key's Home Nodes. It need not be one of them.
+- **W** and **R** are set for a run: how many Home Nodes must have a write before the client is told it succeeded, and how many must answer a read. Results are reported for W=1 R=1, W=2 R=2 and W=3 R=1.
+- The core is a pure step function, as the consensus core is (§4.2), so the Simulation can run it under the same Faults.
+
+### 13.3 What a value is, and the API
+A key holds a **set of strings**. The routes are those of §7.1 and they mean something else, so this is the same routes with a different contract, not the same API.
+
+| Request | Meaning here |
+|---|---|
+| `PUT /v1/kv/{key}` with `{"value": x, "ttl": …}` | Add the element `x` to the key's set |
+| `DELETE /v1/kv/{key}?value=x` | Remove the element `x` |
+| `GET /v1/kv/{key}` | The set, as `{"values": […]}`. An empty set is 200 with an empty list, not 404 |
+| `GET /v1/kv?start=…&end=…` | Scan (9b) |
+| Compare-and-set, `POST /v1/txn`, `POST /v1/sessions` | `not_offered` |
+
+- There are no versions in answers. Nothing here has one order to number.
+- Adding an element that is there, or removing one that isn't, changes nothing. So a request that got no answer can simply be sent again, and Sessions aren't needed.
+
+### 13.4 Writes and Hints
+- The Node that takes a write sends it to the key's three Home Nodes and answers the client when W of them have it on disk.
+- If a Home Node can't be reached, the write is given to the next Node on the ring that isn't one, as a **Hint**: that Node keeps it for the Home Node, on disk, and counts toward W.
+- If fewer than W Nodes in all have it in time, the client is told `too_few_nodes`. The write may be on some of them: the outcome is unknown, and sending it again is safe (§13.3).
+- A Node holding a Hint keeps trying to deliver it to the Home Node, and drops it once that Node has it on disk.
+- A write that reached W is still sent to the Home Nodes that hadn't answered, and sent again for a while if they don't. Each of them gets a stand-in too: W says when to answer the client, not how many Nodes the write is meant for.
+- A write that brings a Node nothing new costs it no write to disk. A Home Node that has been away is sent what it missed many times over.
+
+### 13.5 Two writes at once
+- **First, last-write-wins.** Each key has a counter. A write gives the key's whole set a number one above the highest the Node has seen for it, with the Node's id to break ties, and the higher number replaces the lower wherever they meet. A write reads the set, changes it and writes it back whole. Of two made on different sides of a Partition, one side's whole set wins and the other's additions are gone, though their clients were told they succeeded. Two made at the same moment on a healthy store do the same to each other.
+- **Then, a set where add wins.** Each addition is marked with the Node that took it and that Node's count for the key. A key keeps, beside its elements and their marks, a record of every mark it has seen. Two copies of a key are joined by keeping an element if either has a mark for it that the other hasn't seen, or both have. A remove deletes the marks it has seen and no others, so an addition made elsewhere at the same time survives it.
+- That record of marks seen is a version vector. It is what tells "never added here" from "added and removed", and it must outlive the elements (§13.7).
+
+### 13.6 Converging (9b)
+Three ways, each covering what the one before can't:
+1. Writes sent on and retried (§13.4) reach a Home Node that was briefly away.
+2. Hints reach one that was away while the write was made.
+3. **The Exchange.** Every so often each Node picks another, and for the keys they are both Home Nodes of, each takes what the other has and it lacks. This reaches a Node that was away longer than any retry lasts, or whose Hint-holder died. As built, a key is compared whole, by one fingerprint, and every shared key's fingerprint is sent each time: comparing by ranges was not done.
+
+**Repair on read.** A read asks R Home Nodes, joins their answers, returns that, and sends the joined set back to any that had less.
+
+### 13.7 Removes
+A Node that has applied a remove keeps the key's record of marks seen, even when the set is empty. If it dropped it, a Node that missed the remove would hand the element back in the next Exchange and it would be taken as new. In this Rung the record is never dropped: the cost is that a key once written is never wholly forgotten.
+
+### 13.8 Time-to-live (9b)
+An element added with a time-to-live carries a deadline: the wall clock of the Node that took the write, plus the time-to-live. Each Node stops showing the element once its own clock passes the deadline, and may then remove it locally. What is stored converges all the same. Under clock skew two Nodes disagree, for as long as the skew, about whether the element shows. This is Rung 5's naive store kept on purpose; the disagreement is measured.
+
+### 13.9 Scans (9b)
+A scan asks every Node for the keys in the range that it is a Home Node of, joins the answers key by key, and returns keys whose set isn't empty. It is as current as the least current Node that answered for each key. It answers when every Node has, or after a short wait with what it has.
+
+### 13.10 Disk
+A write, a Hint, and what an Exchange brings are on disk before they count or are acknowledged, as in the consistent store. A Node that restarts has what it had. The on-disk form is *to settle*; it is hand-written, as §3 requires.
+
+### 13.11 Verification
+The linearizability check doesn't apply. A run is judged on:
+- **Converged.** After Faults stop and a quiet period, every Home Node of every key holds the same set, and no Hint is left.
+- **No Acknowledged add lost.** Every addition a client was told had succeeded is in the final set, unless a remove took it out. This is checked exactly: the Simulation is told the mark each addition was given and the marks each remove had seen.
+- **Nothing comes back.** No addition that an Acknowledged remove took out is in the final set.
+- For last-write-wins, which has no marks, both are judged by the times of the requests: an add is lost if its element is gone and no remove of it ended after the add began.
+- **Availability,** a number: the requests answered that began while the Partition lasted, as a share of those answered over the same time, from the same seeds, with no Fault. It is given for this store at each W and R and for the consistent store of Rung 8 (5 Nodes, 3 Groups). The share of requests answered would not do: a client kept waiting asks for little, and so fails little.
+- **Stale reads,** a rate: reads that missed an add acknowledged before the read began. Nothing here promises there are none.
+
+The comparison is the Rung's result: availability during the Partition, against Acknowledged adds lost, side by side.
+
+### 13.12 Real processes and Docker (9c)
+- `kvnode` gets a mode for the Leaderless variant, with the same HTTP routes, TCP between Nodes and the disk of §13.10. `kvbench` gets its workload and its verdicts.
+- The local harness can pause and kill Nodes (`harness/leaderless.sh`). A real Partition needs Docker with the network cut (`harness/partition.sh`): every link between Nodes goes through a proxy that can be switched off.
+- As built: the compose file gives every Node extra flags from `KVNODE_ARGS`, a change the user agreed to. The Leaderless variant's Nodes talk only over the links that were already proxied. The store of Rung 8 also forwards requests and gossips over HTTP, so each link has a second proxy and a Node is told to reach the others through it (`kvnode -forward-via`).
+- `kvbench -pin` keeps each client on one Node, as the Simulation's clients are, so that what is measured is whether the Node a client can reach will serve it.
+- **Measured** (`retros/rung-9.md`). Local processes, 64 clients: 647 requests/s at W=2 R=2 and 1,280 at W=1 R=1, against the consistent store's 710. Under a real Partition of two Nodes from three: the consistent store did 73% of its work, the Leaderless variant 77% at W=1 R=1 and 2% at W=2 R=2. The Simulation had put them at 19%, 92% and 44%.
+
+### 13.13 Risks accepted
+- A client must know that a value is a set. Nothing written for the consistent store works unchanged.
+- A key once written is never wholly forgotten (§13.7).
+- With W=1 a write acknowledged by one Node, which is then lost for good before sending it on, is gone. No Partition is needed.
+- Expiry disagrees under clock skew (§13.8).
+- A Node can't tell a Node that is cut off from one that is slow. A request that can't find W or R Nodes waits out its whole time before it is refused, and with clients that don't pause that wait is most of what the store does during a Partition.
+- The Node set is fixed. Adding or removing a Node moves keys between Home Nodes, and that is not built.
+- A Node that loses its disk can't come back under the same number: it would count its additions from one again, and the others would take its new additions for ones they had already seen.
+- A remove takes out only what the Home Nodes it read from had seen. During a long Partition about 3% of removes that succeed take nothing out (`retros/rung-9.md`).
+
 ## Decision Log
 
 ### The consensus core is a pure step function
@@ -668,3 +764,9 @@ Across Groups there is no one index. Each key could take its own Group's version
 
 ### The older Transaction wins, and a retry keeps its age
 A Transaction that meets a Lock could be refused at once, which lets two keep refusing each other, or all could prepare in one key order, which makes prepares one after another. So each has an age, the younger gives way, and only a younger one ever waits. Age is the Store time on the begin Entry, then the Session id: coarse, but one order every Group agrees on with no extra call. A Transaction that loses is told its age and sends it back, so it can't lose for ever. The store has to trust that number.
+
+### The Leaderless variant's value is a set, and add wins
+Version vectors, as first sketched, keep both of two concurrent values and hand them to the client to choose between. That is honest and changes the API into one where clients merge. Showing one by a fixed rule keeps the API and hides a write as surely as losing it. So the store joins concurrent writes itself, which it can only do for a value with a rule for joining: a set of strings, where an add made at the same time as a remove survives. The cost is that the routes are the same and the contract is not: a client written for the consistent store doesn't work against this one. In return adds and removes can be sent twice without harm, so Sessions aren't needed.
+
+### W of three Home Nodes, with Hints
+Every Node could hold every key and answer as soon as it has stored a write itself, which is the most available store there is. The user chose Dynamo's shape: three Home Nodes of five per key, a write acknowledged at W of them, and a Node that isn't a Home Node standing in for one that can't be reached. It is comparable with the consistent store, where a key is also on three Nodes of five, and W and R make the trade between availability and loss a setting that can be measured at several values. It costs a ring, a second path by which data moves, and results that are per setting.

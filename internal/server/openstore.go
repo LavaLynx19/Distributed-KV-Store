@@ -35,6 +35,10 @@ type StoreConfig struct {
 	// founder is told of every founder. A Node joining later needs only
 	// itself and one other in Clients; gossip brings the rest.
 	Peers, Clients map[int]string
+	// Via, if set, is where this Node reaches Node n's client API, as a
+	// URL, when that isn't the address clients use: in a harness that puts
+	// something between the Nodes to cut them off from each other.
+	Via func(n int) string
 	// Detector is how quiet Nodes are noticed, and GossipEvery the length
 	// of a gossip round (default 10 ticks).
 	Detector    gossip.Detector
@@ -69,7 +73,7 @@ func OpenStore(ctx context.Context, cfg StoreConfig) (*Store, func(), error) {
 		Node: cfg.Node, Nodes: cfg.Nodes, Groups: cfg.Groups, Replicas: cfg.Replicas, Slots: cfg.Slots,
 		Local: map[shard.GroupID]*Node{}, Clients: map[int]string{}, Peers: map[int]string{},
 		Timeout: cfg.Timeout, Tick: 2 * cfg.Tick, TimeEvery: 10 * cfg.Tick,
-		GossipEvery: cfg.GossipEvery, Auto: cfg.Auto, DeadWait: cfg.DeadWait,
+		GossipEvery: cfg.GossipEvery, Auto: cfg.Auto, DeadWait: cfg.DeadWait, Via: cfg.Via,
 		handles: map[shard.GroupID]*handle{}, roles: map[shard.GroupID]string{},
 	}
 	if s.GossipEvery == 0 {

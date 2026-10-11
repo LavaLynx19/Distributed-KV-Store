@@ -134,6 +134,21 @@ _Avoid_: Force restart, disaster recovery
 **Leaderless variant**:
 A second mode of the store, with no Leader, in which every Node accepts writes during a Partition and conflicts are settled afterwards.
 _Avoid_: AP mode, eventual mode, Dynamo mode
+**Home Node**:
+One of the Nodes that keep a given key in the Leaderless variant.
+_Avoid_: Replica, preference list, owner
+
+**Hint**:
+A write kept by a Node that is not a Home Node of its key, for a Home Node that couldn't be reached.
+_Avoid_: Handoff, buffered write
+
+**Exchange**:
+Two Nodes comparing the keys they both keep and each taking what it lacks.
+_Avoid_: Anti-entropy, sync, repair
+
+**Converged**:
+Said of the Leaderless variant when every Home Node of every key holds the same data and no Hint is left.
+_Avoid_: Consistent, in sync, settled
 
 ## Process
 

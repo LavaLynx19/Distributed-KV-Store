@@ -49,6 +49,11 @@ launch() { # id nodes founders
   local groups
   groups="$(cat "$OUT/groups" 2>/dev/null || echo 0)"
   [[ $groups -eq 0 ]] || shape=(-data-groups "$groups" -slots "$(cat "$OUT/slots")")
+  # The Leaderless variant (A§13): every Node started is a Node of it.
+  local leaderless
+  leaderless="$(cat "$OUT/leaderless" 2>/dev/null || true)"
+  # shellcheck disable=SC2206
+  [[ -z $leaderless ]] || shape=(-leaderless $leaderless)
   "$BIN" -id "$1" -peers "$(addrs 7000 "$2")" -clients "$(addrs 8000 "$2")" "${shape[@]}" \
     ${data[@]+"${data[@]}"} ${KVNODE_FLAGS:-} \
     >>"$OUT/node$1.log" 2>&1 &
@@ -78,6 +83,7 @@ case "${1:-}" in
     echo "$n" >"$OUT/founders"
     echo "${DATA_GROUPS:-0}" >"$OUT/groups"
     echo "${SLOTS:-64}" >"$OUT/slots"
+    echo "${LEADERLESS:-}" >"$OUT/leaderless"
     for i in $(seq 1 "$total"); do launch "$i" "$total" "$n"; done
     echo "started $n Members${3:+ and $3 Spares}; clients on 127.0.0.1:8001..$((8000 + total))"
     ;;
