@@ -1,6 +1,6 @@
 # Rung 8 retro: Transactions across Groups
 
-Status: **stage 8a done and approved. Stage 8b built and tested in the Simulation and in-process; its real runs and the numbers check are waiting for the user's go-ahead.** Rung 8 is built in two stages (A§12.1). This file has a part per stage, and the verdict for the whole Rung at the end.
+Status: **stage 8a done and approved. Stage 8b done, waiting for approval.** Rung 8 is built in two stages (A§12.1). This file has a part per stage, and the verdict for the whole Rung at the end.
 
 Stage 8a in one paragraph: a Transaction whose keys are in several Groups commits in all of them or none, with every step in the Log of its Coordinator Group. 5,400 simulated runs under crashes, Partitions and Moves committed 112,948 such Transactions with none half-committed, no History that isn't Linearizable, and nothing left Locked. Four shortcuts were shipped first and seen failing. Two bugs that none of the planned exposures would have shown were found by the suite and are described below. Nothing here has run as real processes yet: that is stage 8b.
 
@@ -161,6 +161,30 @@ The part a Leader plays, sending steps and proposing decisions, is one package (
 
 Measured in those tests, not under `kvbench`: a Transaction across three Groups with nobody else on its keys takes 88 ms, where a single write takes 16 ms. With six clients on the same three keys a commit takes about 200 ms.
 
+## Real runs (P8b.6)
+
+M4 Pro, local processes, 10 s each, five Nodes hosting three data Groups and the Meta Group, 64 clients, twelve replicas syncing to one disk. Run by the user's leave: eight runs in two batches. `kvbench` sends Transactions that write two keys in different Groups, on keys of their own, and sends one again with its age when it is aborted over a conflict.
+
+**The numbers check.** With no Transactions and no Fault: **710 requests/s, against Rung 7's 704 (1.01×).** Pass. The checks Rung 8 adds to every read and write cost nothing that shows.
+
+**What a Transaction costs.** Single-key requests are in the same runs; their latency didn't change (p50 80 to 88 ms throughout).
+
+| Run | Keys | Single-key requests/s | Transactions/s | Transaction p50 / p95 | Attempts aborted over a conflict | Not committed | Verdicts |
+|---|---|---|---|---|---|---|---|
+| 10% Transactions | 5,000 | 406 | 43 | 581 ms / 899 ms | 0 | 0 | Linearizable; Groups identical |
+| 10%, Node 1 killed for 3 s | 5,000 | 415 | 44 | 516 ms / 901 ms | 0 | 16 | Same; longest pause in writes 370 ms |
+| 10%, a Slot moved every half second | 5,000 | 452 | 48 | 498 ms / 780 ms | 8 | 1 | Same; 2 Slots moved, frozen 174 ms median, 240 ms at most |
+| 10% Transactions | 50 | 222 | 20 | 988 ms / 3.5 s | 142 | 48 | Same |
+| 100% Transactions | 50 | — | 17 | 1.17 s / 5.0 s | 316 | 97 | Same |
+| 10%, before the waits were changed | 50 | 158 | 14 | 1.48 s / 5.7 s | 513 | 40 | Same |
+| 100%, before | 50 | — | 8 | 3.6 s / 7.7 s | 1,004 | 71 | Same |
+
+- **A Transaction across two Groups takes about 0.55 s here, where a single write takes 0.08 s: about seven times.** Three of its steps are disk writes one after the other (begin, prepare, decision), about 85 ms each under this load. The rest is the Node that took the request asking the Coordinator Group whether it is decided yet: each asking is a Linearizable read, which takes about 100 ms here, and it takes two or three.
+- **Single-key throughput falls from 710 to about 410, and none of that is the store being slower.** A client sends one request at a time, and one request in ten now takes seven times as long.
+- **On 50 keys, 64 clients fight.** A Transaction's median is 1 s, and one in six isn't committed within the client's 2 s. "Not committed" here means the client stopped waiting: `kvbench` sends its Transactions outside a Session and can't ask again.
+- **The first two runs were worse, and showed a mistake.** The waits had been chosen in-process, where a step takes 16 ms. Under load a step takes 85 ms, so a younger Transaction gave way after 400 ms to an older one that needed about that long to finish, and steps were sent a second time while the first was still on its way. With waits sized for the step time measured, aborted attempts on 50 keys fell from 513 to 142. The waits are still fixed numbers, right for one machine and one load.
+- **Moves were few and slow in the Move run:** two Slots in 3 s, taking 1.4 s and 2.0 s each, where Rung 7 moved one every half second. That run had 10,000 keys where Rung 7's had 50, so each Slot had about 150 keys to copy. Whether Locks added to it was not separated out.
+
 ## Bugs found
 
 1. **A forgotten abort came back with the wrong key names.** Once records were forgotten, a retry was answered from the Session's record, which held the failed conditions under the plain names of the keys where the reading code expected internal ones. 7 runs of 100 with no Faults, 69 with crashes.
@@ -178,7 +202,9 @@ Measured in those tests, not under `kvbench`: a Transaction across three Groups 
 
 ## Not covered
 
-- **The numbers check, and any run under `kvbench`.** Waiting for the user's go-ahead.
+- **A crash or a Move during Transactions, on real processes, was run once each.** Both ended Linearizable with the Groups identical. `kvbench` doesn't check that its Transactions were atomic: that rests on the Simulation and the in-process tests.
+- **How a Transaction is answered.** The Node that took the request asks again and again whether it is decided, by Linearizable reads. That is two or three reads of 100 ms on top of three writes. A decision once made can't be unmade, so it could be read from any Member's state without the round trip to a Majority. Not done.
+- **The waits don't follow the load.** They are constants, sized once for the Simulation and once for this machine.
 - **A crowd.** Twenty clients on 24 keys with Transactions over three of them commit 23 to 50 Transactions in a run where five clients commit about 37 each run on average, and leave some undecided when the run ends. Their steps and retries fill the Groups' Logs. Nothing in the design sheds that load. The linearizability check can't be run on a History that size either: it is over the whole store at once, and stops being feasible well before 20 clients. The balancer was therefore tested with 6 clients, not the 20 its load figures were measured with.
 - **`kvbench` doesn't check its Transactions.** They use keys of their own and are counted and timed. The History it checks has only the single-key requests.
 - A Coordinator Group without a Majority, and Docker, as in stage 8a.
@@ -191,3 +217,24 @@ go test ./internal/shardtest -run 'Rung8|Waiting|TwoKeys|OlderWins|AMove'
 go test ./internal/server -run 'Transaction'
 KV_MEASURE=1 go test ./internal/shardtest -run TestMeasureRung8b -v -timeout 40m
 ```
+
+## Verdict (8b)
+
+Done, waiting for approval.
+
+# Rung 8 verdict
+
+| Check (README) | Result |
+|---|---|
+| Exposed: a transaction across Groups half-committed when its coordinator crashes | **Done.** 93 runs of 300 with the Node stopped mid-commit, 54 under Partitions with no crash at all. Three more shortcuts shown failing on the way: readable Locks (Stale reads with no Fault), versions with no offset (every run), waiting with no order (82 runs of 100, with three keys) |
+| Atomic under coordinator and participant crashes; nothing stays undecided | **Done in the Simulation:** 5,400 runs in stage 8a and 6,100 in stage 8b, none failing, with crashes, Partitions, Moves, replacement and the balancer. On real processes: in-process tests, and one run each with a Node killed and with Slots moving. "Nothing stays undecided" holds while every Group involved has a Majority |
+| Numbers: at least 0.9× Rung 7 | **Pass: 710 against 704 requests/s (1.01×)** on the same load. Transactions across Groups are a known cost on top: about seven single writes each |
+| Retro | This file |
+
+## Lessons
+
+- **The step that is safe alone is not safe out of order.** Every step of the commit could be applied twice. A prepare applied after its own finish was the hole, and it took three fixes: asking about old Locks, remembering by Session, and at last naming in the decision the prepare it counted. Only the last doesn't depend on something being remembered.
+- **The lowest key gave an order for free.** Because the Coordinator Group owns the lowest key and Locks first, two-key Transactions can't wait in a ring, and for them the naive waiting was the best policy measured. "Older wins" is needed from three Groups up, and costs aborts below that.
+- **A wait is a guess about how long a step takes.** Every wait here was chosen on a quiet machine and was wrong under load. Stage 7c found the same with the load figures.
+- **What a test can't see, it doesn't test.** Finishes sent 250 ms late passed 11,000 simulated runs. One timing on real Nodes found it.
+- **The checker sets the size of the test.** A History with Transactions is checked over the whole store, which rules out 20 clients. The crowd that broke the store's throughput was also the one case its correctness couldn't be checked in.

@@ -605,10 +605,12 @@ Messages go Leader to Leader, name the Transaction and are repeated until answer
 - **Faults:** the Coordinator Group's Leader and each other Group's Leader crashed between every pair of steps, Partitions between Groups, and from 8b Moves and automation during Transactions.
 - **Client signals** add: requests refused `locked` and `txn_conflict`, attempts per Transaction, and the longest time a key stayed Locked.
 - **Numbers.** The Rung 7 load with no Transactions is run again and must reach 0.9× of Rung 7. Transactions across Groups are then measured on their own and their cost is stated in the retro as a known cost.
+- **Measured** (`retros/rung-8.md`): on local processes with three Groups and 64 clients, the Rung 7 load answers 710 requests/s against Rung 7's 704. A Transaction across two Groups takes about 0.55 s where a single write takes 0.08 s: three writes one after the other, and two or three Linearizable reads by the Node waiting to hear the decision.
 
 ### 12.10 Risks accepted
 - Two-phase commit stops when the Coordinator Group has no Majority (§12.4).
-- A Transaction across two Groups costs at least five Committed writes where one in a single Group costs one: begin, decision and confirmed in the Coordinator Group, prepare and finish in the other.
+- A Transaction across two Groups costs at least five Committed writes where one in a single Group costs one: begin, decision and confirmed in the Coordinator Group, prepare and finish in the other. The client waits for three of them, and for the reads by which the Node that took its request learns the decision.
+- Every wait in §12 is a fixed number, chosen for one machine under one load. Too short, and Transactions abort each other for nothing; too long, and a stuck one holds its keys.
 - A client can lie about a Transaction's age (§12.5).
 - A scan across Groups is still not one moment (§11.8).
 - Moves made by the balancer now cost Transactions a retry.

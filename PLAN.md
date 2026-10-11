@@ -119,7 +119,7 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P8b.3 Measure a Move stalled behind a slow Transaction; then Moves abort undecided Transactions (A§12.7) → §P8
 - [x] P8b.4 Forget a record when every Group has confirmed (A§12.2) → §P8
 - [x] P8b.5 Real shell: the steps between processes, `kvctl` shows Locks and undecided Transactions, `kvbench` can send a share of Transactions across Groups → §P8
-- [ ] P8b.6 Stage 8b suite with Moves and automation on, real runs, the 8b part and the Rung 8 verdict in `retros/rung-8.md` → §P8
+- [x] P8b.6 Stage 8b suite with Moves and automation on, real runs, the 8b part and the Rung 8 verdict in `retros/rung-8.md` → §P8
 
 ### Phase 9 — Rung 9: the Leaderless variant (§P9)
 - [>] P9.0 Confirm or replace the A§10 sketch; design the convergence check → defer until: Rung 6 retro is done (independent of Rungs 7–8)
