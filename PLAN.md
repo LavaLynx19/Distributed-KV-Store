@@ -141,7 +141,7 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P9c.3 The comparison runs, the 9c part and the Rung 9 verdict in the retro → §P9
 
 ### Phase 10 — Writeup (§P10)
-- [>] P10.1 `RESULTS.md` via `/docs`: Rung results and a Decision Log walkthrough → defer until: the last Rung in scope passes
+- [x] P10.1 `RESULTS.md` via `/docs`: Rung results and a Decision Log walkthrough → §P10
 
 ## Project structure
 ```
