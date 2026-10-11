@@ -138,7 +138,7 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P9b.6 Stage 9b suite and the 9b part of the retro → §P9
 - [x] P9c.1 Real processes: a `kvnode` mode with HTTP, TCP and disk; `kvbench` workload and verdicts; local harness (A§13.12) → §P9
 - [x] P9c.2 Docker with the network cut, for the Leaderless variant and for the store of Rung 8: `harness/partition.sh`. The compose file gained `KVNODE_ARGS`, with the user's leave; the store of Rung 8 reaches other Nodes' HTTP through a second proxy per link (`kvnode -forward-via`) → §P9
-- [ ] P9c.3 The comparison runs, the 9c part and the Rung 9 verdict in the retro → §P9
+- [x] P9c.3 The comparison runs, the 9c part and the Rung 9 verdict in the retro → §P9
 
 ### Phase 10 — Writeup (§P10)
 - [>] P10.1 `RESULTS.md` via `/docs`: Rung results and a Decision Log walkthrough → defer until: the last Rung in scope passes

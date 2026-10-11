@@ -700,12 +700,14 @@ The comparison is the Rung's result: availability during the Partition, against 
 - The local harness can pause and kill Nodes (`harness/leaderless.sh`). A real Partition needs Docker with the network cut (`harness/partition.sh`): every link between Nodes goes through a proxy that can be switched off.
 - As built: the compose file gives every Node extra flags from `KVNODE_ARGS`, a change the user agreed to. The Leaderless variant's Nodes talk only over the links that were already proxied. The store of Rung 8 also forwards requests and gossips over HTTP, so each link has a second proxy and a Node is told to reach the others through it (`kvnode -forward-via`).
 - `kvbench -pin` keeps each client on one Node, as the Simulation's clients are, so that what is measured is whether the Node a client can reach will serve it.
+- **Measured** (`retros/rung-9.md`). Local processes, 64 clients: 647 requests/s at W=2 R=2 and 1,280 at W=1 R=1, against the consistent store's 710. Under a real Partition of two Nodes from three: the consistent store did 73% of its work, the Leaderless variant 77% at W=1 R=1 and 2% at W=2 R=2. The Simulation had put them at 19%, 92% and 44%.
 
 ### 13.13 Risks accepted
 - A client must know that a value is a set. Nothing written for the consistent store works unchanged.
 - A key once written is never wholly forgotten (§13.7).
 - With W=1 a write acknowledged by one Node, which is then lost for good before sending it on, is gone. No Partition is needed.
 - Expiry disagrees under clock skew (§13.8).
+- A Node can't tell a Node that is cut off from one that is slow. A request that can't find W or R Nodes waits out its whole time before it is refused, and with clients that don't pause that wait is most of what the store does during a Partition.
 - The Node set is fixed. Adding or removing a Node moves keys between Home Nodes, and that is not built.
 - A Node that loses its disk can't come back under the same number: it would count its additions from one again, and the others would take its new additions for ones they had already seen.
 - A remove takes out only what the Home Nodes it read from had seen. During a long Partition about 3% of removes that succeed take nothing out (`retros/rung-9.md`).
