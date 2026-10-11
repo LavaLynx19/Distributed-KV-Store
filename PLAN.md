@@ -114,8 +114,8 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P8a.5 Fix: Locked keys ask the Coordinator Group, wait, then `locked`; old Locks are asked about; a Move waits for a Slot's Locks (A§12.3, A§12.7) → §P8
 - [x] P8a.6 The per-Slot version offset (A§12.6), built in P8a.1: its regression seeds from P8a.3, and Moves resetting it → §P8
 - [x] P8a.7 Stage 8a suite with the verdicts of A§12.9, crashes between every pair of steps, and the 8a part of `retros/rung-8.md` → §P8
-- [ ] P8b.1 Naive conflicts: Transactions wait for each other's Locks with no order and no bound. Expose: two Transactions that never decide → §P8
-- [ ] P8b.2 Fix: age, older wins, `txn_conflict` carrying the age, the client's retry (A§12.5) → §P8
+- [x] P8b.1 Naive conflicts: Transactions wait for each other's Locks with no order and no bound. Expose: Transactions that never decide. It takes Transactions over three Groups: two keys can't form a ring (A§12.5) → §P8
+- [x] P8b.2 Fix: age, older wins, `txn_conflict` carrying the age, the client's retry (A§12.5) → §P8
 - [ ] P8b.3 Measure a Move stalled behind a slow Transaction; then Moves abort undecided Transactions (A§12.7) → §P8
 - [ ] P8b.4 Forget a record when every Group has confirmed (A§12.2) → §P8
 - [ ] P8b.5 Real shell: the steps between processes, `kvctl` shows Locks and undecided Transactions, `kvbench` can send a share of Transactions across Groups → §P8

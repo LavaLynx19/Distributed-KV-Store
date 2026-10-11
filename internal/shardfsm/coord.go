@@ -44,6 +44,8 @@ type CoordStep struct {
 	Parts    []Part
 	Stamp    int64
 	Register bool
+	// Age, on a begin, is the Transaction's age, or zero for the Stamp.
+	Age int64
 
 	// For a decision: whether the Transaction commits, the version its
 	// writes get if it does, and the conditions the other Groups found
@@ -142,6 +144,7 @@ type coordinated struct {
 	// parts are the other Groups' parts.
 	parts   []Part
 	stamp   int64
+	age     int64
 	decided bool
 	commit  bool
 	version uint64
@@ -178,6 +181,7 @@ type Coordinated struct {
 	// begin.
 	Parts []Part
 	Stamp int64
+	Age   int64
 	// Own is this Group's own answer to its part.
 	Own     Vote
 	OwnResp fsm.Response
@@ -206,7 +210,7 @@ func (m *Machine) Coordinating() []Coordinated {
 	var out []Coordinated
 	m.openTxns.Ascend("", "", func(k string, _ struct{}) bool {
 		r, _ := m.coord.Get(k)
-		c := Coordinated{ID: idOf(k), Parts: r.parts, Stamp: r.stamp, Decided: r.decided, Commit: r.commit, Version: r.version, Confirmed: r.confirmed, Offers: r.offers}
+		c := Coordinated{ID: idOf(k), Parts: r.parts, Stamp: r.stamp, Age: r.age, Decided: r.decided, Commit: r.commit, Version: r.version, Confirmed: r.confirmed, Offers: r.offers}
 		if p, held := m.txns.Get(k); held {
 			c.Own, c.OwnResp, _ = DecodeVote(p.answer)
 		}
@@ -239,14 +243,17 @@ func (m *Machine) applyCoord(index core.Index, payload []byte) []byte {
 			return EncodeState(TxnRefused, fsm.Response{Status: fsm.StatusWrongGroup})
 		}
 		own := st.Parts[0]
-		vote, resp, _ := DecodeVote(m.prepare(index, PrepareStep(st.ID, m.cfg.Group, true, own.Conds, own.Writes, st.Stamp, st.Register)))
+		if st.Age == 0 {
+			st.Age = st.Stamp
+		}
+		vote, resp, _ := DecodeVote(m.prepare(index, PrepareStep(st.ID, m.cfg.Group, true, own.Conds, own.Writes, st.Stamp, st.Register).Aged(st.Age)))
 		switch {
 		case vote == VoteDone:
 			return EncodeState(TxnDecided, resp)
 		case vote == VoteNo && resp.Status != fsm.StatusVersionMismatch:
 			return EncodeState(TxnRefused, resp)
 		}
-		rec = coordinated{parts: st.Parts[1:], stamp: st.Stamp}
+		rec = coordinated{parts: st.Parts[1:], stamp: st.Stamp, age: st.Age}
 		m.coord = m.coord.Put(key, rec)
 		m.openTxns = m.openTxns.Put(key, struct{}{})
 		m.finished = Finished{ID: st.ID}
@@ -384,6 +391,7 @@ func (s CoordStep) Encode() []byte {
 	switch s.op {
 	case opTxnBegin:
 		b = append(b, flag(s.Register))
+		b = binary.AppendVarint(b, s.Age)
 		b = binary.AppendVarint(b, s.Stamp)
 		b = appendParts(b, s.Parts)
 	case opDecide:
@@ -406,7 +414,7 @@ func DecodeCoordStep(payload []byte) (CoordStep, error) {
 	s := CoordStep{op: payload[0], ID: TxnID{Session: r.uvarint(), Seq: r.uvarint()}}
 	switch s.op {
 	case opTxnBegin:
-		s.Register, s.Stamp = r.byte() == 1, r.varint()
+		s.Register, s.Age, s.Stamp = r.byte() == 1, r.varint(), r.varint()
 		s.Parts = r.parts()
 	case opDecide:
 		s.Commit, s.Version = r.byte() == 1, r.uvarint()
@@ -427,6 +435,7 @@ func appendCoord(b []byte, m *Machine) []byte {
 	m.coord.Ascend("", "", func(k string, rec coordinated) bool {
 		b = append(b, k...) // always 16 bytes
 		b = appendParts(b, rec.parts)
+		b = binary.AppendVarint(b, rec.age)
 		b = binary.AppendVarint(b, rec.stamp)
 		b = append(b, flag(rec.decided), flag(rec.commit))
 		b = binary.AppendUvarint(b, rec.version)
@@ -449,7 +458,7 @@ func (m *Machine) restoreCoord(r *reader) {
 		}
 		k := string(r.b[:16])
 		r.b = r.b[16:]
-		rec := coordinated{parts: r.parts(), stamp: r.varint(), decided: r.byte() == 1, commit: r.byte() == 1, version: r.uvarint(), outcome: r.bytes()}
+		rec := coordinated{parts: r.parts(), age: r.varint(), stamp: r.varint(), decided: r.byte() == 1, commit: r.byte() == 1, version: r.uvarint(), outcome: r.bytes()}
 		for range r.count() {
 			rec.confirmed = append(rec.confirmed, shard.GroupID(r.uvarint()))
 		}

@@ -24,11 +24,29 @@ type Transactions struct {
 	ReadLocked bool
 	// NoOffset is another (shardfsm.Config.NoOffset).
 	NoOffset bool
+	// Conflicts is what a Transaction does when it finds a key Locked by
+	// another.
+	Conflicts ConflictMode
 	// NoAsking leaves a Group that has Locked keys waiting to be told the
 	// outcome, never asking for it. It exists so that the Locks this
 	// leaves behind stay reproducible.
 	NoAsking bool
 }
+
+// ConflictMode is what a Transaction does about a key another has Locked.
+type ConflictMode uint8
+
+const (
+	// RefuseAtOnce aborts it, as in stage 8a. Nothing ever waits, so
+	// nothing can wait for ever.
+	RefuseAtOnce ConflictMode = iota
+	// WaitInTurn has it wait for the key, however long that takes, with
+	// no order between Transactions. It is the store stage 8b starts from.
+	WaitInTurn
+	// OlderWins has the older of the two abort the younger, and the
+	// younger wait a while for the older (A§12.5).
+	OlderWins
+)
 
 // part is one Group's share of a Transaction.
 type part struct {
@@ -44,6 +62,8 @@ const (
 	lockAskAfter = 30  // how old a Lock is before its Group asks what was decided
 	lockAskAgain = 6   // how soon it asks again while a request is waiting
 	lockWait     = 12  // how long a request for a Locked key waits before it is refused
+	txnRetry     = 10  // how soon a Transaction that found a key Locked tries for it again
+	txnWait      = 80  // how long a younger Transaction waits for an older one's keys
 )
 
 // split divides a Transaction between the Groups the table gives for its
@@ -213,9 +233,16 @@ func (c *Cluster) transact(n int, cmd fsm.Command, done func(Outcome, fsm.Respon
 // begin puts a Transaction across Groups to its Coordinator Group, from
 // Node n, and waits there for the decision (A§12.2). The Node keeps
 // nothing that matters: if it stops, the Transaction goes on without it.
-func (c *Cluster) begin(n int, cmd fsm.Command, done func(Outcome, fsm.Response)) {
+func (c *Cluster) begin(n int, cmd fsm.Command, age int64, answer func(Outcome, fsm.Response, int64)) {
 	nd := c.nodes[n]
 	boot := nd.boots
+	if age == 0 || age > nd.table.StoreTime {
+		// A Transaction is as old as the Store time its first attempt
+		// found, and no older than a client can honestly say (A§12.5).
+		age = max(nd.table.StoreTime, 1)
+	}
+	started := c.S.Now()
+	done := func(o Outcome, resp fsm.Response) { answer(o, resp, age) }
 	id := shardfsm.TxnID{Session: cmd.Session, Seq: cmd.Seq}
 	split := split(nd.table, cmd)
 	parts := make([]shardfsm.Part, len(split))
@@ -243,6 +270,11 @@ func (c *Cluster) begin(n int, cmd fsm.Command, done func(Outcome, fsm.Response)
 			})
 		})
 	}
+	build := func(storeTime int64) []byte {
+		step := shardfsm.TxnBeginStep(id, parts, storeTime, cmd.Register)
+		step.Age = age
+		return step.Encode()
+	}
 	settle = func(o Outcome, raw []byte) {
 		if o != Answered {
 			done(o, fsm.Response{})
@@ -256,10 +288,21 @@ func (c *Cluster) begin(n int, cmd fsm.Command, done func(Outcome, fsm.Response)
 			wait()
 		case state == shardfsm.TxnRefused && resp.Status == fsm.StatusSessionExpired:
 			done(Answered, resp)
+		case state == shardfsm.TxnRefused && resp.Status == fsm.StatusTxnConflict && c.yield(nd, shardfsm.Held{ID: id, Coord: lead, Age: age}, resp, started):
+			// The Coordinator Group's own keys are Locked, and nothing is
+			// held for this Transaction yet: try again shortly.
+			c.S.After(txnRetry, func() {
+				if nd.up && nd.boots == boot {
+					c.ask(n, lead, false, build, settle)
+				}
+			})
 		case state == shardfsm.TxnRefused:
 			if resp.Status == fsm.StatusWrongGroup {
 				c.WrongGroup++
 				c.refresh(nd)
+			}
+			if resp.Status == fsm.StatusTxnConflict {
+				c.TxnConflict++
 			}
 			done(Refused, resp)
 		case resp.Status == fsm.StatusTxnConflict:
@@ -272,10 +315,34 @@ func (c *Cluster) begin(n int, cmd fsm.Command, done func(Outcome, fsm.Response)
 			done(Answered, resp)
 		}
 	}
-	build := func(storeTime int64) []byte {
-		return shardfsm.TxnBeginStep(id, parts, storeTime, cmd.Register).Encode()
-	}
 	c.ask(n, lead, false, build, settle)
+}
+
+// yield decides what a Transaction does on finding a key Locked by
+// another, and reports whether it should try for the key again. With
+// OlderWins, the older of the two has the younger aborted and tries again;
+// the younger tries again for a while and then gives way. since is when
+// the Transaction first found the key Locked.
+func (c *Cluster) yield(nd *node, me shardfsm.Held, resp fsm.Response, since int64) bool {
+	holder, named := shardfsm.DecodeHeld(resp.Value)
+	switch c.cfg.Transactions.Conflicts {
+	case WaitInTurn:
+		return true
+	case OlderWins:
+		if !named {
+			return false
+		}
+		if !me.Older(holder) {
+			return c.S.Now()-since < txnWait
+		}
+		// The younger one is aborted by its own Coordinator Group, if it
+		// isn't decided yet. Either way its Locks go.
+		c.TxnWounded++
+		abort := shardfsm.DecideStep(holder.ID, false, 0, nil, nil).Encode()
+		c.ask(nd.id, holder.Coord, false, func(int64) []byte { return abort }, func(Outcome, []byte) {})
+		return c.S.Now()-since < txnGiveUp
+	}
+	return false
 }
 
 // coordKey names a Transaction a Node is carrying on for a Group it leads.
@@ -295,6 +362,9 @@ type coordState struct {
 	asked map[shard.GroupID]int64
 	// proposed is when this Leader last proposed a decision.
 	proposed int64
+	// blocked is when each Group first answered that a key was Locked by
+	// another Transaction, while this one is still trying for it.
+	blocked map[shard.GroupID]int64
 }
 
 // txnLoop has Node nd carry on the Transactions of every Group it leads.
@@ -381,7 +451,7 @@ func (c *Cluster) coordinate(nd *node, g shard.GroupID, t shardfsm.Coordinated, 
 	now := c.S.Now()
 	st := nd.coord[key]
 	if st == nil {
-		st = &coordState{since: now, votes: map[shard.GroupID]fsm.Response{}, yes: map[shard.GroupID]bool{}, asked: map[shard.GroupID]int64{}, proposed: -txnAskAgain}
+		st = &coordState{since: now, votes: map[shard.GroupID]fsm.Response{}, yes: map[shard.GroupID]bool{}, asked: map[shard.GroupID]int64{}, blocked: map[shard.GroupID]int64{}, proposed: -txnAskAgain}
 		nd.coord[key] = st
 	}
 	boot := nd.boots
@@ -414,17 +484,31 @@ func (c *Cluster) coordinate(nd *node, g shard.GroupID, t shardfsm.Coordinated, 
 			continue
 		}
 		st.asked[p.Group] = now
-		prepare := shardfsm.PrepareStep(t.ID, g, false, p.Conds, p.Writes, t.Stamp, false).Encode()
+		prepare := shardfsm.PrepareStep(t.ID, g, false, p.Conds, p.Writes, t.Stamp, false).Aged(t.Age).Encode()
 		c.ask(nd.id, p.Group, false, func(int64) []byte { return prepare }, func(o Outcome, raw []byte) {
 			vote, resp, err := shardfsm.DecodeVote(raw)
 			if o != Answered || err != nil || nd.boots != boot {
 				return // asked again in a while
+			}
+			if vote == shardfsm.VoteNo && resp.Status == fsm.StatusTxnConflict {
+				if _, was := st.blocked[p.Group]; !was {
+					st.blocked[p.Group] = c.S.Now()
+				}
+				if c.yield(nd, shardfsm.Held{ID: t.ID, Coord: g, Age: t.Age}, resp, st.blocked[p.Group]) {
+					// Nothing is held there: try for the key again shortly.
+					st.asked[p.Group] = c.S.Now() - txnAskAgain + txnRetry
+					return
+				}
 			}
 			st.votes[p.Group], st.yes[p.Group] = resp, vote == shardfsm.VoteYes
 		})
 	}
 	if now-st.proposed < txnAskAgain {
 		return
+	}
+	giveUp := int64(txnGiveUp)
+	if c.cfg.Transactions.Conflicts == WaitInTurn {
+		giveUp = 1 << 60 // the naive store waits for as long as it takes
 	}
 	commit := t.Own == shardfsm.VoteYes
 	version := t.OwnResp.Version
@@ -435,7 +519,7 @@ func (c *Cluster) coordinate(nd *node, g shard.GroupID, t shardfsm.Coordinated, 
 		resp, voted := st.votes[p.Group]
 		switch {
 		case !voted:
-			if now-st.since < txnGiveUp {
+			if now-st.since < giveUp {
 				return // not every Group has answered, and there is time yet
 			}
 			commit, conflict = false, true

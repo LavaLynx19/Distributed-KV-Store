@@ -152,6 +152,11 @@ type Routing struct {
 	Locked, TxnConflict int
 	// TxnCommitted counts Transactions across Groups that committed.
 	TxnCommitted int
+	// TxnWounded counts the times an older Transaction had a younger one
+	// aborted. TxnRetries counts Transactions sent again after an abort
+	// over a conflict, TxnGaveUp those whose client stopped trying, and
+	// TxnMaxTries is the most attempts any one took.
+	TxnWounded, TxnRetries, TxnGaveUp, TxnMaxTries int
 }
 
 // Passed is true when the run kept every guarantee: it was Safe, every

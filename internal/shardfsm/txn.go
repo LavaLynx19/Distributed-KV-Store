@@ -52,6 +52,8 @@ type TxnStep struct {
 	Writes   []fsm.Write
 	Stamp    int64
 	Register bool
+	// Age, on a prepare, is the Transaction's age (A§12.5).
+	Age int64
 
 	// For a finish: whether the Transaction commits, the version its
 	// writes get, and the version this Group offered in the prepare the
@@ -65,7 +67,14 @@ type TxnStep struct {
 
 // PrepareStep asks a Group to check and Lock its part of a Transaction.
 func PrepareStep(id TxnID, coord shard.GroupID, lead bool, conds []fsm.Cond, writes []fsm.Write, stamp int64, register bool) TxnStep {
-	return TxnStep{op: opPrepare, ID: id, Coord: coord, Lead: lead, Conds: conds, Writes: writes, Stamp: stamp, Register: register}
+	return TxnStep{op: opPrepare, ID: id, Coord: coord, Lead: lead, Conds: conds, Writes: writes, Stamp: stamp, Register: register, Age: stamp}
+}
+
+// Aged returns the prepare with the Transaction's age set. Without it the
+// age is the prepare's Stamp.
+func (s TxnStep) Aged(age int64) TxnStep {
+	s.Age = age
+	return s
 }
 
 // FinishStep tells a Group what was decided.
@@ -109,6 +118,7 @@ type prepared struct {
 	coord  shard.GroupID
 	writes []fsm.Write
 	stamp  int64
+	age    int64
 	// keys are the keys Locked, under their stored names.
 	keys []string
 	// answer is what the prepare was answered, to answer a repeat the same
@@ -144,11 +154,55 @@ func (m *Machine) Prepared() []TxnID {
 	return ids
 }
 
-// Held is a Transaction this Group has prepared for another Group, which
-// coordinates it.
+// Held is a Transaction a Group has prepared: its Coordinator Group and its
+// age.
 type Held struct {
 	ID    TxnID
 	Coord shard.GroupID
+	Age   int64
+}
+
+// Older reports whether h is older than other: by age, then Session, then
+// request number. Every Group compares the same way, so of any two
+// Transactions exactly one is the older (A§12.5).
+func (h Held) Older(other Held) bool {
+	switch {
+	case h.Age != other.Age:
+		return h.Age < other.Age
+	case h.ID.Session != other.ID.Session:
+		return h.ID.Session < other.ID.Session
+	}
+	return h.ID.Seq < other.ID.Seq
+}
+
+// EncodeHeld packs a Held, for the Value of an answer that says who holds
+// a key.
+func EncodeHeld(h Held) []byte {
+	b := binary.AppendUvarint(nil, h.ID.Session)
+	b = binary.AppendUvarint(b, h.ID.Seq)
+	b = binary.AppendUvarint(b, uint64(h.Coord))
+	return binary.AppendVarint(b, h.Age)
+}
+
+// DecodeHeld unpacks a Held, and reports whether there was one.
+func DecodeHeld(b []byte) (Held, bool) {
+	r := &reader{b: b}
+	h := Held{ID: TxnID{Session: r.uvarint(), Seq: r.uvarint()}, Coord: shard.GroupID(r.uvarint()), Age: r.varint()}
+	return h, len(b) > 0 && !r.bad && len(r.b) == 0
+}
+
+// LockedInBy lists the Transactions that have keys of slot Locked, this
+// Group's own among them.
+func (m *Machine) LockedInBy(slot shard.Slot) []Held {
+	var out []Held
+	m.locks.Ascend(stored(slot, ""), slotEnd(slot), func(_ string, id TxnID) bool {
+		if !slices.ContainsFunc(out, func(h Held) bool { return h.ID == id }) {
+			p, _ := m.txns.Get(id.key())
+			out = append(out, Held{ID: id, Coord: p.coord, Age: p.age})
+		}
+		return true
+	})
+	return out
 }
 
 // Holding lists the Transactions this Group has prepared and is waiting to
@@ -158,7 +212,7 @@ func (m *Machine) Holding() []Held {
 	var out []Held
 	m.txns.Ascend("", "", func(k string, p prepared) bool {
 		if p.coord != m.cfg.Group {
-			out = append(out, Held{ID: idOf(k), Coord: p.coord})
+			out = append(out, Held{ID: idOf(k), Coord: p.coord, Age: p.age})
 		}
 		return true
 	})
@@ -173,6 +227,29 @@ func (m *Machine) LockedIn(slot shard.Slot) int {
 		return true
 	})
 	return n
+}
+
+// holder is the Transaction that has one of a Command's keys Locked, if any
+// has.
+func (m *Machine) holder(cmd fsm.Command) (Held, bool) {
+	var id TxnID
+	held := false
+	look := func(key string) {
+		if !held {
+			id, held = m.locks.Get(stored(m.slotOf(key), key))
+		}
+	}
+	for _, c := range cmd.Conds {
+		look(c.Key)
+	}
+	for _, w := range cmd.Writes {
+		look(w.Key)
+	}
+	if !held {
+		return Held{}, false
+	}
+	p, _ := m.txns.Get(id.key())
+	return Held{ID: id, Coord: p.coord, Age: p.age}, true
 }
 
 // lockedAny reports whether any of a Command's keys is Locked.
@@ -273,8 +350,10 @@ func (m *Machine) prepare(index core.Index, step TxnStep) []byte {
 			return no(fsm.StatusMoving)
 		}
 	}
-	if m.lockedAny(cmd) {
-		return no(fsm.StatusTxnConflict)
+	if h, held := m.holder(cmd); held {
+		// The answer says who holds the key, so that whoever is older can
+		// be told (A§12.5).
+		return EncodeVote(VoteNo, fsm.Response{Status: fsm.StatusTxnConflict, Value: EncodeHeld(h)})
 	}
 	var failed []fsm.Item
 	for _, c := range step.Conds {
@@ -283,7 +362,7 @@ func (m *Machine) prepare(index core.Index, step TxnStep) []byte {
 		}
 	}
 
-	p := prepared{coord: step.Coord, writes: step.Writes, stamp: step.Stamp}
+	p := prepared{coord: step.Coord, writes: step.Writes, stamp: step.Stamp, age: step.Age}
 	lock := func(key string) {
 		name := stored(m.slotOf(key), key)
 		if !slices.Contains(p.keys, name) {
@@ -372,6 +451,7 @@ func (s TxnStep) Encode() []byte {
 		return binary.AppendUvarint(b, s.Offer)
 	}
 	b = append(b, flag(s.Register))
+	b = binary.AppendVarint(b, s.Age)
 	b = binary.AppendVarint(b, s.Stamp)
 	b = binary.AppendUvarint(b, uint64(len(s.Conds)))
 	for _, c := range s.Conds {
@@ -405,7 +485,7 @@ func DecodeTxnStep(payload []byte) (TxnStep, error) {
 	if s.op == opFinish {
 		s.Commit, s.Version, s.Offer = r.byte() == 1, r.uvarint(), r.uvarint()
 	} else {
-		s.Register, s.Stamp = r.byte() == 1, r.varint()
+		s.Register, s.Age, s.Stamp = r.byte() == 1, r.varint(), r.varint()
 		for range r.count() {
 			s.Conds = append(s.Conds, fsm.Cond{Key: string(r.bytes()), Version: r.uvarint()})
 		}

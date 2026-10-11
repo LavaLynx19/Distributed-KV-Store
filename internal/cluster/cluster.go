@@ -182,6 +182,14 @@ type Cluster struct {
 	Locked, TxnConflict int
 	// TxnCommitted counts Transactions across Groups that committed.
 	TxnCommitted int
+	// TxnWounded counts the times an older Transaction had a younger one
+	// aborted.
+	TxnWounded int
+	// TxnRetries counts Transactions sent again after being aborted over
+	// a conflict, TxnGaveUp those whose client stopped sending them, and
+	// TxnMaxTries is the most attempts any Transaction took to be decided
+	// on its own conditions.
+	TxnRetries, TxnGaveUp, TxnMaxTries int
 	// LocksAsked counts the times a Group finished a Transaction on the
 	// answer to its own question, not on being told.
 	LocksAsked int
@@ -570,10 +578,19 @@ func (c *Cluster) rpcDelay() int64 { return rpcMin + c.S.Rand().Int64N(rpcMax-rp
 // definite refusal that changed nothing, or nothing known. If the reply is
 // lost, done is never called, and the client must time out.
 func (c *Cluster) Request(n int, cmd fsm.Command, done func(Outcome, fsm.Response)) {
-	c.request(n, cmd, done, false)
+	c.request(n, cmd, 0, func(o Outcome, resp fsm.Response, _ int64) { done(o, resp) }, false)
 }
 
-func (c *Cluster) request(n int, cmd fsm.Command, done func(Outcome, fsm.Response), waited bool) {
+// RequestAged is Request for a Transaction that may have been tried before:
+// age is the age its first attempt was given, or zero for a first attempt.
+// done is also told the Transaction's age, to send with the next attempt
+// if this one is aborted to make way for another (A§12.5).
+func (c *Cluster) RequestAged(n int, cmd fsm.Command, age int64, done func(Outcome, fsm.Response, int64)) {
+	c.request(n, cmd, age, done, false)
+}
+
+func (c *Cluster) request(n int, cmd fsm.Command, age int64, answer func(Outcome, fsm.Response, int64), waited bool) {
+	done := func(o Outcome, resp fsm.Response) { answer(o, resp, age) }
 	if !c.NodeUp(n) {
 		done(Refused, fsm.Response{})
 		return
@@ -596,7 +613,7 @@ func (c *Cluster) request(n int, cmd fsm.Command, done func(Outcome, fsm.Respons
 		if c.cfg.Transactions.Memory {
 			c.transact(n, cmd, done)
 		} else {
-			c.begin(n, cmd, done)
+			c.begin(n, cmd, age, answer)
 		}
 		return
 	}
@@ -638,7 +655,7 @@ func (c *Cluster) request(n int, cmd fsm.Command, done func(Outcome, fsm.Respons
 				c.nodes[NodeOf(l)].nudged = true
 			}
 			if !waited && c.cfg.Transactions.On && !c.cfg.Transactions.Memory && !c.cfg.Transactions.NoAsking {
-				c.S.After(lockWait, func() { c.request(n, cmd, done, true) })
+				c.S.After(lockWait, func() { c.request(n, cmd, age, answer, true) })
 				return
 			}
 			c.Locked++

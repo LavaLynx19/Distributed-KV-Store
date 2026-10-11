@@ -110,7 +110,8 @@ func RunSharded(store ShardedStore, sc ShardedScenario, seed uint64) Report {
 	rep.Diverged = c.EndState()
 	rep.Signals = h.Signals
 	rep.Recovery = h.Signals.RecoveryAfter(faultsEnd)
-	rep.Routing = Routing{Forwarded: c.Forwarded, WrongGroup: c.WrongGroup, Moving: c.Moving, Locked: c.Locked, TxnConflict: c.TxnConflict, TxnCommitted: c.TxnCommitted}
+	rep.Routing = Routing{Forwarded: c.Forwarded, WrongGroup: c.WrongGroup, Moving: c.Moving, Locked: c.Locked, TxnConflict: c.TxnConflict, TxnCommitted: c.TxnCommitted,
+		TxnWounded: c.TxnWounded, TxnRetries: c.TxnRetries, TxnGaveUp: c.TxnGaveUp, TxnMaxTries: c.TxnMaxTries}
 	rep.Pauses = c.Pauses
 	rep.MovesAsked, rep.MovesTaken = c.MovesAsked, c.MovesTaken
 	rep.Diverged = append(rep.Diverged, c.GossipAgrees()...)

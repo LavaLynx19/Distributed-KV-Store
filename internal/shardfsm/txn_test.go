@@ -483,3 +483,21 @@ func TestTheCoordinatorGroupTellsAGroupItsOffer(t *testing.T) {
 		t.Errorf("offers: %+v", open[0].Offers)
 	}
 }
+
+func TestAConflictSaysWhoHoldsTheKey(t *testing.T) {
+	m := whole(Config{})
+	write := []fsm.Write{{Op: fsm.OpPut, Key: "b", Value: []byte("x")}}
+	m.Apply(entry(5, PrepareStep(TxnID{Session: 77, Seq: 1}, 9, false, nil, write, 300, false).Aged(120).Encode()))
+	v, r := voteOf(t, m.Apply(entry(6, PrepareStep(TxnID{Session: 78, Seq: 1}, 8, false, nil, write, 300, false).Encode())))
+	h, named := DecodeHeld(r.Value)
+	if v != VoteNo || r.Status != fsm.StatusTxnConflict || !named || h != (Held{ID: TxnID{Session: 77, Seq: 1}, Coord: 9, Age: 120}) {
+		t.Fatalf("vote %d, %+v, holder %+v", v, r, h)
+	}
+	// Older is decided by age, then Session, then request number, and of
+	// two Transactions exactly one is the older.
+	a, b := Held{ID: TxnID{7, 1}, Age: 100}, Held{ID: TxnID{3, 9}, Age: 200}
+	c := Held{ID: TxnID{3, 9}, Age: 100}
+	if !a.Older(b) || b.Older(a) || !c.Older(a) || a.Older(c) || a.Older(a) {
+		t.Error("ages don't order Transactions")
+	}
+}

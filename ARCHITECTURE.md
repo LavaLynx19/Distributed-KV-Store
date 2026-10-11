@@ -568,12 +568,13 @@ Messages go Leader to Leader, name the Transaction and are repeated until answer
 - **The limit.** A Coordinator Group that has lost its Majority can decide nothing, and the other Groups keep their Locks until its Members return or an operator runs Unsafe recovery. "Nothing stays undecided" holds while every Group involved has a Majority.
 
 ### 12.5 Two Transactions and one key (8b)
-- **Age.** A Transaction's age is the Store time stamped on its begin Entry, then its Session id, then its request number. Every Group compares ages the same way.
-- **Older wins.** A prepare that finds a key Locked by a younger Transaction asks that Transaction's Coordinator Group to abort it. If it is still undecided it is aborted; if it has already committed, the answer is the commit. Either way the Lock goes, and the prepare waits for that.
-- A prepare that finds a key Locked by an older Transaction waits a bounded time and then answers no.
+- **Age.** A Transaction's age is the Store time the Node that took its first attempt had heard, then its Session id, then its request number. Every Group compares ages the same way. Store time moves in steps, so many Transactions share an age and the Session id then decides.
+- **Older wins.** A prepare that finds a key Locked answers no, holds nothing, and says who holds the key and how old it is. If the holder is younger, the Leader that sent the prepare asks the holder's Coordinator Group to abort it, with an abort decision of its own that is ignored if the Transaction is already decided. Either way the Lock goes, and the prepare is sent again every 10 units until it does.
+- If the holder is older, the prepare is sent again for 80 units, and then the Transaction aborts.
+- **Two keys need none of this.** A Transaction's Coordinator Group owns its lowest key and Locks its own keys first. With two keys, each Transaction waits only for a key higher than one it holds, so no ring of waiting Transactions can close, even with no order. It takes three Groups prepared side by side.
 - So no two Transactions can wait for each other: of any two, only the younger waits.
 - **A Transaction that loses** is refused with `txn_conflict`, which carries its age. That attempt changed nothing. The client sends it again as a new request with that age, so it keeps getting older and must win in the end.
-- The store trusts the age a client sends, except that it can't be later than Store time now. A client that lies about its age can push in front of others. It can't break atomicity or lose a write.
+- The store trusts the age a client sends, except that it can't be later than the Store time the Node has heard. A client that lies about its age can push in front of others. It can't break atomicity or lose a write.
 - Requests that aren't Transactions across Groups have no age. They wait and are refused as in §12.3.
 
 ### 12.6 One version per Transaction
