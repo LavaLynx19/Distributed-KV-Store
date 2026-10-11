@@ -63,6 +63,11 @@ type SlotInfo struct {
 	// is at least Epoch, and higher if a Transaction has written the Slot
 	// together with one whose Epoch is higher (A§11.5).
 	VEpoch uint32
+	// VOffset is added to an Entry's index to make a version for the Slot.
+	// It is raised when a Transaction across Groups gives a key here a
+	// version above what this Group would have given, so that later
+	// versions stay above it (A§12.6).
+	VOffset uint64
 }
 
 // Serves reports whether a Group in this state answers for the Slot.
@@ -81,6 +86,14 @@ type Config struct {
 	// owns the Slot. It exists so that Rung 7's exposure of a Group that
 	// doesn't check stays reproducible.
 	Unchecked bool
+	// ReadLocked makes the Machine answer a read of a Locked key from what
+	// it holds, as if the key weren't Locked. It exists so that Rung 8's
+	// exposure of that stays reproducible.
+	ReadLocked bool
+	// NoOffset leaves VOffset at zero, so a version a Transaction across
+	// Groups brought from a Group with a longer Log can be followed by a
+	// lower one. It is another of the stores Rung 8 starts from.
+	NoOffset bool
 }
 
 // Machine is a data Group's state.
@@ -97,6 +110,11 @@ type Machine struct {
 	// lastSlots is, per Session, the Slots its last request touched. A
 	// Session moves with them (A§11.6).
 	lastSlots tree.Tree[[]shard.Slot]
+	// locks holds the Locked keys, under their stored names, each with the
+	// Transaction it is Locked for. txns holds what this Group remembers of
+	// each Transaction it has prepared (A§12.3).
+	locks tree.Tree[TxnID]
+	txns  tree.Tree[prepared]
 }
 
 // New returns a Machine owning cfg.Owned.
@@ -185,6 +203,9 @@ func (m *Machine) Apply(e core.Entry) []byte {
 	if len(e.Payload) > 0 && e.Payload[0] >= moveOpBase {
 		return m.applyMove(e.Payload).Encode()
 	}
+	if len(e.Payload) > 0 && e.Payload[0] >= txnOpBase {
+		return m.applyTxn(e.Index, e.Payload)
+	}
 	cmd, err := fsm.DecodeCommand(e.Payload)
 	if err != nil {
 		return fsm.Response{Status: fsm.StatusInvalid}.Encode()
@@ -202,19 +223,17 @@ func (m *Machine) Apply(e core.Entry) []byte {
 	if resp, refused := m.refusal(slots...); refused {
 		return resp.Encode()
 	}
-	// One version for everything the Command writes: the highest version
-	// Epoch among its Slots, which they all then share.
-	var vepoch uint32
-	for _, s := range slots {
-		vepoch = max(vepoch, m.slots[s].VEpoch)
+	if m.lockedAny(cmd) && !(cmd.Op == fsm.OpGet && m.cfg.ReadLocked) {
+		return fsm.Response{Status: fsm.StatusLocked}.Encode()
 	}
+	// One version for everything the Command writes: the highest among
+	// its Slots, which they all then share.
+	version := m.versionAt(e.Index, slots)
 	if cmd.Op != fsm.OpGet {
-		for _, s := range slots {
-			m.slots[s].VEpoch = vepoch
-		}
+		m.raise(e.Index, slots, version)
 	}
 	raw := m.inner.Apply(core.Entry{
-		Index:   core.Index(shard.Version(vepoch, uint64(e.Index))),
+		Index:   core.Index(version),
 		Kind:    core.EntryCommand,
 		Payload: m.store(cmd).Encode(),
 	})
@@ -231,6 +250,34 @@ func (m *Machine) Apply(e core.Entry) []byte {
 		m.lastSlots = m.lastSlots.Put(sessionKey(cmd.Session), slots)
 	}
 	return m.unstore(raw)
+}
+
+// versionAt is the version an Entry at index gives to what it writes in
+// slots: the highest any of them would give.
+func (m *Machine) versionAt(index core.Index, slots []shard.Slot) uint64 {
+	var v uint64
+	for _, s := range slots {
+		v = max(v, shard.Version(m.slots[s].VEpoch, uint64(index)+m.slots[s].VOffset))
+	}
+	return v
+}
+
+// raise makes sure that every Entry after index gives slots a version above
+// v.
+func (m *Machine) raise(index core.Index, slots []shard.Slot, v uint64) {
+	vepoch, low := shard.SplitVersion(v)
+	for _, s := range slots {
+		info := &m.slots[s]
+		switch {
+		case m.cfg.NoOffset:
+			info.VEpoch = max(info.VEpoch, vepoch)
+		case v > shard.Version(info.VEpoch, uint64(index)+info.VOffset):
+			info.VEpoch, info.VOffset = vepoch, 0
+			if low > uint64(index) {
+				info.VOffset = low - uint64(index)
+			}
+		}
+	}
 }
 
 // markDirty remembers every key a write names, if its Slot is Outgoing.
@@ -263,6 +310,9 @@ func (m *Machine) Read(query []byte) []byte {
 	if resp, refused := m.refusal(m.slotOf(cmd.Key)); refused {
 		return resp.Encode()
 	}
+	if m.lockedAny(cmd) && !m.cfg.ReadLocked {
+		return fsm.Response{Status: fsm.StatusLocked}.Encode()
+	}
 	return m.inner.Read(m.store(cmd).Encode())
 }
 
@@ -272,6 +322,9 @@ func (m *Machine) Read(query []byte) []byte {
 // (A§11.8). The Response's Value says which Slots those were, one byte per
 // Slot, so that whoever checks the answer knows what it covers.
 func (m *Machine) scan(cmd fsm.Command, ask func(fsm.Command) []byte) fsm.Response {
+	if !m.cfg.ReadLocked && m.lockedIn(cmd.Key, cmd.End) {
+		return fsm.Response{Status: fsm.StatusLocked}
+	}
 	limit := cmd.Limit
 	if limit == 0 || limit > fsm.MaxScan {
 		limit = fsm.MaxScan

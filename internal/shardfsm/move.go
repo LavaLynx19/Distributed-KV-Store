@@ -437,6 +437,7 @@ func DecodeStep(payload []byte) (Step, error) {
 func (m *Machine) Capture() func() []byte {
 	inner := m.inner.Capture()
 	slots, dirty, incoming, lastSlots := m.Slots(), m.dirty, m.incoming, m.lastSlots
+	txns := m.txns
 	return func() []byte {
 		b := appendBytes(nil, inner())
 		b = binary.AppendUvarint(b, uint64(len(slots)))
@@ -465,6 +466,21 @@ func (m *Machine) Capture() func() []byte {
 			}
 			return true
 		})
+		// Locks are rebuilt from the Transactions that hold them.
+		b = binary.AppendUvarint(b, uint64(txns.Len()))
+		txns.Ascend("", "", func(id string, p prepared) bool {
+			b = append(b, id...) // always 16 bytes
+			b = appendBytes(b, TxnStep{op: opPrepare, Writes: p.writes, Stamp: p.stamp}.Encode())
+			b = binary.AppendUvarint(b, uint64(len(p.keys)))
+			for _, k := range p.keys {
+				b = appendBytes(b, []byte(k))
+			}
+			b = appendBytes(b, p.answer)
+			return true
+		})
+		for _, s := range slots {
+			b = binary.AppendUvarint(b, s.VOffset)
+		}
 		return b
 	}
 }
@@ -504,6 +520,32 @@ func (m *Machine) Restore(data []byte) error {
 			ss = append(ss, shard.Slot(r.uvarint()))
 		}
 		next.lastSlots = next.lastSlots.Put(id, ss)
+	}
+	// A Snapshot from before Rung 8 ends here.
+	if len(r.b) > 0 {
+		for range r.count() {
+			if len(r.b) < 16 {
+				return errMalformed
+			}
+			id := string(r.b[:16])
+			r.b = r.b[16:]
+			step, err := DecodeTxnStep(r.bytes())
+			if err != nil {
+				return err
+			}
+			p := prepared{writes: step.Writes, stamp: step.Stamp}
+			for range r.count() {
+				p.keys = append(p.keys, string(r.bytes()))
+			}
+			p.answer = r.bytes()
+			next.txns = next.txns.Put(id, p)
+			for _, k := range p.keys {
+				next.locks = next.locks.Put(k, TxnID{Session: binary.BigEndian.Uint64([]byte(id[:8])), Seq: binary.BigEndian.Uint64([]byte(id[8:]))})
+			}
+		}
+		for i := range next.slots {
+			next.slots[i].VOffset = r.uvarint()
+		}
 	}
 	if r.bad || len(r.b) != 0 {
 		return errMalformed

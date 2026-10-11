@@ -76,6 +76,9 @@ type Config struct {
 	Replacing Replacing
 	// Balancing is how load is measured and evened out (balance.go).
 	Balancing Balancing
+	// Transactions is how a Transaction across Groups is carried out
+	// (txn.go).
+	Transactions Transactions
 
 	// Unchecked makes data Groups answer for keys in Slots they don't own
 	// (shardfsm.Config.Unchecked), and FlipAtOnce makes a Move change the
@@ -137,6 +140,9 @@ type node struct {
 	// the machine is lost for good.
 	up, gone bool
 	side     int
+	// boots counts the times the machine has stopped. What a Node was
+	// doing in memory before a stop is not carried on after it.
+	boots int
 	// gossip is this Node's gossip, if the store uses it.
 	gossip *gossip.Node
 	// watch is how long this Node's gossip has thought each Node dead, and
@@ -161,6 +167,12 @@ type Cluster struct {
 	nodes map[int]*node
 	// Signals count what the routing layer did.
 	Forwarded, WrongGroup, Moving int
+	// Locked counts requests refused because a key was Locked, and
+	// TxnConflict Transactions across Groups that were aborted for a reason
+	// other than their own conditions.
+	Locked, TxnConflict int
+	// TxnCommitted counts Transactions across Groups that committed.
+	TxnCommitted int
 	// MovesAsked counts the Moves requested, and MovesTaken those the Meta
 	// Group recorded the intent of.
 	MovesAsked, MovesTaken int
@@ -324,7 +336,7 @@ func (c *Cluster) newMachine(id core.NodeID) sim.Machine {
 			owned = append(owned, shard.Slot(s))
 		}
 	}
-	return shardfsm.New(shardfsm.Config{Group: g, Slots: c.cfg.Slots, Owned: owned, SessionTTL: c.cfg.SessionTTL, Unchecked: c.cfg.Unchecked})
+	return shardfsm.New(shardfsm.Config{Group: g, Slots: c.cfg.Slots, Owned: owned, SessionTTL: c.cfg.SessionTTL, Unchecked: c.cfg.Unchecked, ReadLocked: c.cfg.Transactions.ReadLocked, NoOffset: c.cfg.Transactions.NoOffset})
 }
 
 // Table is the Slot table Node n has cached.
@@ -353,6 +365,7 @@ func (c *Cluster) CrashNode(n int) {
 		c.S.Crash(r)
 	}
 	c.nodes[n].up = false
+	c.nodes[n].boots++
 	c.nodes[n].mover.Reset()
 }
 
@@ -552,6 +565,10 @@ func (c *Cluster) Request(n int, cmd fsm.Command, done func(Outcome, fsm.Respons
 		return
 	}
 	g, same := c.groupOf(nd.table, cmd)
+	if !same && c.cfg.Transactions.On {
+		c.transact(n, cmd, done)
+		return
+	}
 	if !same {
 		// The keys are owned by more than one Group (A§11.8).
 		done(Refused, fsm.Response{Status: fsm.StatusCrossGroup})
@@ -582,6 +599,9 @@ func (c *Cluster) Request(n int, cmd fsm.Command, done func(Outcome, fsm.Respons
 			done(Refused, resp)
 		case fsm.StatusMoving:
 			c.Moving++
+			done(Refused, resp)
+		case fsm.StatusLocked:
+			c.Locked++
 			done(Refused, resp)
 		default:
 			if l, known := nd.leader[g]; known {

@@ -129,6 +129,13 @@ const (
 	// Group (A§11.8). No state machine gives this answer: the Node that
 	// routes the request does, before sending it anywhere.
 	StatusCrossGroup
+	// StatusLocked: a key the Command names is Locked by a Transaction
+	// across Groups that isn't decided yet (A§12.3). Nothing changed.
+	StatusLocked
+	// StatusTxnConflict: a Transaction across Groups was aborted for a
+	// reason other than its own conditions (A§12.5, A§12.7). Nothing
+	// changed.
+	StatusTxnConflict
 )
 
 // Response is what the client gets back. Version is the key's version after

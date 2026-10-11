@@ -38,6 +38,9 @@ type ShardedStore struct {
 	Replacing cluster.Replacing
 	// Balancing is how load is evened out (cluster.Config).
 	Balancing cluster.Balancing
+	// Transactions is how a Transaction across Groups is carried out
+	// (cluster.Config).
+	Transactions cluster.Transactions
 }
 
 // ShardedScenario injects Faults, and asks for Moves, between times from
@@ -59,6 +62,7 @@ func RunSharded(store ShardedStore, sc ShardedScenario, seed uint64) Report {
 		Gossip: store.Gossip, Spares: store.Spares, GossipLoss: store.GossipLoss,
 		SuspectAfter: store.SuspectAfter, DeadAfter: store.DeadAfter,
 		GossipDecides: store.GossipDecides, Replacing: store.Replacing, Balancing: store.Balancing,
+		Transactions: store.Transactions,
 	})
 	h := &check.History{}
 	rep := Report{Scenario: sc.Name, Seed: seed, Members: store.Nodes, History: h}
@@ -106,7 +110,7 @@ func RunSharded(store ShardedStore, sc ShardedScenario, seed uint64) Report {
 	rep.Diverged = c.EndState()
 	rep.Signals = h.Signals
 	rep.Recovery = h.Signals.RecoveryAfter(faultsEnd)
-	rep.Routing = Routing{Forwarded: c.Forwarded, WrongGroup: c.WrongGroup, Moving: c.Moving}
+	rep.Routing = Routing{Forwarded: c.Forwarded, WrongGroup: c.WrongGroup, Moving: c.Moving, Locked: c.Locked, TxnConflict: c.TxnConflict, TxnCommitted: c.TxnCommitted}
 	rep.Pauses = c.Pauses
 	rep.MovesAsked, rep.MovesTaken = c.MovesAsked, c.MovesTaken
 	rep.Diverged = append(rep.Diverged, c.GossipAgrees()...)

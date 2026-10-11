@@ -143,6 +143,12 @@ type Routing struct {
 	// the Node's table was out of date. Moving were refused because the
 	// Slot was frozen for a Move.
 	WrongGroup, Moving int
+	// Locked were refused because a key was Locked by a Transaction not
+	// yet decided. TxnConflict counts Transactions across Groups aborted
+	// for a reason other than their own conditions (A§12).
+	Locked, TxnConflict int
+	// TxnCommitted counts Transactions across Groups that committed.
+	TxnCommitted int
 }
 
 // Passed is true when the run kept every guarantee: it was Safe, every
