@@ -33,7 +33,12 @@ type Transport struct {
 	id      core.NodeID
 	ln      net.Listener
 	deliver func(core.Message)
+	// queues has one queue per peer, each emptied by its own sendLoop.
+	// resolve, if set, finds the address of a peer there is no queue for
+	// yet. qmu guards both.
+	qmu     sync.RWMutex
 	queues  map[core.NodeID]chan core.Message
+	resolve func(core.NodeID) string
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -55,25 +60,56 @@ func New(id core.NodeID, ln net.Listener, peers map[core.NodeID]string, deliver 
 		ctx:    ctx, cancel: cancel,
 	}
 	for peer, addr := range peers {
-		if peer == id {
-			continue
+		if peer != id {
+			t.connect(peer, addr)
 		}
-		q := make(chan core.Message, queueSize)
-		t.queues[peer] = q
-		t.wg.Add(1)
-		go t.sendLoop(addr, q)
 	}
 	t.wg.Add(1)
 	go t.acceptLoop()
 	return t
 }
 
+// connect starts sending to a peer. The caller holds qmu, or is New.
+func (t *Transport) connect(peer core.NodeID, addr string) chan core.Message {
+	q := make(chan core.Message, queueSize)
+	t.queues[peer] = q
+	t.wg.Add(1)
+	go t.sendLoop(addr, q)
+	return q
+}
+
+// Resolve gives the Transport a way to find the address of a peer it wasn't
+// told of at the start: one that joined the store later (A§11.10). fn
+// returns "" for a peer it doesn't know either. It is called from Send.
+func (t *Transport) Resolve(fn func(core.NodeID) string) {
+	t.qmu.Lock()
+	t.resolve = fn
+	t.qmu.Unlock()
+}
+
 // Send queues a Message for its destination and returns at once. The Message
 // is dropped if the peer is unknown or its queue is full.
 func (t *Transport) Send(msg core.Message) {
+	t.qmu.RLock()
 	q, ok := t.queues[msg.To]
+	resolve := t.resolve
+	t.qmu.RUnlock()
 	if !ok {
-		return
+		if resolve == nil {
+			return
+		}
+		addr := resolve(msg.To)
+		if addr == "" {
+			return
+		}
+		t.qmu.Lock()
+		if q, ok = t.queues[msg.To]; !ok && t.ctx.Err() == nil {
+			q, ok = t.connect(msg.To, addr), true
+		}
+		t.qmu.Unlock()
+		if !ok {
+			return
+		}
 	}
 	select {
 	case q <- msg:
@@ -83,7 +119,9 @@ func (t *Transport) Send(msg core.Message) {
 
 // Close stops every goroutine and closes every connection.
 func (t *Transport) Close() {
+	t.qmu.Lock() // no new sendLoop starts once the context is done
 	t.cancel()
+	t.qmu.Unlock()
 	t.ln.Close()
 	t.mu.Lock()
 	for c := range t.conns {

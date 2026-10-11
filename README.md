@@ -56,6 +56,7 @@ Keeping several copies of data in agreement sounds simple, but it breaks as soon
 - A retried request takes effect exactly once.
 - The **Leaderless variant** is exempt from these. It promises only that replicas converge after a **Partition** heals.
 - A lease-based read mode is also exempt. It is off by default, exists to be measured, and can return a **Stale read** under clock skew.
+- From Rung 7, a range scan that crosses **Groups** is **Linearizable** within each Group and is not a single moment across them. A transaction whose keys are owned by more than one Group is refused until Rung 8.
 
 ### Durability
 - A write is acknowledged only after it is **Committed**.

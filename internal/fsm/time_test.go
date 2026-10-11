@@ -229,3 +229,67 @@ func TestCaptureKeepsWhenSessionsWereUsed(t *testing.T) {
 		t.Fatal("the same state encoded differently")
 	}
 }
+
+// A Session can be registered part-way through its life (A§11.6): the
+// record starts at the request that registers it and answers for nothing
+// earlier.
+func TestRegisterASessionWithAFloor(t *testing.T) {
+	first := inSession(put("a", "1"), 77, 6)
+	first.Register = true
+	m := New()
+	got := run(t, m,
+		inSession(put("a", "0"), 77, 6),   // not registered, and doesn't ask to be
+		first,                             // registers at request 6 and is applied
+		inSession(put("a", "1"), 77, 6),   // a retry of it: answered as before
+		inSession(put("a", "old"), 77, 5), // below the floor: refused
+		inSession(put("a", "2"), 77, 7),
+	)
+	want := []Status{StatusSessionExpired, StatusOK, StatusOK, StatusSessionExpired, StatusOK}
+	for i, r := range got {
+		if r.Status != want[i] {
+			t.Errorf("request %d: got %v, want %v", i, r.Status, want[i])
+		}
+	}
+	if got[2].Version != got[1].Version {
+		t.Errorf("the retry was applied again: versions %d and %d", got[1].Version, got[2].Version)
+	}
+	// The floor survives a Snapshot.
+	restored := New()
+	if err := restored.Restore(m.Capture()()); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := restored.SessionRecord(77); r.Floor != 6 || r.LastSeq != 7 {
+		t.Fatalf("restored record %+v, want floor 6 and last request 7", r)
+	}
+	if !reflect.DeepEqual(restored.Capture()(), m.Capture()()) {
+		t.Fatal("the same state encoded differently")
+	}
+	// The flag travels in the encoding, and costs nothing when it is off.
+	if got, err := DecodeCommand(first.Encode()); err != nil || !got.Register {
+		t.Fatalf("round trip lost Register: %+v, %v", got, err)
+	}
+}
+
+func TestRawAccess(t *testing.T) {
+	m := New()
+	run(t, m, at(100, put("x", "1")))
+	m.SetRaw(Raw{Key: "b", Value: []byte("2"), Version: 9, Deadline: 150})
+	m.SetRaw(Raw{Key: "a", Value: []byte("1"), Version: 8})
+	var keys []string
+	m.Range("a", "c", func(r Raw) bool { keys = append(keys, r.Key); return true })
+	if !reflect.DeepEqual(keys, []string{"a", "b"}) {
+		t.Fatalf("Range gave %v", keys)
+	}
+	if r, ok := m.GetRaw("b"); !ok || r.Version != 9 || r.Deadline != 150 {
+		t.Fatalf("GetRaw(b) = %+v, %v", r, ok)
+	}
+	// Catching up with another Group's time removes what is due.
+	m.AdvanceTime(150)
+	if _, ok := m.GetRaw("b"); ok || m.LogTime() != 150 {
+		t.Fatalf("after AdvanceTime(150): b still there, or log time %d", m.LogTime())
+	}
+	m.DeleteRaw("a")
+	if len(m.Items()) != 1 {
+		t.Fatalf("items = %+v, want only x", m.Items())
+	}
+}

@@ -56,8 +56,9 @@ type Snapshot struct {
 	Data  []byte
 	// Members is the Group's Member list as of Index, if a Membership
 	// change had been made by then. Nil means the list the Group started
-	// with.
-	Members []NodeID
+	// with. MembersAt is the Index of the Entry that set it.
+	Members   []NodeID
+	MembersAt Index
 }
 
 // Persist is the change a step makes to a Member's durable state. Its parts
@@ -172,7 +173,7 @@ type Message struct {
 }
 
 // Event is one input to a core. The events are Tick, Receive, Propose, Read,
-// Snapshotted and Reconfigure.
+// Snapshotted, Reconfigure and Decree.
 type Event interface{ event() }
 
 // Tick tells the core that one unit of time has passed. Timeouts are counted
@@ -215,12 +216,21 @@ type Reconfigure struct {
 	Members []NodeID
 }
 
+// Decree tells the core who the Members of its Group are, there and then,
+// with no Entry in the Log and no agreement from anyone. No correct shell
+// sends it. It is how the naive store of Rung 7 lets gossip decide who is in
+// a Group (A§11.10), and a core takes it only if it was built to.
+type Decree struct {
+	Members []NodeID
+}
+
 func (Tick) event()        {}
 func (Receive) event()     {}
 func (Propose) event()     {}
 func (Read) event()        {}
 func (Snapshotted) event() {}
 func (Reconfigure) event() {}
+func (Decree) event()      {}
 
 // Reason says why a proposal did not commit.
 type Reason uint8
@@ -301,7 +311,16 @@ type Status struct {
 	// staying out of elections (A§6.8).
 	Recovering bool
 	// Members is the Group's Member list as this Node has it, ascending.
-	Members []NodeID
+	// MembersAt is the index of the Entry that set it, or 0 for the list
+	// the Group was founded with. Changing is set while a Membership change
+	// is under way: the list isn't Committed yet, or a Learner is catching
+	// up.
+	// Learner is the Node a Leader is bringing up to date before adding it,
+	// or 0.
+	Members   []NodeID
+	MembersAt Index
+	Changing  bool
+	Learner   NodeID
 }
 
 // Node is a consensus core. Step must be called from one goroutine at a

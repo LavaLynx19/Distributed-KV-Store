@@ -72,8 +72,38 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P6.6 Rung 6 suite: changes during crashes and Partitions; `retros/rung-6.md` → §P6
 
 ### Phase 7 — Rung 7: several Groups (§P7)
-- [>] P7.0 Confirm or replace the A§10 sketch; write A§11 and Decision Log entries → defer until: Rung 6 retro is done
-- [>] P7.1 Slots, routing table, several cores per Node, slot moves, gossip, merged scans → defer until: P7.0 is approved
+- [x] P7.0 Confirm or replace the A§10 sketch; write A§11 and Decision Log entries → §P7
+- [x] P7a.1 Several cores per Node: Group ids on messages, a data directory per Group, the Simulation hosting several Groups (A§11.9) → §P7
+- [x] P7a.2 The Meta Group with a fixed Slot table; keys hashed to Slots; a Group's tree keyed by Slot (A§11.2, A§11.4) → §P7
+- [x] P7a.3 Routing: forward once, answers carry the table version; clients learn (A§11.3) → §P7
+- [x] P7a.4 Expose: a Group that doesn't check ownership serves a key it doesn't own → §P7
+- [x] P7a.5 Expose: the Meta Group flips the table and nobody confirms; two Groups serve one Slot → §P7
+- [x] P7a.6 The one-owner verdict and the across-Groups End-state check (A§11.12) → §P7
+- [x] P7a.7 The Move: intent, copy while serving, freeze, accept, done, drop; carried on after a crash at each step (A§11.4) → §P7
+- [x] P7a.8 Versions as Epoch and index (A§11.5) → §P7
+- [x] P7a.9 Store-wide Sessions: ids from the Meta Group, registering with a floor, moving with a Slot (A§11.6) → §P7
+- [x] P7a.10 Store time from the Meta Group (A§11.7) → §P7
+- [x] P7a.11 Merged scans; `cross_group` for Transactions (A§11.8) → §P7
+- [x] P7a.12 Real shell: `kvnode` hosting several Groups, `kvctl move-slot`, harness → §P7
+- [x] P7a.13 Stage 7a suite, real runs with the pause of a Move measured, `retros/rung-7.md` → §P7
+- [x] P7b.0 Break stage 7b (gossip, A§11.10) into tasks → §P7
+- [x] P7b.1 `internal/gossip`, a pure core: the Node list with addresses, the counters detector, exchanging everything with a Node on first contact; the Simulation carries its messages between Nodes → §P7
+- [x] P7b.2 The whole table and Store time ride on gossip; Nodes stop asking the Meta Group on a timer; routing avoids Nodes thought dead; how long news of a Move takes to reach every Node, against 7a → §P7
+- [x] P7b.3 Expose: ownership decided by gossip (a Move announced by gossip, highest version wins); two owners under a Partition → §P7
+- [x] P7b.4 Expose: Membership decided by gossip (a Group drops a Member that gossip calls dead, with no Entry); two Leaders under a Partition → §P7
+- [x] P7b.5 The SWIM detector: ping, ping through others, suspicion, answering a suspicion → §P7
+- [x] P7b.6 Detectors compared: time to notice a dead Node, false alarms under a slow Node, a one-way cut, a Partition and lost messages, and messages sent → §P7
+- [x] P7b.7 Joining with one address, leaving; real shell: gossip on the Nodes' network, addresses learned as they arrive; `kvnode -join`, `kvctl nodes` → §P7
+- [x] P7b.8 Stage 7b suite (the 7a suite with gossip carrying the table, plus gossip Faults), real runs, the 7b part of `retros/rung-7.md` → §P7
+- [x] P7c.0 Design load, threshold and damping for rebalancing; break stage 7c (A§11.11) into tasks → §P7
+- [x] P7c.1 The Slot table holds each Group's Member list; Meta records a change wanted and a change done; in the Simulation a Node starts a replica when the table says so and each Group's Leader makes the change → §P7
+- [x] P7c.2 Naive replacement: one Meta Member's word, no wait; add a Spare, remove the dead Member; a returned Node drops its data when gossip says it was replaced. Expose: running Nodes replaced under a Partition, and an Acknowledged write lost to a wrong drop → §P7
+- [x] P7c.3 Fix: a Majority of Meta Members and one wait; the Meta Group's own Members; a returned Node drops only on the Group's Committed Member list and becomes a Spare; a Move stuck on a lost Majority finishes after replacement → §P7
+- [x] P7c.4 Load: per-Slot counts at each data Leader, smoothed, carried by gossip; the weight of a read measured on real processes and built in → §P7
+- [x] P7c.5 Naive rebalancing: latest report, one line, no damping. Expose: Slots moving back and forth under steady and under shifting load, counted in Moves and in time frozen → §P7
+- [x] P7c.6 Fix: two lines, one Move at a time, rest per Slot, smoothed load, nothing while a Node is suspected or being replaced; lines, window and rest settled by measurement → §P7
+- [x] P7c.7 Real shell: Nodes start and drop replicas as the table says, replication takes addresses from gossip, `kvctl` shows replacements and load, `kvbench` can skew load onto a few Slots, harness Faults `kill-for-good` and `skewed-load` → §P7
+- [x] P7c.8 Stage 7c suite (the 7b suite with automation on, plus Nodes lost for good and skewed load), real runs, the 7c part and the Rung 7 verdict in `retros/rung-7.md` → §P7
 
 ### Phase 8 — Rung 8: transactions across Groups (§P8)
 - [>] P8.0 Confirm or replace the A§10 sketch → defer until: Rung 7 retro is done
@@ -142,7 +172,15 @@ P4.4 is a design decision inside the Rung: stop and get it approved before codin
 ## §P6 — Rung 6
 **Verify:** P6.1's seeds fail before and pass after. No Term ever has two Leaders during a change, including changes that straddle Terms. A dead Member is replaced while clients keep writing. Unsafe recovery prints what it discarded.
 
-## §P7–§P9
+## §P7 — Rung 7
+Design is A§11. Three stages (A§11.1), each ending with a retro section and the user's approval.
+**Verify (7c):** P7c.2's and P7c.5's seeds fail naive and can't be reproduced after. A Node lost for good is replaced in every Group it was in, the Meta Group included, with no hand on it, and the run stays Linearizable with one owner per Slot. A minority side of a Partition replaces nobody. A returned Node never drops data its Group still counts on. With one Group carrying most of the load, the busiest Group ends near the low line; load that is even, or that no Move can even out, is left alone after the first few Moves. Moves made and time frozen are reported, naive against damped.
+
+**Verify (7b):** P7b.3's and P7b.4's seeds fail with gossip deciding and can't be reproduced with it only informing. The 7a suite passes with the table carried by gossip and no timed reads of the Meta Group. After Faults stop, every live Node agrees on which Nodes are alive and on the table version. A Node started with one address is known to all. The two detectors' numbers are reported side by side.
+
+**Verify (7a):** P7a.4's and P7a.5's seeds fail before and pass after. No run ever has two Groups serving one Slot. Single-key operations stay Linearizable while Slots move, including Moves interrupted by crashes and Partitions at every step. A retry that crosses a Move takes effect once. The pause of a Move is reported.
+
+## §P8–§P9
 Each starts with its `.0` task: revisit the A§10 sketch with what the earlier Rungs taught, update ARCHITECTURE.md, and get approval. Tasks are broken down then.
 
 ## §P10 — Writeup

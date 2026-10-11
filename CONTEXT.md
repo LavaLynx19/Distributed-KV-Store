@@ -40,6 +40,26 @@ _Avoid_: Standby, idle node
 A Spare that a Leader is sending its Log to before adding it as a Member. It counts toward nothing until it is added.
 _Avoid_: Observer, non-voter, witness
 
+**Meta Group**:
+The one Group that holds the Slot table, hands out Session ids and issues Store time. It stores no keys.
+_Avoid_: Coordinator, config server, master, placement driver
+
+**Slot**:
+One of a fixed number of shares of the keys. A key's Slot is decided by its hash and never changes; a Slot is owned by exactly one Group at any moment.
+_Avoid_: Shard, bucket, partition, vnode
+
+**Slot table**:
+The record of which Group owns each Slot, kept by the Meta Group.
+_Avoid_: Routing map, ring, topology
+
+**Epoch**:
+The count of times a Slot has changed owner.
+_Avoid_: Generation, incarnation
+
+**Move**:
+Handing a Slot, with its keys, from the Group that owns it to another.
+_Avoid_: Migration, rebalance, handoff
+
 ## Data
 
 **Log**:
@@ -69,6 +89,10 @@ _Avoid_: Connection, client id, idempotency key
 **Expiry**:
 The moment a key with a time-to-live stops existing, which is the same Entry on every Member.
 _Avoid_: Timeout, eviction
+
+**Store time**:
+The time the whole store goes by for Expiry, issued by the Meta Group's Leader and never read from any other clock.
+_Avoid_: Wall clock, global clock, timestamp oracle
 
 ## Guarantees
 

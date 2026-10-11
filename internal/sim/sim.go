@@ -51,10 +51,18 @@ type Config struct {
 	// Membership change adds them (A§6.5). Zero means every Node.
 	Members int
 
+	// IDs, if set, are the Nodes' ids, in place of 1..Nodes. A store with
+	// several Groups runs one simulated Node per replica, and gives each an
+	// id that says which machine and which Group it is (A§11.9).
+	IDs []core.NodeID
+
 	// NewNode builds a Member's core. members lists every Member, id included.
 	NewNode func(id core.NodeID, members []core.NodeID, rng core.Rand) core.Node
 	// NewMachine builds a Member's state machine.
 	NewMachine func() Machine
+	// NewMachineFor, if set, is used in place of NewMachine, for a run in
+	// which Nodes don't all hold the same kind of state.
+	NewMachineFor func(id core.NodeID) Machine
 
 	// Restart, if set, makes a crash lose everything that wasn't durable: a
 	// restarted Member gets a new core built from its simulated disk, and a
@@ -84,6 +92,11 @@ type Config struct {
 	// whether it has something to propose so that time moves in a Group
 	// nobody is writing to (A§6.7). It returns the proposal, or nil.
 	TimeEntry func(m Machine, now int64) []byte
+
+	// OnApply, if set, is called each time a Member has applied a Committed
+	// Entry to its state machine, with the machine as it then stands. A
+	// test uses it to watch a Group's state change at the exact Entry.
+	OnApply func(id core.NodeID, index core.Index, m Machine)
 
 	// Copy, if set, stands in for the network's encoding: every message is
 	// passed through it on the way, so Members never share memory.
@@ -183,27 +196,65 @@ func New(cfg Config) *Sim {
 		blocked: map[[2]core.NodeID]bool{},
 		digest:  14695981039346656037, // FNV-1a offset basis
 	}
-	for i := 1; i <= cfg.Nodes; i++ {
+	for i := 1; i <= cfg.Nodes && cfg.IDs == nil; i++ {
 		s.ids = append(s.ids, core.NodeID(i))
 	}
+	s.ids = append(s.ids, cfg.IDs...)
 	for _, id := range s.ids {
-		m := &member{
-			id:      id,
-			core:    cfg.NewNode(id, s.Founders(), rand.New(rand.NewPCG(cfg.Seed, uint64(id)))),
-			machine: cfg.NewMachine(),
-			up:      true,
-			pending: map[uint64]func(Reply){},
-			queries: map[uint64][]byte{},
-			fs:      storage.NewMemFS(),
-
-			clockRate: 100,
-		}
-		m.store, _, _ = s.openDisk(m.fs) // an empty MemFS can't fail to open
-		s.members[id] = m
-		// Members tick out of phase with each other.
-		s.schedule(s.rng.Int64N(cfg.TickEvery), func() { s.tick(m) })
+		s.start(id)
 	}
 	return s
+}
+
+// start gives the Sim a new Member with an empty disk, and schedules its
+// first tick.
+func (s *Sim) start(id core.NodeID) {
+	m := &member{
+		id:      id,
+		core:    s.cfg.NewNode(id, s.Founders(), rand.New(rand.NewPCG(s.cfg.Seed, uint64(id)))),
+		machine: s.newMachine(id),
+		up:      true,
+		pending: map[uint64]func(Reply){},
+		queries: map[uint64][]byte{},
+		fs:      storage.NewMemFS(),
+
+		clockRate: 100,
+	}
+	m.store, _, _ = s.openDisk(m.fs) // an empty MemFS can't fail to open
+	s.members[id] = m
+	// Members tick out of phase with each other.
+	s.schedule(s.rng.Int64N(s.cfg.TickEvery), func() { s.tick(m) })
+}
+
+// Add starts a Node the Sim didn't begin with, or one whose data was
+// dropped, as a machine does when it is told to host a replica (A§11.11).
+// It is in no Group until a Membership change adds it.
+func (s *Sim) Add(id core.NodeID) {
+	s.mix('A', uint64(id), 0)
+	if _, exists := s.members[id]; exists {
+		s.Restart(id)
+		return
+	}
+	s.ids = append(s.ids, id)
+	s.start(id)
+}
+
+// Has reports whether the Sim has ever had a Node with this id.
+func (s *Sim) Has(id core.NodeID) bool { return s.members[id] != nil }
+
+// DropData stops a Node and removes its Log and Snapshot from its disk,
+// keeping its Term and vote (storage.DropData). It stays down until Add.
+func (s *Sim) DropData(id core.NodeID) {
+	s.Crash(id)
+	s.mix('W', uint64(id), 0)
+	must(storage.DropData(s.members[id].fs, dataDir, storage.Options{Unchecked: s.cfg.UncheckedDisk}))
+}
+
+func (s *Sim) newMachine(id core.NodeID) Machine {
+	if s.cfg.NewMachineFor != nil {
+		return s.cfg.NewMachineFor(id)
+	}
+	return s.cfg.NewMachine()
 }
 
 // Now is the current virtual time.
@@ -291,6 +342,15 @@ func (s *Sim) Reconfigure(to core.NodeID, members []core.NodeID, done func(Reply
 	s.step(m, core.Reconfigure{Ref: ref, Members: slices.Clone(members)})
 }
 
+// Inject hands a Member's core an event of the caller's choosing, as its
+// shell might. It is for events no client or other Member causes.
+func (s *Sim) Inject(to core.NodeID, ev core.Event) {
+	if m := s.members[to]; m.up {
+		s.mix('J', uint64(to), 0)
+		s.step(m, ev)
+	}
+}
+
 // Read asks one Member to answer a query from its own state, bypassing the
 // Log. done is called exactly once.
 func (s *Sim) Read(to core.NodeID, query []byte, done func(Reply)) {
@@ -355,13 +415,13 @@ func (s *Sim) Restart(id core.NodeID) {
 	}
 	store, stored, err := s.openDisk(m.fs)
 	if err == nil && stored.Snapshot != nil {
-		machine := s.cfg.NewMachine()
+		machine := s.newMachine(id)
 		if err = machine.Restore(stored.Snapshot.Data); err == nil {
 			m.machine = machine
 			m.applied, m.snapshotAt = stored.Snapshot.Index, stored.Snapshot.Index
 		}
 	} else if err == nil {
-		m.machine = s.cfg.NewMachine()
+		m.machine = s.newMachine(id)
 		m.applied, m.snapshotAt = 0, 0
 	}
 	if err != nil {
@@ -621,6 +681,9 @@ func (s *Sim) finish(m *member, out core.Output) {
 	for _, e := range out.Committed {
 		responses[e.Index] = m.machine.Apply(e)
 		m.applied = e.Index
+		if s.cfg.OnApply != nil {
+			s.cfg.OnApply(m.id, e.Index, m.machine)
+		}
 	}
 	for _, r := range out.Results {
 		done, ok := m.pending[r.Ref]

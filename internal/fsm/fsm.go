@@ -80,6 +80,12 @@ type Command struct {
 	// TTL, on a put, is how long the key lives, in the units of Stamp. Zero
 	// means for good.
 	TTL int64
+	// Register, on a request in a Session, tells a store that doesn't know
+	// the Session to start a record of it at this request (A§11.6). A
+	// client sets it on the first attempt of a request and never on a
+	// retry: the store then refuses anything in the Session numbered below
+	// this request, so an older one can't be applied a second time.
+	Register bool
 	// End and Limit bound an OpScan. Conds and Writes make up an OpTxn.
 	End    string
 	Limit  uint64
@@ -113,6 +119,16 @@ const (
 	// StatusSessionExpired: the Command named a Session the store doesn't
 	// have.
 	StatusSessionExpired
+	// StatusWrongGroup: in a store with several Groups, this Group doesn't
+	// own the key's Slot (A§11.3). Nothing changed.
+	StatusWrongGroup
+	// StatusMoving: this Group owns the key's Slot and has frozen it to
+	// hand it to another (A§11.4). Nothing changed; ask again shortly.
+	StatusMoving
+	// StatusCrossGroup: a Transaction's keys are owned by more than one
+	// Group (A§11.8). No state machine gives this answer: the Node that
+	// routes the request does, before sending it anywhere.
+	StatusCrossGroup
 )
 
 // Response is what the client gets back. Version is the key's version after
@@ -153,6 +169,9 @@ type session struct {
 	lastResp []byte
 	// lastUsed is Log time when the Session was opened or last used.
 	lastUsed int64
+	// floor is the lowest request number the record answers for. It is set
+	// when a Session is registered part-way through its life (A§11.6).
+	floor uint64
 }
 
 // Machine holds the keys and the Sessions, each in a copy-on-write tree
@@ -337,8 +356,11 @@ func (m *Machine) Apply(e core.Entry) []byte {
 	}
 
 	s, ok := m.sessions.Get(sessionKey(cmd.Session))
+	if !ok && cmd.Register {
+		s, ok = session{floor: cmd.Seq}, true
+	}
 	switch {
-	case !ok:
+	case !ok || cmd.Seq < s.floor:
 		return Response{Status: StatusSessionExpired}.Encode()
 	case cmd.Seq == s.lastSeq && s.lastSeq != 0:
 		if s.lastUsed != m.logTime {
@@ -350,7 +372,7 @@ func (m *Machine) Apply(e core.Entry) []byte {
 		return Response{Status: StatusInvalid}.Encode()
 	}
 	resp := m.apply(cmd, index).Encode()
-	m.sessions = m.sessions.Put(sessionKey(cmd.Session), session{lastSeq: cmd.Seq, lastResp: resp, lastUsed: m.logTime})
+	m.sessions = m.sessions.Put(sessionKey(cmd.Session), session{lastSeq: cmd.Seq, lastResp: resp, lastUsed: m.logTime, floor: s.floor})
 	return resp
 }
 
@@ -480,6 +502,9 @@ func (c Command) Encode() []byte {
 	if extended {
 		flags |= flagExtended
 	}
+	if c.Register {
+		flags |= flagRegister
+	}
 	b = append(b, flags)
 	b = binary.AppendUvarint(b, c.IfVersion)
 	b = binary.AppendUvarint(b, c.Session)
@@ -517,13 +542,14 @@ const (
 	flagConditional = 1 << iota
 	flagTimed
 	flagExtended
+	flagRegister
 )
 
 func DecodeCommand(b []byte) (Command, error) {
 	if len(b) < 2 {
 		return Command{}, errMalformed
 	}
-	c := Command{Op: Op(b[0]), Conditional: b[1]&flagConditional != 0}
+	c := Command{Op: Op(b[0]), Conditional: b[1]&flagConditional != 0, Register: b[1]&flagRegister != 0}
 	timed := b[1]&flagTimed != 0
 	if extended := b[1]&flagExtended != 0; extended != (c.Op == OpScan || c.Op == OpTxn) {
 		return Command{}, errMalformed
@@ -733,7 +759,12 @@ func (m *Machine) Capture() func() []byte {
 			b = appendBytes(b, s.lastResp)
 			return true
 		})
-		if logTime == 0 && expiries.Len() == 0 {
+		floors := false
+		sessions.Ascend("", "", func(_ string, s session) bool {
+			floors = floors || s.floor != 0
+			return !floors
+		})
+		if logTime == 0 && expiries.Len() == 0 && !floors {
 			return b
 		}
 		b = binary.AppendVarint(b, logTime)
@@ -747,6 +778,12 @@ func (m *Machine) Capture() func() []byte {
 			b = binary.AppendVarint(b, s.lastUsed)
 			return true
 		})
+		if floors {
+			sessions.Ascend("", "", func(_ string, s session) bool {
+				b = binary.AppendUvarint(b, s.floor)
+				return true
+			})
+		}
 		return b
 	}
 }
@@ -821,6 +858,16 @@ func (m *Machine) Restore(data []byte) error {
 				sessions = sessions.Put(id, s)
 			}
 		}
+		// Floors, if any Session has one.
+		for _, id := range sessionIDs {
+			if !ok || len(b) == 0 {
+				break
+			}
+			s, _ := sessions.Get(id)
+			if s.floor, b, ok = uvarint(b); ok {
+				sessions = sessions.Put(id, s)
+			}
+		}
 	}
 	if !ok || len(b) != 0 {
 		return errMalformed
@@ -832,4 +879,66 @@ func (m *Machine) Restore(data []byte) error {
 func appendBytes(b, field []byte) []byte {
 	b = binary.AppendUvarint(b, uint64(len(field)))
 	return append(b, field...)
+}
+
+// Raw is a key as the Machine holds it, for a store with several Groups to
+// hand a Slot's keys from one Machine to another (A§11.4).
+type Raw struct {
+	Key      string
+	Value    []byte
+	Version  uint64
+	Deadline int64
+}
+
+// Range calls fn for each key in [from, to), in order, until fn returns
+// false. An empty to means no upper bound.
+func (m *Machine) Range(from, to string, fn func(Raw) bool) {
+	m.keys.Ascend(from, to, func(k string, e entry) bool {
+		return fn(Raw{Key: k, Value: e.value, Version: e.version, Deadline: e.deadline})
+	})
+}
+
+// GetRaw is one key as held, and whether it exists.
+func (m *Machine) GetRaw(key string) (Raw, bool) {
+	e, ok := m.keys.Get(key)
+	return Raw{Key: key, Value: e.value, Version: e.version, Deadline: e.deadline}, ok
+}
+
+// SetRaw stores a key exactly as given, version and deadline included.
+func (m *Machine) SetRaw(r Raw) {
+	m.set(r.Key, entry{value: bytes.Clone(r.Value), version: r.Version, deadline: r.Deadline})
+}
+
+// DeleteRaw removes a key if it is there.
+func (m *Machine) DeleteRaw(key string) { m.unset(key) }
+
+// AdvanceTime moves Log time on to at least t and removes what that makes
+// due. A Group taking over a Slot uses it to catch up with the Group the
+// Slot came from, so that the Slot's keys expire when they would have.
+func (m *Machine) AdvanceTime(t int64) {
+	if !m.ownClock && t > m.logTime {
+		m.advance(t)
+	} else {
+		m.sweep()
+	}
+}
+
+// SessionRecord is what a Machine remembers of one Session.
+type SessionRecord struct {
+	ID       uint64
+	LastSeq  uint64
+	LastResp []byte
+	LastUsed int64
+	Floor    uint64
+}
+
+// SessionRecord returns the record of a Session, and whether there is one.
+func (m *Machine) SessionRecord(id uint64) (SessionRecord, bool) {
+	s, ok := m.sessions.Get(sessionKey(id))
+	return SessionRecord{ID: id, LastSeq: s.lastSeq, LastResp: s.lastResp, LastUsed: s.lastUsed, Floor: s.floor}, ok
+}
+
+// PutSessionRecord stores a Session's record as given.
+func (m *Machine) PutSessionRecord(r SessionRecord) {
+	m.sessions = m.sessions.Put(sessionKey(r.ID), session{lastSeq: r.LastSeq, lastResp: bytes.Clone(r.LastResp), lastUsed: r.LastUsed, floor: r.Floor})
 }

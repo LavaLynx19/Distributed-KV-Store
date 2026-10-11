@@ -8,6 +8,7 @@ import (
 	"github.com/anishathalye/porcupine"
 
 	"distributed-kv-store/internal/fsm"
+	"distributed-kv-store/internal/shard"
 )
 
 // storeState is what the whole-store model knows: one keyState per key that
@@ -101,7 +102,16 @@ func stepScan(s storeState, cmd fsm.Command, out Outcome) []storeState {
 	if uint64(len(items)) > limit {
 		return nil
 	}
-	inRange := func(k string) bool { return k >= cmd.Key && (cmd.End == "" || k < cmd.End) }
+	// A Group in a store with several answers only for the Slots it serves,
+	// and says which in the Response's Value (A§11.8). Keys in other Slots
+	// are outside what this scan claims anything about.
+	served := out.Resp.Value
+	inRange := func(k string) bool {
+		if len(served) > 0 && served[shard.SlotOf(k, len(served))] == 0 {
+			return false
+		}
+		return k >= cmd.Key && (cmd.End == "" || k < cmd.End)
+	}
 	found := map[string]fsm.Item{}
 	for i, it := range items {
 		if !inRange(it.Key) || (i > 0 && it.Key <= items[i-1].Key) {
