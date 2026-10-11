@@ -136,7 +136,7 @@ Requirements: [README.md](./README.md). Design: [ARCHITECTURE.md](./ARCHITECTURE
 - [x] P9b.4 Repair on read; the stale-read rate at R=1 before and after (A§13.6) → §P9
 - [x] P9b.5 Time-to-live by stamped deadline, with the disagreement under clock skew measured; scans (A§13.8, A§13.9) → §P9
 - [x] P9b.6 Stage 9b suite and the 9b part of the retro → §P9
-- [ ] P9c.1 Real processes: a `kvnode` mode with HTTP, TCP and disk; `kvbench` workload and verdicts; local harness (A§13.12) → §P9
+- [x] P9c.1 Real processes: a `kvnode` mode with HTTP, TCP and disk; `kvbench` workload and verdicts; local harness (A§13.12) → §P9
 - [~] P9c.2 Docker with the network cut, for the Leaderless variant and for the store of Rung 8 → blocked by: the user's leave to edit `deploy/docker-compose.yml`, asked with the exact change
 - [ ] P9c.3 The comparison runs, the 9c part and the Rung 9 verdict in the retro → §P9
 

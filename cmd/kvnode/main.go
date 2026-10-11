@@ -26,6 +26,8 @@ import (
 	"distributed-kv-store/internal/core"
 	"distributed-kv-store/internal/fsm"
 	"distributed-kv-store/internal/gossip"
+	"distributed-kv-store/internal/leaderless"
+	"distributed-kv-store/internal/lserver"
 	"distributed-kv-store/internal/raft"
 	"distributed-kv-store/internal/server"
 	"distributed-kv-store/internal/shard"
@@ -57,7 +59,17 @@ func main() {
 	auto := flag.Bool("auto", true, "with -data-groups: replace dead Nodes with Spares and move Slots off busy Groups without being asked (A§11.11)")
 	deadWait := flag.Duration("dead-wait", 5*time.Second, "with -auto: how long this Node must have thought a Node dead before it says so; replacing a Node copies every Group it was in, so make it longer than a restart")
 	reads := flag.String("reads", "index", "how gets are answered: index (read index, A§6.2), log (as Log Entries), or lease (from the Leader's memory under a lease: faster, and not Linearizable if clocks run at different speeds)")
+	leaderlessMode := flag.Bool("leaderless", false, "run as a Node of the Leaderless variant (A§13): no Leader, a key is a set of strings on three Home Nodes, and every Node in -peers is a Node of the store")
+	w := flag.Int("w", 2, "with -leaderless: how many Nodes must have a write before the client is told it succeeded")
+	r := flag.Int("r", 2, "with -leaderless: how many Home Nodes must answer a read")
+	lww := flag.Bool("lww", false, "with -leaderless: settle two writes made apart by last-write-wins, which loses one of them (the store Rung 9 starts from)")
 	flag.Parse()
+	if *leaderlessMode {
+		if err := runLeaderless(int(*id), *peersFlag, *clientsFlag, *listenPeer, *listenClient, *tick, *timeout, *data, *w, *r, *lww); err != nil {
+			log.Fatalf("kvnode: %v", err)
+		}
+		return
+	}
 
 	var mode raft.ReadMode
 	switch *reads {
@@ -286,4 +298,60 @@ func parseAddrs(s string) (map[core.NodeID]string, error) {
 		addrs[core.NodeID(id)] = addr
 	}
 	return addrs, nil
+}
+
+// runLeaderless runs a Node of the Leaderless variant until interrupted.
+func runLeaderless(id int, peersFlag, clientsFlag, listenPeer, listenClient string, tick, timeout time.Duration, data string, w, r int, lww bool) error {
+	peers, err := parseAddrs(peersFlag)
+	if err != nil {
+		return fmt.Errorf("-peers: %w", err)
+	}
+	clients, err := parseAddrs(clientsFlag)
+	if err != nil {
+		return fmt.Errorf("-clients: %w", err)
+	}
+	if peers[core.NodeID(id)] == "" || clients[core.NodeID(id)] == "" {
+		return fmt.Errorf("-id %d must appear in both -peers and -clients", id)
+	}
+	if listenPeer == "" {
+		listenPeer = peers[core.NodeID(id)]
+	}
+	if listenClient == "" {
+		listenClient = clients[core.NodeID(id)]
+	}
+	ln, err := net.Listen("tcp", listenPeer)
+	if err != nil {
+		return err
+	}
+	addrs := map[int]string{}
+	for n, addr := range peers {
+		addrs[int(n)] = addr
+	}
+	mode := leaderless.AddWins
+	if lww {
+		mode = leaderless.LastWriteWins
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	node, err := lserver.Open(ctx, lserver.Config{
+		ID: id, Peers: addrs, Listener: ln, W: w, R: r, Mode: mode,
+		DeliverHints: true, Resend: true, Exchange: true, Repair: true,
+		Data: data, Tick: tick,
+	})
+	if err != nil {
+		return err
+	}
+	defer node.Close()
+	srv := &http.Server{Addr: listenClient, Handler: (&lserver.API{Server: node, Timeout: timeout}).Handler(), ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		<-ctx.Done()
+		shutdown, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdown) // exiting anyway
+	}()
+	log.Printf("kvnode %d: Leaderless variant, %d Nodes, W=%d R=%d, Nodes on %s, clients on %s, tick %s, data %q", id, len(peers), w, r, listenPeer, listenClient, tick, data)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("client API: %w", err)
+	}
+	return nil
 }

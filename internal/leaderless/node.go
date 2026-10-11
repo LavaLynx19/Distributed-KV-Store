@@ -759,3 +759,9 @@ func (n *Node) deliver(out *Output) {
 		n.send(out, hk.For, Deliver{Key: hk.Key, State: n.stored.Hints[hk]})
 	}
 }
+
+// MessageBodies lists the concrete types a Node puts in Message.Body, for a
+// shell that has to encode them.
+func MessageBodies() []any {
+	return []any{Write{}, WriteAck{}, HintMsg{}, HintAck{}, ReadReq{}, ReadResp{}, Deliver{}, DeliverAck{}, Offer{}, Counter{}, Give{}, ScanReq{}, ScanResp{}}
+}
