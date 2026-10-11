@@ -595,6 +595,8 @@ Messages go Leader to Leader, name the Transaction and are repeated until answer
 - `POST /v1/txn` takes an optional `age`. A `txn_conflict` refusal carries the `age` to send with the next attempt.
 - `cross_group` is no longer returned.
 - A Transaction's answer still has one version.
+- `GET /v1/status` on a Node of a store with several Groups adds, per Group it hosts, `locked` (keys Locked) and `open` (Transactions it coordinates that aren't over). `kvctl table` prints them for each Group's Leader.
+- A request outside any Session is still given a name by the Node that takes it, from that Node's clock and number, so that of two Transactions of the same age the one that arrived first is the older.
 
 ### 12.9 Verification
 - **Linearizability** over the whole store, with Transactions whose keys are in different Groups in every run (§8.2: such Histories stay small).
